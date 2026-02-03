@@ -1,0 +1,54 @@
+[package]
+name = "amt-protocol"
+version = "0.1.0"
+edition = "2021"
+authors = ["Blockcast"]
+description = "AMT (Automatic Multicast Tunneling) protocol implementation for multiple platforms"
+license = "MIT"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = ["wasm"]
+
+# WASM target (web browsers via wasm-bindgen)
+wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys", "dep:js-sys", "getrandom/js"]
+
+# FFI target (native platforms via C ABI - CGO, JNI, UniFFI)
+ffi = []
+
+# JNI bindings for Android
+jni = ["ffi", "dep:jni"]
+
+# UniFFI bindings for iOS/macOS
+uniffi = ["ffi", "dep:uniffi"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+getrandom = "0.2"
+
+# WASM dependencies (optional)
+wasm-bindgen = { version = "0.2", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+web-sys = { version = "0.3", features = ["console"], optional = true }
+js-sys = { version = "0.3", optional = true }
+
+# JNI dependencies (optional)
+jni = { version = "0.21", optional = true }
+
+# UniFFI dependencies (optional)
+uniffi = { version = "0.28", optional = true }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Link-time optimization
+codegen-units = 1   # Better optimization
+panic = "abort"     # Smaller binary
+strip = true        # Strip symbols
