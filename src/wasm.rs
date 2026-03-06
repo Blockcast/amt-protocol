@@ -391,10 +391,13 @@ impl JsMldReport {
     }
 }
 
-/// DRIAD query builder for WASM (RFC 8777)
+/// DRIAD query builder and DNS parser for WASM (RFC 8777)
 ///
 /// DRIAD discovers AMT relays based on the **source address**, not the group.
 /// The source network operator configures DNS records for their source IPs.
+///
+/// Provides DNS wire-format query building and response parsing so that
+/// the caller (JS/IWA) only needs to handle UDP transport.
 #[wasm_bindgen]
 pub struct JsDriad;
 
@@ -403,7 +406,7 @@ impl JsDriad {
     /// Build DRIAD query name for multicast source address (RFC 8777)
     ///
     /// @param source - Multicast source address (IPv4 or IPv6) - NOT the group!
-    /// @returns DNS query name (e.g., "10.95.25.69.amt.in-addr.arpa" for source 69.25.95.10)
+    /// @returns DNS query name (e.g., "10.95.25.69.in-addr.arpa" for source 69.25.95.10)
     #[wasm_bindgen(js_name = buildQuery)]
     pub fn build_query(source: &str) -> Result<String, JsValue> {
         let addr: IpAddr = source
@@ -411,6 +414,35 @@ impl JsDriad {
             .map_err(|e| JsValue::from_str(&format!("Invalid IP address: {}", e)))?;
 
         Ok(DriadResolver::build_query(addr))
+    }
+
+    /// Build a DNS wire-format query packet for AMTRELAY (TYPE260) lookup.
+    ///
+    /// Returns a complete DNS query packet (RFC 1035) as Uint8Array, ready to
+    /// send over UDP to a DNS resolver (e.g., 8.8.8.8:53).
+    ///
+    /// @param source - Multicast source IP address
+    /// @param transaction_id - DNS transaction ID for matching responses
+    /// @returns Uint8Array containing the DNS query packet
+    #[wasm_bindgen(js_name = buildDnsQuery)]
+    pub fn build_dns_query(source: &str, transaction_id: u16) -> Result<Vec<u8>, JsValue> {
+        let addr: IpAddr = source
+            .parse()
+            .map_err(|e| JsValue::from_str(&format!("Invalid IP address: {}", e)))?;
+
+        Ok(DriadResolver::build_dns_query(addr, transaction_id))
+    }
+
+    /// Parse a DNS response packet and extract the AMT relay IP address.
+    ///
+    /// Looks for TYPE260 (AMTRELAY) answer records and returns the relay
+    /// address from the first valid record.
+    ///
+    /// @param data - Raw DNS response bytes (Uint8Array)
+    /// @returns Relay IP address as string, or null if no AMTRELAY record found
+    #[wasm_bindgen(js_name = parseDnsResponse)]
+    pub fn parse_dns_response(data: &[u8]) -> Option<String> {
+        DriadResolver::parse_dns_response(data).map(|addr| addr.to_string())
     }
 }
 
