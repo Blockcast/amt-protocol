@@ -48,7 +48,7 @@ pub use platform::Platform;
 pub use gateway::{AmtGateway, GatewayState, GroupKey, GroupInfo};
 pub use igmp::{IgmpV3Report, IgmpRecord, RecordType};
 pub use mld::{MldV2Report, MldRecord};
-pub use driad::DriadResolver;
+pub use driad::{DriadRelayAddress, DriadResolver};
 
 // Re-export platform implementations based on features
 #[cfg(feature = "wasm")]

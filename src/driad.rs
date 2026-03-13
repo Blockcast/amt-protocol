@@ -14,13 +14,33 @@
 //! - DNS wire-format query packet building (RFC 1035)
 //! - DNS wire-format response parsing for TYPE260 AMTRELAY records
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// DNS record type for AMTRELAY (RFC 8777)
 const AMTRELAY_TYPE: u16 = 260;
 
+/// DNS record type A (IPv4 address)
+const DNS_TYPE_A: u16 = 1;
+
 /// DNS class IN
 const DNS_CLASS_IN: u16 = 1;
+
+/// Result of DRIAD relay discovery — may be an IP or a DNS name requiring resolution
+#[derive(Debug, Clone, PartialEq)]
+pub enum DriadRelayAddress {
+    Ip(IpAddr),
+    DnsName(String),
+}
+
+impl fmt::Display for DriadRelayAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DriadRelayAddress::Ip(addr) => write!(f, "{}", addr),
+            DriadRelayAddress::DnsName(name) => write!(f, "{}", name),
+        }
+    }
+}
 
 /// DRIAD Resolver for AMT relay discovery
 ///
@@ -80,11 +100,18 @@ impl DriadResolver {
     /// The transaction ID is provided by the caller for matching responses.
     pub fn build_dns_query(source: IpAddr, transaction_id: u16) -> Vec<u8> {
         let qname = Self::build_query(source);
-        Self::build_dns_query_packet(&qname, transaction_id)
+        Self::build_dns_query_packet(&qname, AMTRELAY_TYPE, transaction_id)
     }
 
-    /// Build DNS wire-format query packet from a domain name string.
-    fn build_dns_query_packet(qname: &str, transaction_id: u16) -> Vec<u8> {
+    /// Build a DNS wire-format A record query for a hostname.
+    ///
+    /// Used to resolve DRIAD type=3 DNS name relays to IPv4 addresses.
+    pub fn build_dns_a_query(hostname: &str, transaction_id: u16) -> Vec<u8> {
+        Self::build_dns_query_packet(hostname, DNS_TYPE_A, transaction_id)
+    }
+
+    /// Build DNS wire-format query packet for any QNAME and QTYPE.
+    fn build_dns_query_packet(qname: &str, qtype: u16, transaction_id: u16) -> Vec<u8> {
         let mut packet = Vec::with_capacity(64);
 
         // DNS Header (12 bytes) - RFC 1035 Section 4.1.1
@@ -103,19 +130,39 @@ impl DriadResolver {
         }
         packet.push(0); // Root label (terminator)
 
-        // QTYPE = 260 (AMTRELAY)
-        packet.extend_from_slice(&AMTRELAY_TYPE.to_be_bytes());
+        // QTYPE
+        packet.extend_from_slice(&qtype.to_be_bytes());
         // QCLASS = IN (1)
         packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
 
         packet
     }
 
-    /// Parse a DNS response packet and extract the relay IP from the first
+    /// Parse a DNS response packet and extract the relay address from the first
     /// AMTRELAY (TYPE260) answer record.
     ///
-    /// Returns the relay IP address, or None if no valid AMTRELAY record found.
-    pub fn parse_dns_response(data: &[u8]) -> Option<IpAddr> {
+    /// Returns the relay address (IP or DNS name), or None if no valid record found.
+    pub fn parse_dns_response(data: &[u8]) -> Option<DriadRelayAddress> {
+        let rdata = Self::find_dns_answer(data, AMTRELAY_TYPE)?;
+        Self::parse_amtrelay_rdata(&rdata)
+    }
+
+    /// Parse a DNS A record response and extract the first IPv4 address.
+    ///
+    /// Used to resolve DRIAD type=3 DNS name relays.
+    pub fn parse_dns_a_response(data: &[u8]) -> Option<IpAddr> {
+        let rdata = Self::find_dns_answer(data, DNS_TYPE_A)?;
+        if rdata.len() == 4 {
+            Some(IpAddr::V4(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3])))
+        } else {
+            None
+        }
+    }
+
+    /// Find the RDATA of the first DNS answer record matching the given type.
+    ///
+    /// Returns a copy of the RDATA bytes, or None if no matching record found.
+    fn find_dns_answer(data: &[u8], record_type: u16) -> Option<Vec<u8>> {
         if data.len() < 12 {
             return None;
         }
@@ -164,8 +211,8 @@ impl DriadResolver {
                 return None;
             }
 
-            if rtype == AMTRELAY_TYPE {
-                return Self::parse_amtrelay_rdata(&data[offset..offset + rdlength]);
+            if rtype == record_type {
+                return Some(data[offset..offset + rdlength].to_vec());
             }
 
             // Skip this record's RDATA
@@ -180,7 +227,7 @@ impl DriadResolver {
     /// Wire format: [precedence:1][D+type:1][relay:variable]
     ///   D (bit 7): discovery optional flag
     ///   type (bits 6-0): 0=none, 1=IPv4, 2=IPv6, 3=domain name
-    fn parse_amtrelay_rdata(rdata: &[u8]) -> Option<IpAddr> {
+    fn parse_amtrelay_rdata(rdata: &[u8]) -> Option<DriadRelayAddress> {
         if rdata.len() < 2 {
             return None;
         }
@@ -194,9 +241,9 @@ impl DriadResolver {
                 if rdata.len() < 6 {
                     return None;
                 }
-                Some(IpAddr::V4(Ipv4Addr::new(
+                Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
                     rdata[2], rdata[3], rdata[4], rdata[5],
-                )))
+                ))))
             }
             2 => {
                 // IPv6: 16 bytes
@@ -205,11 +252,51 @@ impl DriadResolver {
                 }
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&rdata[2..18]);
-                Some(IpAddr::V6(Ipv6Addr::from(octets)))
+                Some(DriadRelayAddress::Ip(IpAddr::V6(Ipv6Addr::from(octets))))
             }
-            // Type 3 (domain name) not supported — would require additional DNS resolution
+            3 => {
+                // DNS wire-format name (RFC 1035 Section 3.3)
+                // Per RFC 8777: compression pointers are NOT allowed in AMTRELAY RDATA
+                Self::parse_dns_wire_name(&rdata[2..]).map(DriadRelayAddress::DnsName)
+            }
             _ => None,
         }
+    }
+
+    /// Parse a DNS wire-format domain name (uncompressed label sequence).
+    ///
+    /// Format: [len][label][len][label]...[0]
+    /// Example: 05 "sfo12" 05 "bcast" 02 "id" 00 → "sfo12.bcast.id"
+    fn parse_dns_wire_name(data: &[u8]) -> Option<String> {
+        let mut labels = Vec::new();
+        let mut offset = 0;
+
+        loop {
+            if offset >= data.len() {
+                return None;
+            }
+            let len = data[offset] as usize;
+            if len == 0 {
+                break;
+            }
+            // Compression pointers not allowed per RFC 8777
+            if (len & 0xC0) != 0 {
+                return None;
+            }
+            offset += 1;
+            if offset + len > data.len() {
+                return None;
+            }
+            let label = std::str::from_utf8(&data[offset..offset + len]).ok()?;
+            labels.push(label.to_string());
+            offset += len;
+        }
+
+        if labels.is_empty() {
+            return None;
+        }
+
+        Some(labels.join("."))
     }
 
     /// Skip a DNS name at the given offset, handling both labels and pointers.
@@ -390,7 +477,10 @@ mod tests {
         response.extend_from_slice(&[192, 0, 2, 1]); // relay: 192.0.2.1
 
         let relay = DriadResolver::parse_dns_response(&response);
-        assert_eq!(relay, Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
+        assert_eq!(
+            relay,
+            Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))))
+        );
     }
 
     #[test]
@@ -419,7 +509,7 @@ mod tests {
         let relay = DriadResolver::parse_dns_response(&response);
         assert_eq!(
             relay,
-            Some(IpAddr::V6("2001:db8::1".parse().unwrap()))
+            Some(DriadRelayAddress::Ip(IpAddr::V6("2001:db8::1".parse().unwrap())))
         );
     }
 
@@ -458,13 +548,87 @@ mod tests {
         // D flag should be masked off — type is in lower 7 bits
         let rdata = [10, 0x81, 192, 0, 2, 1]; // D=1, type=1 (IPv4)
         let result = DriadResolver::parse_amtrelay_rdata(&rdata);
-        assert_eq!(result, Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
+        assert_eq!(
+            result,
+            Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))))
+        );
+    }
+
+    #[test]
+    fn test_parse_amtrelay_rdata_type3_dns_name() {
+        // Type 3: DNS wire-format name for sfo12.bcast.id
+        // Wire: 05 "sfo12" 05 "bcast" 02 "id" 00
+        let rdata = [
+            10,   // precedence
+            0x03, // D=0, type=3 (DNS name)
+            5, b's', b'f', b'o', b'1', b'2', // label "sfo12"
+            5, b'b', b'c', b'a', b's', b't', // label "bcast"
+            2, b'i', b'd',                    // label "id"
+            0,                                // root label
+        ];
+        let result = DriadResolver::parse_amtrelay_rdata(&rdata);
+        assert_eq!(
+            result,
+            Some(DriadRelayAddress::DnsName("sfo12.bcast.id".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_amtrelay_rdata_type3_real_wire_data() {
+        // Real RDATA from production: 0A 03 05 73 66 6F 31 32 05 62 63 61 73 74 02 69 64 00
+        let rdata = [
+            0x0A, 0x03, 0x05, 0x73, 0x66, 0x6F, 0x31, 0x32,
+            0x05, 0x62, 0x63, 0x61, 0x73, 0x74, 0x02, 0x69,
+            0x64, 0x00,
+        ];
+        let result = DriadResolver::parse_amtrelay_rdata(&rdata);
+        assert_eq!(
+            result,
+            Some(DriadRelayAddress::DnsName("sfo12.bcast.id".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_dns_response_type3_dns_name() {
+        // Full DNS response with TYPE260 answer containing type=3 DNS name
+        let source: IpAddr = "69.25.95.128".parse().unwrap();
+        let query = DriadResolver::build_dns_query(source, 0x9999);
+        let mut response = query.clone();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6] = 0x00;
+        response[7] = 0x01;
+
+        // Answer: pointer to QNAME
+        response.push(0xC0);
+        response.push(0x0C);
+        response.extend_from_slice(&260u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&300u32.to_be_bytes());
+        // RDATA: precedence(1) + D+type(1) + DNS name for "sfo12.bcast.id"
+        let dns_name_wire = [
+            5, b's', b'f', b'o', b'1', b'2',
+            5, b'b', b'c', b'a', b's', b't',
+            2, b'i', b'd',
+            0,
+        ];
+        let rdlength = (2 + dns_name_wire.len()) as u16;
+        response.extend_from_slice(&rdlength.to_be_bytes());
+        response.push(10);   // precedence
+        response.push(0x03); // D=0, type=3 (DNS name)
+        response.extend_from_slice(&dns_name_wire);
+
+        let relay = DriadResolver::parse_dns_response(&response);
+        assert_eq!(
+            relay,
+            Some(DriadRelayAddress::DnsName("sfo12.bcast.id".to_string()))
+        );
     }
 
     #[test]
     fn test_parse_amtrelay_rdata_unsupported_type() {
-        // Type 3 (domain name) — not supported
-        let rdata = [10, 0x03, 4, b't', b'e', b's', b't', 0];
+        // Type 4 (unknown) — not supported
+        let rdata = [10, 0x04, 0, 0, 0, 0];
         assert_eq!(DriadResolver::parse_amtrelay_rdata(&rdata), None);
     }
 
@@ -473,5 +637,70 @@ mod tests {
         // IPv4 type but only 3 bytes of address
         let rdata = [10, 0x01, 192, 0, 2];
         assert_eq!(DriadResolver::parse_amtrelay_rdata(&rdata), None);
+    }
+
+    #[test]
+    fn test_parse_dns_wire_name_empty() {
+        // Just root label — invalid for a relay name
+        assert_eq!(DriadResolver::parse_dns_wire_name(&[0]), None);
+    }
+
+    #[test]
+    fn test_parse_dns_wire_name_truncated() {
+        // Label claims 5 bytes but only 3 available
+        assert_eq!(DriadResolver::parse_dns_wire_name(&[5, b'a', b'b']), None);
+    }
+
+    #[test]
+    fn test_parse_dns_wire_name_compression_rejected() {
+        // Compression pointer (0xC0) — not allowed in AMTRELAY RDATA
+        assert_eq!(DriadResolver::parse_dns_wire_name(&[0xC0, 0x0C]), None);
+    }
+
+    #[test]
+    fn test_build_dns_a_query() {
+        let packet = DriadResolver::build_dns_a_query("sfo12.bcast.id", 0x4321);
+        // Verify header
+        assert_eq!(packet[0], 0x43);
+        assert_eq!(packet[1], 0x21);
+        // Verify QNAME contains "sfo12"
+        assert_eq!(packet[12], 5); // label length
+        assert_eq!(&packet[13..18], b"sfo12");
+        // Find QTYPE at end of QNAME
+        // sfo12(6) + bcast(6) + id(3) + root(1) = 16 bytes for QNAME
+        let qtype_offset = 12 + 16;
+        assert_eq!(u16::from_be_bytes([packet[qtype_offset], packet[qtype_offset + 1]]), 1); // TYPE A
+    }
+
+    #[test]
+    fn test_parse_dns_a_response() {
+        // Build a DNS A record response for sfo12.bcast.id → 69.25.95.128
+        let query = DriadResolver::build_dns_a_query("sfo12.bcast.id", 0x5555);
+        let mut response = query.clone();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6] = 0x00;
+        response[7] = 0x01;
+
+        // Answer: pointer to QNAME
+        response.push(0xC0);
+        response.push(0x0C);
+        response.extend_from_slice(&1u16.to_be_bytes());    // TYPE A
+        response.extend_from_slice(&1u16.to_be_bytes());    // CLASS IN
+        response.extend_from_slice(&300u32.to_be_bytes());  // TTL
+        response.extend_from_slice(&4u16.to_be_bytes());    // RDLENGTH = 4
+        response.extend_from_slice(&[69, 25, 95, 128]);     // 69.25.95.128
+
+        let ip = DriadResolver::parse_dns_a_response(&response);
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(69, 25, 95, 128))));
+    }
+
+    #[test]
+    fn test_driad_relay_address_display() {
+        let ip = DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(ip.to_string(), "192.0.2.1");
+
+        let dns = DriadRelayAddress::DnsName("sfo12.bcast.id".to_string());
+        assert_eq!(dns.to_string(), "sfo12.bcast.id");
     }
 }

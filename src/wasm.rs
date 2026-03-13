@@ -433,16 +433,38 @@ impl JsDriad {
         Ok(DriadResolver::build_dns_query(addr, transaction_id))
     }
 
-    /// Parse a DNS response packet and extract the AMT relay IP address.
+    /// Parse a DNS response packet and extract the AMT relay address.
     ///
     /// Looks for TYPE260 (AMTRELAY) answer records and returns the relay
-    /// address from the first valid record.
+    /// address from the first valid record. May return an IP address string
+    /// (for type 1/2) or a DNS hostname (for type 3) that needs further resolution.
     ///
     /// @param data - Raw DNS response bytes (Uint8Array)
-    /// @returns Relay IP address as string, or null if no AMTRELAY record found
+    /// @returns Relay address as string (IP or hostname), or null if no AMTRELAY record found
     #[wasm_bindgen(js_name = parseDnsResponse)]
     pub fn parse_dns_response(data: &[u8]) -> Option<String> {
         DriadResolver::parse_dns_response(data).map(|addr| addr.to_string())
+    }
+
+    /// Build a DNS A record query for a hostname.
+    ///
+    /// Used to resolve DRIAD type=3 DNS name relays to IPv4 addresses.
+    ///
+    /// @param hostname - The hostname to resolve (e.g., "sfo12.bcast.id")
+    /// @param transaction_id - DNS transaction ID for matching responses
+    /// @returns Uint8Array containing the DNS A query packet
+    #[wasm_bindgen(js_name = buildDnsAQuery)]
+    pub fn build_dns_a_query(hostname: &str, transaction_id: u16) -> Vec<u8> {
+        DriadResolver::build_dns_a_query(hostname, transaction_id)
+    }
+
+    /// Parse a DNS A record response and extract the first IPv4 address.
+    ///
+    /// @param data - Raw DNS response bytes (Uint8Array)
+    /// @returns IPv4 address as string, or null if no A record found
+    #[wasm_bindgen(js_name = parseDnsAResponse)]
+    pub fn parse_dns_a_response(data: &[u8]) -> Option<String> {
+        DriadResolver::parse_dns_a_response(data).map(|addr| addr.to_string())
     }
 }
 
