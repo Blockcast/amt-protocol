@@ -247,9 +247,12 @@ impl<P: Platform> AmtGateway<P> {
 
     /// Send membership update (IGMP/MLD report)
     ///
-    /// Returns MembershipUpdate message to send to relay
+    /// Returns MembershipUpdate message to send to relay.
+    /// Valid in Querying (initial handshake) and Active (keep-alive refresh).
+    /// RFC 7450 §5.2.3.4: gateway re-sends Membership Update before the
+    /// relay's AMT query timer expires to maintain tunnel state.
     pub fn send_update(&mut self, report_data: Vec<u8>) -> Result<AmtMessage> {
-        if self.state != GatewayState::Querying {
+        if self.state != GatewayState::Querying && self.state != GatewayState::Active {
             return Err(AmtError::InvalidState);
         }
 
@@ -454,6 +457,19 @@ mod tests {
                 assert_eq!(data, report_data);
             },
             _ => panic!("Expected MembershipUpdate"),
+        };
+
+        // Keep-alive: send_update from Active state (RFC 7450 §5.2.3.4)
+        let keepalive_data = vec![0x66, 0x77];
+        let keepalive_msg = gw.send_update(keepalive_data.clone()).unwrap();
+        assert_eq!(gw.state(), GatewayState::Active); // stays Active
+        match keepalive_msg {
+            AmtMessage::MembershipUpdate { request_nonce, response_mac: mac, report_data: data } => {
+                assert_eq!(request_nonce, req_nonce); // same nonce
+                assert_eq!(mac, response_mac);        // same MAC
+                assert_eq!(data, keepalive_data);
+            },
+            _ => panic!("Expected MembershipUpdate for keep-alive"),
         };
 
         // Teardown
