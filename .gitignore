@@ -4,3 +4,10 @@ Cargo.lock
 *.so
 *.a
 *.dylib
+node_modules/
+dist/
+vendor/
+.build/
+target/
+*.wasm
+pkg/
