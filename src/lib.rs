@@ -59,6 +59,12 @@ pub use platform::wasm_platform::WasmPlatform;
 #[cfg(feature = "ffi")]
 pub use platform::ffi_platform::FfiPlatform;
 
+#[cfg(feature = "native")]
+pub mod native;
+
+#[cfg(feature = "native")]
+pub use native::NativePlatform;
+
 #[cfg(test)]
 mod lib_tests {
     use crate::*;
