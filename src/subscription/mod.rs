@@ -331,6 +331,83 @@ impl<P: Platform> SubscriptionManager<P> {
         Ok(())
     }
 
+    /// Advance time-driven state: keep-alive Updates, Discovery/Request retries.
+    pub fn tick(&mut self, now_ms: u64) -> Result<()> {
+        if self.shutting_down {
+            return Ok(());
+        }
+        // 1. Discovery retry / give-up.
+        if self.inner.state() == GatewayState::Discovering {
+            if let Some(t) = self.last_discovery_at_ms {
+                if now_ms.saturating_sub(t) >= DISCOVERY_TIMEOUT_MS {
+                    if self.discovery_retries < MAX_DISCOVERY_RETRIES {
+                        // Re-send by resetting the inner gateway to Idle then starting again.
+                        self.inner.reset();
+                        self.discovery_retries += 1;
+                        self.start_discovery(now_ms)?;
+                        return Ok(());
+                    } else {
+                        self.inner.reset();
+                        self.discovery_retries = 0;
+                        self.last_discovery_at_ms = None;
+                        self.out_queue.push_back(Event::Warning(AmtError::DiscoveryFailed));
+                        return Ok(());
+                    }
+                }
+            }
+            return Ok(());
+        }
+        // 2. Request retry: if no Query within REQUEST_TIMEOUT_MS, give up to Idle.
+        if self.inner.state() == GatewayState::Requesting {
+            if let Some(t) = self.last_request_at_ms {
+                if now_ms.saturating_sub(t) >= REQUEST_TIMEOUT_MS {
+                    self.inner.reset();
+                    self.last_request_at_ms = None;
+                    self.out_queue.push_back(Event::Warning(AmtError::QueryFailed));
+                }
+            }
+            return Ok(());
+        }
+        // 3. Active keep-alive.
+        if self.inner.state() == GatewayState::Active && !self.groups.is_empty() {
+            let interval_ms = (self.cfg.keepalive_interval_secs as u64) * 1000;
+            if interval_ms == 0 { return Ok(()); }
+            let due = match self.last_update_at_ms {
+                Some(t) => now_ms.saturating_sub(t) >= interval_ms,
+                None => false,
+            };
+            if due {
+                self.send_current_state_update(now_ms)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Earliest future wall-clock (ms) at which a `tick(now_ms)` call would emit work,
+    /// or `None` if no timer is armed. Caller uses this to drive `sleep_until`.
+    pub fn next_wakeup_ms(&self) -> Option<u64> {
+        let mut candidates: Vec<u64> = Vec::with_capacity(3);
+        if self.inner.state() == GatewayState::Discovering {
+            if let Some(t) = self.last_discovery_at_ms {
+                candidates.push(t + DISCOVERY_TIMEOUT_MS);
+            }
+        }
+        if self.inner.state() == GatewayState::Requesting {
+            if let Some(t) = self.last_request_at_ms {
+                candidates.push(t + REQUEST_TIMEOUT_MS);
+            }
+        }
+        if self.inner.state() == GatewayState::Active && !self.groups.is_empty() {
+            let interval_ms = (self.cfg.keepalive_interval_secs as u64) * 1000;
+            if interval_ms > 0 {
+                if let Some(t) = self.last_update_at_ms {
+                    candidates.push(t + interval_ms);
+                }
+            }
+        }
+        candidates.into_iter().min()
+    }
+
     // Test helpers (only compiled into the test binary).
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize { self.pending.len() }
@@ -804,5 +881,102 @@ mod tests {
         m.unsubscribe(&k, 1000).unwrap();
         let events = drain(&mut m);
         assert!(events.is_empty(), "no events on unsubscribe of unknown key");
+    }
+
+    #[test]
+    fn tick_emits_keepalive_update_after_interval() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, k);
+        let _ = drain(&mut m);
+
+        // Default keep-alive is 60s. Advance just past it.
+        let ka_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
+        m.tick(1200 + ka_ms + 1).unwrap();
+
+        let events = drain(&mut m);
+        let update = events.iter().find_map(|ev| match ev {
+            Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
+            _ => None,
+        }).expect("expected keep-alive Update");
+        let report = &update[12..];
+        assert_eq!(report[0], 0x22);
+        assert_eq!(u16::from_be_bytes([report[6], report[7]]), 1);
+    }
+
+    #[test]
+    fn next_wakeup_ms_returns_keepalive_deadline_in_active() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, k);
+        // After drive_to_active, last_update_at_ms is 1200 (the synthesized
+        // Query timestamp). next_wakeup_ms = last_update_at + 60s.
+        let ka_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
+        assert_eq!(m.next_wakeup_ms(), Some(1200 + ka_ms));
+    }
+
+    #[test]
+    fn next_wakeup_ms_idle_returns_none() {
+        let m = mgr();
+        assert_eq!(m.next_wakeup_ms(), None);
+    }
+
+    #[test]
+    fn next_wakeup_ms_discovering_returns_timeout_deadline() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(k, 1000).unwrap();
+        let _ = drain(&mut m);
+        assert_eq!(m.next_wakeup_ms(), Some(1000 + DISCOVERY_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn tick_no_keepalive_before_interval() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, k);
+        let _ = drain(&mut m);
+        m.tick(1200 + 1_000).unwrap();
+        assert!(drain(&mut m).is_empty(), "no events before interval");
+    }
+
+    #[test]
+    fn tick_retries_discovery_then_gives_up() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(k, 1000).unwrap();
+        let _ = drain(&mut m); // consume initial Discovery
+
+        // 3 retries (default MAX_DISCOVERY_RETRIES).
+        let mut t = 1000 + DISCOVERY_TIMEOUT_MS + 1;
+        for _ in 0..MAX_DISCOVERY_RETRIES {
+            m.tick(t).unwrap();
+            let events = drain(&mut m);
+            assert!(events.iter().any(|ev| matches!(ev,
+                Event::Transmit { payload, .. } if payload[0] == 0x01)));
+            t += DISCOVERY_TIMEOUT_MS + 1;
+        }
+
+        // One more tick: should give up.
+        m.tick(t).unwrap();
+        let events = drain(&mut m);
+        assert!(events.iter().any(|ev|
+            matches!(ev, Event::Warning(AmtError::DiscoveryFailed))));
+        assert_eq!(m.state(), GatewayState::Idle, "manager parks in Idle on give-up");
     }
 }
