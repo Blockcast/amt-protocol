@@ -27,6 +27,17 @@ jni = ["ffi", "dep:jni"]
 # UniFFI bindings for iOS/macOS
 uniffi = ["ffi", "dep:uniffi"]
 
+# Native target (tokio-based async runtime + CLI binary)
+native = [
+    "dep:tokio",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:bytes",
+    "dep:anyhow",
+    "dep:serde_json",
+    "dep:clap",
+]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 getrandom = "0.2"
@@ -43,8 +54,20 @@ jni = { version = "0.21", optional = true }
 # UniFFI dependencies (optional)
 uniffi = { version = "0.28", optional = true }
 
+# Native target dependencies (optional, behind `native` feature)
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+bytes = { version = "1", optional = true }
+anyhow = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+# For native-runtime integration tests. `process` is needed by tests/cli_json.rs
+# (Task 3.4) which spawns the built bin via tokio::process::Command.
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "process", "io-util"] }
 
 [profile.release]
 opt-level = "z"     # Optimize for size
