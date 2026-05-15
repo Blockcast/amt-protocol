@@ -57,6 +57,19 @@ CGO_ENABLED=1 go build
 - **ffi**: C FFI bindings (staticlib + cdylib)
 - **wasm**: WebAssembly via wasm-bindgen
 - **jni**: Android JNI bindings
+- **native**: tokio-based async runtime + `amt-verify` CLI
+
+## CLI: `amt-verify`
+
+A native CLI for end-to-end AMT tunnel verification (one-shot or `--watch`),
+built when this crate is compiled with `--features native`:
+
+```bash
+cargo build --release --no-default-features --features native --bin amt-verify
+```
+
+See [`docs/runbook-staging-e2e.md`](docs/runbook-staging-e2e.md) for the
+staging verification procedure.
 
 ## License
 
