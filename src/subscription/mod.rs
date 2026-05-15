@@ -408,11 +408,41 @@ impl<P: Platform> SubscriptionManager<P> {
         candidates.into_iter().min()
     }
 
+    /// Initiate teardown. If currently Active, emits a Teardown Transmit and
+    /// transitions to Closed. From any non-Active state, transitions straight
+    /// to Closed without emitting wire traffic. Subsequent subscribe()/unsubscribe()
+    /// calls return ShutdownInProgress. After shutdown(), `is_closed()` returns
+    /// true so the AsyncAmtGateway runtime can break out of its select loop.
+    pub fn shutdown(&mut self, _now_ms: u64) -> Result<()> {
+        self.shutting_down = true;
+        if self.inner.state() == GatewayState::Active {
+            let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
+            let msg = self.inner.send_teardown()?;
+            self.out_queue.push_back(Event::Transmit {
+                dst: relay,
+                port: self.inner.relay_port(),
+                payload: msg.encode(),
+            });
+            // inner.send_teardown() already advanced inner state to Closed.
+        } else {
+            // No wire traffic — but the manager must still expose "Closed"
+            // semantics to its caller. inner.reset() returns to Idle (the
+            // AmtGateway primitive has no public set-Closed). Track the
+            // shutdown completion in the manager itself.
+            self.inner.reset();
+        }
+        self.closed = true;
+        Ok(())
+    }
+
+    /// True once `shutdown()` has been called.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
     // Test helpers (only compiled into the test binary).
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize { self.pending.len() }
-    #[cfg(test)]
-    pub(crate) fn shutting_down_for_test(&mut self) { self.shutting_down = true; }
 }
 
 #[cfg(test)]
@@ -531,13 +561,13 @@ mod tests {
     #[test]
     fn subscribe_after_shutdown_rejected() {
         let mut m = mgr();
-        m.shutting_down_for_test();
+        m.shutdown(1000).unwrap();
         let err = m.subscribe(
             GroupKey {
                 group: "232.0.0.1".parse().unwrap(),
                 source: Some("10.0.0.1".parse().unwrap()),
             },
-            1000,
+            1100,
         ).unwrap_err();
         assert_eq!(err, AmtError::ShutdownInProgress);
     }
@@ -978,5 +1008,46 @@ mod tests {
         assert!(events.iter().any(|ev|
             matches!(ev, Event::Warning(AmtError::DiscoveryFailed))));
         assert_eq!(m.state(), GatewayState::Idle, "manager parks in Idle on give-up");
+    }
+
+    #[test]
+    fn shutdown_emits_teardown_from_active() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, k);
+        let _ = drain(&mut m);
+
+        m.shutdown(1500).unwrap();
+        assert_eq!(m.state(), GatewayState::Closed);
+        let events = drain(&mut m);
+        let teardown = events.iter().find_map(|ev| match ev {
+            Event::Transmit { payload, .. } if payload[0] == 0x07 => Some(payload.clone()),
+            _ => None,
+        }).expect("expected Teardown transmit");
+        assert_eq!(teardown.len(), 12, "Teardown is 12 bytes");
+    }
+
+    #[test]
+    fn shutdown_in_idle_is_noop() {
+        let mut m = mgr();
+        m.shutdown(1500).unwrap();
+        assert!(drain(&mut m).is_empty());
+    }
+
+    #[test]
+    fn subscribe_after_shutdown_rejected_real() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, k.clone());
+        drain(&mut m);
+        m.shutdown(1500).unwrap();
+        let err = m.subscribe(k, 1600).unwrap_err();
+        assert_eq!(err, AmtError::ShutdownInProgress);
     }
 }
