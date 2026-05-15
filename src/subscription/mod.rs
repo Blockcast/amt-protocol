@@ -287,6 +287,34 @@ impl<P: Platform> SubscriptionManager<P> {
         Ok(())
     }
 
+    /// Unsubscribe from a (group, source). In Active state, emits an incremental
+    /// BLOCK_OLD_SOURCES Update. In all other states, just removes from groups/pending.
+    /// Unknown keys are a silent no-op.
+    pub fn unsubscribe(&mut self, key: &GroupKey, now_ms: u64) -> Result<()> {
+        if self.shutting_down {
+            return Err(AmtError::ShutdownInProgress);
+        }
+        // Drop from pending first (covers pre-handshake removal).
+        self.pending.retain(|k| k != key);
+        let was_announced = self.groups.remove(key).map(|g| g.announced).unwrap_or(false);
+        if !was_announced || self.inner.state() != GatewayState::Active {
+            return Ok(());
+        }
+        let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
+        let report = match relay {
+            IpAddr::V4(_) => crate::subscription::report::build_block_v4(key)?,
+            IpAddr::V6(_) => crate::subscription::report::build_block_v6(key)?,
+        };
+        let msg = self.inner.send_update(report)?;
+        self.out_queue.push_back(Event::Transmit {
+            dst: relay,
+            port: self.inner.relay_port(),
+            payload: msg.encode(),
+        });
+        self.last_update_at_ms = Some(now_ms);
+        Ok(())
+    }
+
     fn emit_incremental_allow(&mut self, key: &GroupKey, now_ms: u64) -> Result<()> {
         let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
         let report = match relay {
@@ -742,5 +770,39 @@ mod tests {
         assert_eq!(report[0], 0x22, "IGMPv3 report type");
         assert_eq!(u16::from_be_bytes([report[6], report[7]]), 1, "single ALLOW record");
         assert_eq!(report[8], 5, "record type = ALLOW_NEW_SOURCES");
+    }
+
+    #[test]
+    fn unsubscribe_in_active_emits_block_update() {
+        let mut m = mgr();
+        let k1 = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, k1.clone());
+
+        m.unsubscribe(&k1, 1400).unwrap();
+        assert_eq!(m.groups().len(), 0);
+
+        let events = drain(&mut m);
+        let update = events.iter().find_map(|ev| match ev {
+            Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
+            _ => None,
+        }).expect("expected MembershipUpdate transmit");
+        let report = &update[12..];
+        assert_eq!(report[8], 6, "record type = BLOCK_OLD_SOURCES");
+    }
+
+    #[test]
+    fn unsubscribe_unknown_key_is_noop() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.99".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        // Not subscribed first; manager in Idle.
+        m.unsubscribe(&k, 1000).unwrap();
+        let events = drain(&mut m);
+        assert!(events.is_empty(), "no events on unsubscribe of unknown key");
     }
 }
