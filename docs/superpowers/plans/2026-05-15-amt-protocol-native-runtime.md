@@ -167,6 +167,7 @@ pub enum AmtError {
     MalformedInner,
     ShutdownInProgress,
 }
+```
 
 **Edit 3b — add display arms** inside the existing `impl fmt::Display for AmtError` match, after the existing `AmtError::IoError(msg) => …` arm:
 
@@ -1172,7 +1173,7 @@ pub fn build_block_v4(key: &GroupKey) -> Result<Vec<u8>> {
 /// Build an incremental MLDv2 ALLOW record for one new v6 (S,G) join in Active state.
 /// MLDv2 record types mirror IGMPv3 (RFC 3810 §5.2.12); ALLOW_NEW_SOURCES = 5.
 pub fn build_allow_v6(key: &GroupKey) -> Result<Vec<u8>> {
-    use crate::mld::MldRecordType;
+    use crate::mld::RecordType as MldRecordType;
     let mut report = MldV2Report::new();
     match (key.group, key.source) {
         (IpAddr::V6(g), Some(IpAddr::V6(s))) => {
@@ -1188,7 +1189,7 @@ pub fn build_allow_v6(key: &GroupKey) -> Result<Vec<u8>> {
 
 /// Build an incremental MLDv2 BLOCK record for v6 unsubscribe in Active state.
 pub fn build_block_v6(key: &GroupKey) -> Result<Vec<u8>> {
-    use crate::mld::MldRecordType;
+    use crate::mld::RecordType as MldRecordType;
     let mut report = MldV2Report::new();
     match (key.group, key.source) {
         (IpAddr::V6(g), Some(IpAddr::V6(s))) => {
@@ -1202,15 +1203,9 @@ pub fn build_block_v6(key: &GroupKey) -> Result<Vec<u8>> {
     Ok(report.encode())
 }
 
-/// NOTE: `build_allow_v6` and `build_block_v6` require `MldRecord::new` +
-/// `MldRecordType` to exist on the existing `src/mld.rs`. If they do not yet
-/// (the existing crate only exposes `ssm_join` / `asm_join` mirroring IGMPv3
-/// at the time of writing), add them mirroring the IGMPv3 surface — they are
-/// trivially derivable from the wire format already encoded in `mld.rs`. If
-/// adding to `mld.rs` is out of scope for this task, gate this helper module
-/// addition behind a small TODO + use `build_current_state_v6` as a temporary
-/// fallback in the manager's v6 path. The spec calls for incremental records,
-/// so DO NOT ship without resolving one way or the other.
+// Note: mld.rs already exposes RecordType (not MldRecordType) — the v6 helpers
+// above import it as `RecordType as MldRecordType` for symmetry with the v4
+// path which uses `RecordType as IgmpRecordType`. No changes needed to mld.rs.
 
 #[cfg(test)]
 mod tests {
