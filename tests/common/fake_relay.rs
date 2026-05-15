@@ -3,7 +3,7 @@
 //! Responds with canned Advertisement → Query → synthetic MulticastData.
 //! Captures inbound datagram types so tests can assert on them.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -88,6 +88,24 @@ impl FakeRelay {
             }
         });
     }
+}
+
+/// Build a synthetic IPv6+UDP inner packet for fake MulticastData (v6 tests).
+pub fn synth_v6_udp(src: [u8; 16], dst: [u8; 16], sp: u16, dp: u16, payload: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0x60, 0x00, 0x00, 0x00];  // version=6, traffic class+flow label=0
+    let payload_len: u16 = 8 + payload.len() as u16;
+    buf.extend_from_slice(&payload_len.to_be_bytes());
+    buf.push(17);   // Next Header = UDP
+    buf.push(64);   // hop limit
+    buf.extend_from_slice(&src);
+    buf.extend_from_slice(&dst);
+    buf.extend_from_slice(&sp.to_be_bytes());
+    buf.extend_from_slice(&dp.to_be_bytes());
+    let udp_len = (8 + payload.len()) as u16;
+    buf.extend_from_slice(&udp_len.to_be_bytes());
+    buf.extend_from_slice(&[0, 0]);  // udp checksum (unused)
+    buf.extend_from_slice(payload);
+    buf
 }
 
 /// Build a synthetic IPv4+UDP inner packet for fake MulticastData.
