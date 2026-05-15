@@ -30,6 +30,7 @@ pub mod gateway;
 pub mod igmp;
 pub mod mld;
 pub mod driad;
+pub mod subscription;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
@@ -49,6 +50,7 @@ pub use gateway::{AmtGateway, GatewayState, GroupKey, GroupInfo};
 pub use igmp::{IgmpV3Report, IgmpRecord, RecordType};
 pub use mld::{MldV2Report, MldRecord};
 pub use driad::{DriadRelayAddress, DriadResolver};
+pub use subscription::Event;
 
 // Re-export platform implementations based on features
 #[cfg(feature = "wasm")]
