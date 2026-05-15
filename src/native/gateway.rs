@@ -65,6 +65,17 @@ impl AsyncAmtGateway {
         }
     }
 
+    /// Construct a builder that will DRIAD-resolve the relay from `source`
+    /// when `.build()` is awaited.
+    pub fn builder_for_source(source: IpAddr) -> AsyncAmtGatewayBuilderForSource {
+        AsyncAmtGatewayBuilderForSource {
+            source,
+            relay_port: 2268,
+            keepalive: Duration::from_secs(AmtConfig::DEFAULT_KEEPALIVE_SECS as u64),
+            log_target: "amt",
+        }
+    }
+
     pub fn state(&self) -> GatewayState {
         match self.state.load(Ordering::SeqCst) {
             0 => GatewayState::Idle,
@@ -277,6 +288,39 @@ fn handle_cmd(
                 *shutdown_ack = Some(ack);
             }
         }
+    }
+}
+
+pub struct AsyncAmtGatewayBuilderForSource {
+    source: IpAddr,
+    relay_port: u16,
+    keepalive: Duration,
+    log_target: &'static str,
+}
+
+impl AsyncAmtGatewayBuilderForSource {
+    pub fn relay_port(mut self, port: u16) -> Self {
+        self.relay_port = port;
+        self
+    }
+    pub fn keepalive(mut self, d: Duration) -> Self {
+        self.keepalive = d;
+        self
+    }
+    pub fn log_target(mut self, t: &'static str) -> Self {
+        self.log_target = t;
+        self
+    }
+
+    pub async fn build(self) -> Result<AsyncAmtGateway> {
+        let relay = super::resolver::resolve_amt_relay(self.source).await?;
+        tracing::info!(target: "amt", relay=%relay, "DRIAD resolved relay");
+        AsyncAmtGateway::builder(relay)
+            .relay_port(self.relay_port)
+            .keepalive(self.keepalive)
+            .log_target(self.log_target)
+            .build()
+            .await
     }
 }
 

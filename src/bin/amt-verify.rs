@@ -13,9 +13,9 @@ use amt_protocol::native::AsyncAmtGateway;
 #[derive(Parser, Debug)]
 #[command(name = "amt-verify", version, about = "AMT E2E verify CLI")]
 struct Args {
-    /// AMT relay address (required in M3; M4 makes this optional via DRIAD)
+    /// AMT relay address. If omitted, DRIAD-resolved from --source.
     #[arg(long)]
-    relay: IpAddr,
+    relay: Option<IpAddr>,
 
     /// AMT relay UDP port (RFC 7450 default 2268)
     #[arg(long, default_value_t = 2268)]
@@ -25,14 +25,18 @@ struct Args {
     #[arg(long)]
     group: IpAddr,
 
-    /// SSM source address — REQUIRED for SSM verify (the spec contract).
-    /// ASM verify is out of scope for this CLI; for ASM, use the library.
+    /// SSM source address — REQUIRED. DRIAD-only mode also needs it
+    /// (DRIAD queries on the source).
     #[arg(long)]
     source: IpAddr,
 
-    /// Force IP family. `auto` infers from --relay.
+    /// Force IP family. `auto` infers from --relay (or resolved relay).
     #[arg(long, value_enum, default_value_t = Family::Auto)]
     family: Family,
+
+    /// Disable DRIAD. Forces --relay to be explicit.
+    #[arg(long, default_value_t = false)]
+    no_driad: bool,
 
     /// Wait at most this many seconds for first data
     #[arg(long, default_value = "30")]
@@ -123,18 +127,58 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
+    // ----- Config validation (exit 2) -----
     if args.json && args.watch {
         return Err(ExitCategory::Config(anyhow!(
             "--json is one-shot only; combining with --watch is rejected"
         )));
     }
-    let inferred_family = if args.relay.is_ipv4() { Family::V4 } else { Family::V6 };
+    if args.no_driad && args.relay.is_none() {
+        return Err(ExitCategory::Config(anyhow!(
+            "--no-driad set but --relay missing"
+        )));
+    }
+
+    // ----- Build gateway (explicit relay OR DRIAD path) -----
+    let (gw, resolved_relay) = match args.relay {
+        Some(r) => {
+            let gw = AsyncAmtGateway::builder(r)
+                .relay_port(args.port)
+                .keepalive(Duration::from_secs(args.keepalive))
+                .build()
+                .await
+                .map_err(ExitCategory::Fatal)?;
+            (gw, r)
+        }
+        None => {
+            let gw = AsyncAmtGateway::builder_for_source(args.source)
+                .relay_port(args.port)
+                .keepalive(Duration::from_secs(args.keepalive))
+                .build()
+                .await
+                .map_err(ExitCategory::HandshakeFail)?;
+            // Re-resolve to surface the address in JSON output. Cheap UDP
+            // lookup; an alternative is exposing a getter on AsyncAmtGateway.
+            let resolved = amt_protocol::native::resolver::resolve_amt_relay(args.source)
+                .await
+                .map_err(ExitCategory::HandshakeFail)?;
+            (gw, resolved)
+        }
+    };
+
+    // Family inference now that the relay is known (resolved or explicit).
+    let inferred_family = if resolved_relay.is_ipv4() {
+        Family::V4
+    } else {
+        Family::V6
+    };
     let effective_family = match args.family {
         Family::Auto => inferred_family,
         explicit => {
-            let relay_family = inferred_family;
-            let same = matches!((explicit, relay_family),
-                (Family::V4, Family::V4) | (Family::V6, Family::V6));
+            let same = matches!(
+                (explicit, inferred_family),
+                (Family::V4, Family::V4) | (Family::V6, Family::V6)
+            );
             if !same {
                 return Err(ExitCategory::Config(anyhow!(
                     "--family explicitly set but does not match --relay family"
@@ -143,25 +187,23 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             explicit
         }
     };
-    let family_str = match effective_family { Family::V4 => "v4", Family::V6 => "v6", Family::Auto => unreachable!() };
+    let family_str = match effective_family {
+        Family::V4 => "v4",
+        Family::V6 => "v6",
+        Family::Auto => unreachable!(),
+    };
 
     if args.group.is_ipv4() != args.source.is_ipv4() {
         return Err(ExitCategory::Config(anyhow!(
             "--group and --source must be the same IP family"
         )));
     }
-    if args.group.is_ipv4() != args.relay.is_ipv4() {
+    if args.group.is_ipv4() != resolved_relay.is_ipv4() {
         return Err(ExitCategory::Config(anyhow!(
             "--group and --relay must be the same IP family"
         )));
     }
 
-    let gw = AsyncAmtGateway::builder(args.relay)
-        .relay_port(args.port)
-        .keepalive(Duration::from_secs(args.keepalive))
-        .build()
-        .await
-        .map_err(ExitCategory::Fatal)?;
     let mut data_rx = gw.subscribe_data();
 
     let started = Instant::now();
@@ -185,23 +227,34 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     if args.json {
         let report = OneshotReport {
             outcome: "ok",
-            relay: args.relay.to_string(),
+            relay: resolved_relay.to_string(),
             family: family_str,
             group: args.group.to_string(),
             source: Some(args.source.to_string()),
-            timings_ms: Timings { first_data: first_data_ms },
+            timings_ms: Timings {
+                first_data: first_data_ms,
+            },
             first_packet: FirstPacket {
                 src: format!("{}:{}", evt.src, evt.src_port),
                 dst_port: evt.dst_port,
                 len: evt.payload.len(),
             },
         };
-        println!("{}", serde_json::to_string(&report).map_err(|e| ExitCategory::Fatal(e.into()))?);
+        println!(
+            "{}",
+            serde_json::to_string(&report).map_err(|e| ExitCategory::Fatal(e.into()))?
+        );
     } else {
         println!(
             "ok — relay={} family={} group={} source={} first_data={}ms first_pkt={}:{} len={}",
-            args.relay, family_str, args.group, args.source,
-            first_data_ms, evt.src, evt.src_port, evt.payload.len()
+            resolved_relay,
+            family_str,
+            args.group,
+            args.source,
+            first_data_ms,
+            evt.src,
+            evt.src_port,
+            evt.payload.len()
         );
     }
 

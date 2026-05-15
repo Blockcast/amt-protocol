@@ -136,7 +136,6 @@ fn response_qname_matches(pkt: &[u8], expected: &str) -> bool {
     while off < pkt.len() {
         let len = pkt[off] as usize;
         if len == 0 {
-            off += 1;
             break;
         }
         if len >= 0xC0 {
