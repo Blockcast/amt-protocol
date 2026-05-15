@@ -50,7 +50,7 @@ pub use gateway::{AmtGateway, GatewayState, GroupKey, GroupInfo};
 pub use igmp::{IgmpV3Report, IgmpRecord, RecordType};
 pub use mld::{MldV2Report, MldRecord};
 pub use driad::{DriadRelayAddress, DriadResolver};
-pub use subscription::Event;
+pub use subscription::{Event, GroupState, SubscriptionManager};
 
 // Re-export platform implementations based on features
 #[cfg(feature = "wasm")]
@@ -58,3 +58,14 @@ pub use platform::wasm_platform::WasmPlatform;
 
 #[cfg(feature = "ffi")]
 pub use platform::ffi_platform::FfiPlatform;
+
+#[cfg(test)]
+mod lib_tests {
+    use crate::*;
+
+    #[test]
+    fn subscription_manager_reachable_from_crate_root() {
+        let _ = SubscriptionManager::<platform::test_platform::TestPlatform>::new;
+        let _ = Event::HandshakeComplete;
+    }
+}
