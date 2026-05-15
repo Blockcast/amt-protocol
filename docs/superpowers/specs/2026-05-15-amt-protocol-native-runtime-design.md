@@ -232,7 +232,12 @@ fan-out shrinks to a `Map<(src, group), WTStream>` lookup.
    among {`last_update_at + cfg.keepalive_interval_secs*1000`,
    `last_discovery_at + DISCOVERY_TIMEOUT_MS`,
    `last_request_at + REQUEST_TIMEOUT_MS`}. On `tick()`, exactly one of
-   {keep-alive Update, Discovery retry, Request retry} fires per call.
+   {keep-alive Update in Active, Discovery retry in Discovering (up to
+   `MAX_DISCOVERY_RETRIES`), Request fail-to-Idle in Requesting} fires per call.
+   Note: Request does **not** retry — on timeout the manager resets to Idle and
+   emits `Event::Warning(QueryFailed)`; the caller decides whether to re-`subscribe()`
+   to restart the handshake. This is intentional: Request retransmits without a
+   fresh Discovery would reuse a possibly-stale relay binding.
 
 7. **Inner data demux is best-effort, never fatal**: a malformed inner IP/UDP packet
    inside `AmtMessage::MulticastData` produces `Event::Warning(MalformedInner)` and

@@ -132,17 +132,25 @@ cargo test --lib error::tests::new_error_variants_display 2>&1 | tail -20
 
 Expected: FAIL with `no variant or associated item named 'FamilyMismatch' found for enum 'AmtError'`.
 
-- [ ] **Step 3: Add the new variants**
+- [ ] **Step 3: Patch the new variants in**
 
-Replace the body of `src/error.rs` with:
+In `src/error.rs`, **add** the new variants to the existing `AmtError` enum (do not replace the whole file — the existing variants and `impl Display` / `impl Error` blocks must be preserved). Apply two targeted edits:
+
+**Edit 3a — add new enum variants** after the existing `IoError(String),` line:
 
 ```rust
-//! Error types for AMT protocol
+    // Subscription-layer additions (M1 — BLO-3457 follow-up)
+    FamilyMismatch,
+    TunnelFull,
+    DiscoveryFailed,
+    QueryFailed,
+    MalformedInner,
+    ShutdownInProgress,
+```
 
-use std::fmt;
+So the full enum becomes:
 
-pub type Result<T> = std::result::Result<T, AmtError>;
-
+```rust
 #[derive(Debug, Clone, PartialEq)]
 pub enum AmtError {
     InvalidMessage(String),
@@ -151,7 +159,7 @@ pub enum AmtError {
     UnexpectedMessage,
     NoResponseMac,
     IoError(String),
-    // Subscription-layer additions (M1)
+    // Subscription-layer additions (M1 — BLO-3457 follow-up)
     FamilyMismatch,
     TunnelFull,
     DiscoveryFailed,
@@ -160,42 +168,18 @@ pub enum AmtError {
     ShutdownInProgress,
 }
 
-impl fmt::Display for AmtError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AmtError::InvalidMessage(msg) => write!(f, "Invalid AMT message: {}", msg),
-            AmtError::InvalidState => write!(f, "Invalid state for operation"),
-            AmtError::InvalidNonce => write!(f, "Nonce mismatch"),
-            AmtError::UnexpectedMessage => write!(f, "Unexpected message type"),
-            AmtError::NoResponseMac => write!(f, "No response MAC available"),
-            AmtError::IoError(msg) => write!(f, "IO error: {}", msg),
+**Edit 3b — add display arms** inside the existing `impl fmt::Display for AmtError` match, after the existing `AmtError::IoError(msg) => …` arm:
+
+```rust
             AmtError::FamilyMismatch => write!(f, "IP family mismatch between relay, group, and source"),
             AmtError::TunnelFull => write!(f, "Tunnel group cap (64) reached"),
             AmtError::DiscoveryFailed => write!(f, "Relay Discovery failed after retries"),
             AmtError::QueryFailed => write!(f, "Membership Query not received within timeout"),
             AmtError::MalformedInner => write!(f, "Malformed inner IP/UDP packet in MulticastData"),
             AmtError::ShutdownInProgress => write!(f, "Operation rejected: manager is shutting down or closed"),
-        }
-    }
-}
-
-impl std::error::Error for AmtError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn new_error_variants_display() {
-        assert_eq!(format!("{}", AmtError::FamilyMismatch), "IP family mismatch between relay, group, and source");
-        assert_eq!(format!("{}", AmtError::TunnelFull), "Tunnel group cap (64) reached");
-        assert_eq!(format!("{}", AmtError::DiscoveryFailed), "Relay Discovery failed after retries");
-        assert_eq!(format!("{}", AmtError::QueryFailed), "Membership Query not received within timeout");
-        assert_eq!(format!("{}", AmtError::MalformedInner), "Malformed inner IP/UDP packet in MulticastData");
-        assert_eq!(format!("{}", AmtError::ShutdownInProgress), "Operation rejected: manager is shutting down or closed");
-    }
-}
 ```
+
+Leave `impl std::error::Error for AmtError {}` and any other existing impls/derives untouched.
 
 - [ ] **Step 4: Run tests to verify it passes + nothing broke**
 
@@ -338,6 +322,14 @@ Create `src/subscription/inner_packet.rs`:
 //!
 //! Returns (src, group, src_port, dst_port, payload). Best-effort — caller
 //! treats parse failure as a `Warning(MalformedInner)` event, not fatal.
+//!
+//! **Deliberate limitation**: IPv6 packets with extension headers
+//! (Hop-by-Hop, Routing, Fragment, ESP, AH, Destination Options) are NOT
+//! decoded. Only IPv6 packets whose `Next Header` is directly UDP (17)
+//! are accepted; anything else returns `MalformedInner`. AMT data from
+//! a relay rarely carries extension headers in practice, and walking them
+//! is a separate ~80 LOC concern. If real traffic needs them, lift this
+//! limitation in a follow-up.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::error::{AmtError, Result};
@@ -611,6 +603,11 @@ pub struct SubscriptionManager<P: Platform> {
     discovery_retries: u32,
     out_queue: VecDeque<Event>,
     shutting_down: bool,
+    /// True after shutdown() has been called. AsyncAmtGateway runtime uses
+    /// this — not the inner AmtGateway state — to detect end-of-life,
+    /// because the inner state machine only reaches Closed on the Active-
+    /// path teardown.
+    closed: bool,
 }
 
 impl<P: Platform> SubscriptionManager<P> {
@@ -627,6 +624,7 @@ impl<P: Platform> SubscriptionManager<P> {
             discovery_retries: 0,
             out_queue: VecDeque::new(),
             shutting_down: false,
+            closed: false,
         }
     }
 
@@ -765,6 +763,27 @@ Append to the `#[cfg(test)] mod tests` block in `src/subscription/mod.rs`:
     }
 
     #[test]
+    fn subscribe_idempotent_at_cap() {
+        // Fill to cap, then re-subscribe the FIRST one. Must succeed (idempotent),
+        // not return TunnelFull.
+        let mut m = mgr();
+        let first_key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(first_key.clone(), 1000).unwrap();
+        for i in 1..MAX_GROUPS_PER_TUNNEL {
+            let group: IpAddr = format!("232.0.0.{}", i + 1).parse().unwrap();
+            m.subscribe(
+                GroupKey { group, source: Some("10.0.0.1".parse().unwrap()) },
+                1000,
+            ).unwrap();
+        }
+        // At cap. Re-sub of an existing key must be Ok and a no-op.
+        m.subscribe(first_key, 2000).expect("idempotent re-sub at cap must succeed");
+    }
+
+    #[test]
     fn subscribe_after_shutdown_rejected() {
         let mut m = mgr();
         m.shutting_down_for_test();
@@ -801,10 +820,14 @@ Add inside `impl<P: Platform> SubscriptionManager<P>` in `src/subscription/mod.r
             return Err(AmtError::ShutdownInProgress);
         }
         self.check_family(&key)?;
-        if self.groups.len() + self.pending.len() >= MAX_GROUPS_PER_TUNNEL {
-            return Err(AmtError::TunnelFull);
-        }
-        if !self.pending.iter().any(|k| k == &key) && !self.groups.contains_key(&key) {
+        // Dedup BEFORE cap — re-subscribing an existing (S,G) at cap must be
+        // idempotent, not TunnelFull.
+        let already_known =
+            self.pending.iter().any(|k| k == &key) || self.groups.contains_key(&key);
+        if !already_known {
+            if self.groups.len() + self.pending.len() >= MAX_GROUPS_PER_TUNNEL {
+                return Err(AmtError::TunnelFull);
+            }
             self.pending.push_back(key);
         }
         match self.inner.state() {
@@ -998,7 +1021,14 @@ Add inside `impl<P: Platform> SubscriptionManager<P>`:
             return Ok(());
         }
         match self.inner.handle_advertisement(nonce, relay_address) {
-            Ok(()) => self.send_request(now_ms),
+            Ok(()) => {
+                // Reset retry counter on successful Discovery — a later
+                // re-Discovery should start its budget at 0, not at the
+                // count left over from a previous successful handshake.
+                self.discovery_retries = 0;
+                self.last_discovery_at_ms = None;
+                self.send_request(now_ms)
+            }
             Err(e) => {
                 self.out_queue.push_back(Event::Warning(e));
                 Ok(())
@@ -1139,6 +1169,49 @@ pub fn build_block_v4(key: &GroupKey) -> Result<Vec<u8>> {
     Ok(report.encode())
 }
 
+/// Build an incremental MLDv2 ALLOW record for one new v6 (S,G) join in Active state.
+/// MLDv2 record types mirror IGMPv3 (RFC 3810 §5.2.12); ALLOW_NEW_SOURCES = 5.
+pub fn build_allow_v6(key: &GroupKey) -> Result<Vec<u8>> {
+    use crate::mld::MldRecordType;
+    let mut report = MldV2Report::new();
+    match (key.group, key.source) {
+        (IpAddr::V6(g), Some(IpAddr::V6(s))) => {
+            report.add_record(MldRecord::new(MldRecordType::AllowNewSources, g, vec![s]));
+        }
+        (IpAddr::V6(g), None) => {
+            report.add_record(MldRecord::asm_join(g));
+        }
+        _ => return Err(AmtError::FamilyMismatch),
+    }
+    Ok(report.encode())
+}
+
+/// Build an incremental MLDv2 BLOCK record for v6 unsubscribe in Active state.
+pub fn build_block_v6(key: &GroupKey) -> Result<Vec<u8>> {
+    use crate::mld::MldRecordType;
+    let mut report = MldV2Report::new();
+    match (key.group, key.source) {
+        (IpAddr::V6(g), Some(IpAddr::V6(s))) => {
+            report.add_record(MldRecord::new(MldRecordType::BlockOldSources, g, vec![s]));
+        }
+        (IpAddr::V6(g), None) => {
+            report.add_record(MldRecord::new(MldRecordType::ChangeToIncludeMode, g, vec![]));
+        }
+        _ => return Err(AmtError::FamilyMismatch),
+    }
+    Ok(report.encode())
+}
+
+/// NOTE: `build_allow_v6` and `build_block_v6` require `MldRecord::new` +
+/// `MldRecordType` to exist on the existing `src/mld.rs`. If they do not yet
+/// (the existing crate only exposes `ssm_join` / `asm_join` mirroring IGMPv3
+/// at the time of writing), add them mirroring the IGMPv3 surface — they are
+/// trivially derivable from the wire format already encoded in `mld.rs`. If
+/// adding to `mld.rs` is out of scope for this task, gate this helper module
+/// addition behind a small TODO + use `build_current_state_v6` as a temporary
+/// fallback in the manager's v6 path. The spec calls for incremental records,
+/// so DO NOT ship without resolving one way or the other.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,6 +1294,42 @@ in Active state. Family-mismatched keys return FamilyMismatch."
 Append to `#[cfg(test)] mod tests`:
 
 ```rust
+    #[test]
+    fn query_with_wrong_nonce_warns_no_transition() {
+        // The spec's "mac_drift_on_data_warns" was misnamed:
+        // AmtMessage::MulticastData carries no nonce / response_mac on the wire
+        // (per messages.rs:167-174 — just type/reserved/ip_packet). The validation
+        // we DO want is on MembershipQuery: a Query whose request_nonce does not
+        // match our outstanding nonce must Warning + leave state in Requesting.
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(key, 1000).unwrap();
+        let initial = drain(&mut m);
+        let disc_nonce = discovery_nonce_from(&initial);
+        let advert = AmtMessage::RelayAdvertisement {
+            nonce: disc_nonce,
+            relay_address: "192.0.2.96".parse::<IpAddr>().unwrap(),
+        };
+        m.handle_datagram(&advert.encode(), 1100).unwrap();
+        let _ = drain(&mut m);
+
+        // Inject a Query with the WRONG nonce.
+        let bad_query = AmtMessage::MembershipQuery {
+            request_nonce: 0xDEAD_BEEF,
+            response_mac: [0xAA; 6],
+            query_data: vec![0; 12],
+        };
+        m.handle_datagram(&bad_query.encode(), 1200).unwrap();
+
+        assert_eq!(m.state(), GatewayState::Requesting, "state must not advance");
+        let events = drain(&mut m);
+        assert!(events.iter().any(|ev| matches!(ev, Event::Warning(_))));
+        assert!(!events.iter().any(|ev| matches!(ev, Event::HandshakeComplete)));
+    }
+
     #[test]
     fn query_flushes_pending_into_one_update_v4() {
         let mut m = mgr();
@@ -1321,6 +1430,13 @@ Add new methods inside the impl:
         while let Some(key) = self.pending.pop_front() {
             self.groups.insert(key.clone(), GroupState::new(key, now_ms));
         }
+        // Event-emit ORDER is part of the public contract: Transmit(Update)
+        // FIRST, HandshakeComplete SECOND. Consumers that want to know "tunnel
+        // is up" via HandshakeComplete must drain in-order; they will have
+        // already enqueued the Update for transmission by the time they see
+        // the signal. Consumers that want "tunnel is up AND Update sent"
+        // semantics get exactly that. Flipping this order would let a consumer
+        // gate on HandshakeComplete and then drop the Update.
         self.send_current_state_update(now_ms)?;
         self.out_queue.push_back(Event::HandshakeComplete);
         Ok(())
@@ -1461,6 +1577,47 @@ Append to `#[cfg(test)] mod tests` in `src/subscription/mod.rs`:
         assert!(events.iter().any(|ev| matches!(ev, Event::Warning(AmtError::MalformedInner))));
         assert!(!events.iter().any(|ev| matches!(ev, Event::Data { .. })));
     }
+
+    #[test]
+    fn unsubscribed_multicast_data_dropped_silently() {
+        let mut m = mgr();
+        let subscribed = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, subscribed);
+
+        // Inner packet for an UNSUBSCRIBED (S,G).
+        let inner = synth_v4_udp_packet([10, 0, 0, 2], [232, 0, 0, 99], 5004, 5005, b"junk");
+        let data_msg = AmtMessage::MulticastData { ip_packet: inner };
+        m.handle_datagram(&data_msg.encode(), 1300).unwrap();
+
+        let events = drain(&mut m);
+        assert!(
+            !events.iter().any(|ev| matches!(ev, Event::Data { .. })),
+            "expected no Data event for unsubscribed (S,G); got: {:?}",
+            events
+        );
+        // Also no Warning — silent drop is the intent.
+        assert!(events.is_empty(), "expected zero events; got: {:?}", events);
+    }
+
+    #[test]
+    fn wrong_source_for_subscribed_group_dropped() {
+        let mut m = mgr();
+        let subscribed = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, subscribed);
+
+        // Right group, WRONG source.
+        let inner = synth_v4_udp_packet([10, 0, 0, 99], [232, 0, 0, 1], 5004, 5005, b"x");
+        let data_msg = AmtMessage::MulticastData { ip_packet: inner };
+        m.handle_datagram(&data_msg.encode(), 1300).unwrap();
+        let events = drain(&mut m);
+        assert!(!events.iter().any(|ev| matches!(ev, Event::Data { .. })));
+    }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1483,6 +1640,20 @@ In `handle_datagram()`, replace the catch-all arm with two arms — add the Mult
                 }
                 match crate::subscription::inner_packet::parse_inner(&ip_packet) {
                     Ok(p) => {
+                        // Filter by subscribed (S,G). The relay can deliver
+                        // data for any (S,G) on the tunnel, including ones
+                        // we have NOT subscribed to (stale state from another
+                        // gateway sharing the tunnel, ASM noise, or a
+                        // misconfigured relay). Drop silently if not subscribed
+                        // — the manager's groups map is the source of truth.
+                        let asm_key = GroupKey { group: p.dst, source: None };
+                        let ssm_key = GroupKey { group: p.dst, source: Some(p.src) };
+                        if !self.groups.contains_key(&ssm_key)
+                            && !self.groups.contains_key(&asm_key)
+                        {
+                            // Not a subscription we care about. No event.
+                            return Ok(());
+                        }
                         self.out_queue.push_back(Event::Data {
                             src: p.src,
                             group: p.dst,
@@ -1593,7 +1764,7 @@ Add the helper inside the impl block:
         let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
         let report = match relay {
             IpAddr::V4(_) => crate::subscription::report::build_allow_v4(key)?,
-            IpAddr::V6(_) => crate::subscription::report::build_current_state_v6(std::iter::once(key))?,
+            IpAddr::V6(_) => crate::subscription::report::build_allow_v6(key)?,
         };
         let msg = self.inner.send_update(report)?;
         self.out_queue.push_back(Event::Transmit {
@@ -1701,11 +1872,7 @@ Add inside `impl<P: Platform> SubscriptionManager<P>`:
         let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
         let report = match relay {
             IpAddr::V4(_) => crate::subscription::report::build_block_v4(key)?,
-            IpAddr::V6(_) => {
-                // For v6, an empty current-state report covering remaining groups
-                // is the simplest correct signal that this (S,G) is gone.
-                crate::subscription::report::build_current_state_v6(self.groups.keys())?
-            }
+            IpAddr::V6(_) => crate::subscription::report::build_block_v6(key)?,
         };
         let msg = self.inner.send_update(report)?;
         self.out_queue.push_back(Event::Transmit {
@@ -1771,6 +1938,38 @@ Append to `#[cfg(test)] mod tests`:
         let report = &update[12..];
         assert_eq!(report[0], 0x22);
         assert_eq!(u16::from_be_bytes([report[6], report[7]]), 1);
+    }
+
+    #[test]
+    fn next_wakeup_ms_returns_keepalive_deadline_in_active() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, k);
+        // After drive_to_active, last_update_at_ms is 1200 (the synthesized
+        // Query timestamp). next_wakeup_ms = last_update_at + 60s.
+        let ka_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
+        assert_eq!(m.next_wakeup_ms(), Some(1200 + ka_ms));
+    }
+
+    #[test]
+    fn next_wakeup_ms_idle_returns_none() {
+        let m = mgr();
+        assert_eq!(m.next_wakeup_ms(), None);
+    }
+
+    #[test]
+    fn next_wakeup_ms_discovering_returns_timeout_deadline() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(k, 1000).unwrap();
+        let _ = drain(&mut m);
+        assert_eq!(m.next_wakeup_ms(), Some(1000 + DISCOVERY_TIMEOUT_MS));
     }
 
     #[test]
@@ -1999,8 +2198,9 @@ Add inside `impl<P: Platform> SubscriptionManager<P>`:
 ```rust
     /// Initiate teardown. If currently Active, emits a Teardown Transmit and
     /// transitions to Closed. From any non-Active state, transitions straight
-    /// to Closed without emitting. Subsequent subscribe()/unsubscribe() calls
-    /// return ShutdownInProgress.
+    /// to Closed without emitting wire traffic. Subsequent subscribe()/unsubscribe()
+    /// calls return ShutdownInProgress. After shutdown(), `is_closed()` returns
+    /// true so the AsyncAmtGateway runtime can break out of its select loop.
     pub fn shutdown(&mut self, _now_ms: u64) -> Result<()> {
         self.shutting_down = true;
         if self.inner.state() == GatewayState::Active {
@@ -2011,11 +2211,24 @@ Add inside `impl<P: Platform> SubscriptionManager<P>`:
                 port: self.inner.relay_port(),
                 payload: msg.encode(),
             });
+            // inner.send_teardown() already advanced inner state to Closed.
         } else {
-            // Move inner directly to Closed by resetting and marking shutting_down.
+            // No wire traffic — but the manager must still expose "Closed"
+            // semantics to its caller. inner.reset() returns to Idle (the
+            // AmtGateway primitive has no public set-Closed). Track the
+            // shutdown completion in the manager itself.
             self.inner.reset();
         }
+        self.closed = true;
         Ok(())
+    }
+
+    /// True once `shutdown()` has been called. The AsyncAmtGateway runtime
+    /// uses this to detect "manager is done" regardless of whether the inner
+    /// AmtGateway state machine itself reached Closed (it only does on the
+    /// Active-state teardown path).
+    pub fn is_closed(&self) -> bool {
+        self.closed
     }
 ```
 
@@ -2198,6 +2411,7 @@ native = [
     "dep:bytes",
     "dep:anyhow",
     "dep:serde_json",
+    "dep:clap",
 ]
 ```
 
@@ -2211,13 +2425,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 bytes = { version = "1", optional = true }
 anyhow = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 ```
 
 In `[dev-dependencies]`, append:
 
 ```toml
-# For native-runtime integration tests
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
+# For native-runtime integration tests. `process` is needed by tests/cli_json.rs
+# (Task 3.4) which spawns the built bin via tokio::process::Command.
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "process", "io-util"] }
 ```
 
 - [ ] **Step 3: Verify build still works with default features**
@@ -2573,6 +2789,11 @@ pub struct AsyncAmtGateway {
     data_tx: broadcast::Sender<DataEvent>,
     state: Arc<AtomicU8>,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// Holds a fatal runtime error (socket bind/send/recv unrecoverable) if
+    /// the spawned task exited because of one. `shutdown()` checks this and
+    /// returns Err(...) instead of Ok(()) when set. Aligns with spec
+    /// "Fatal runtime → AsyncAmtGateway::shutdown future resolves with Err".
+    fatal: Arc<Mutex<Option<anyhow::Error>>>,
 }
 
 pub struct AsyncAmtGatewayBuilder {
@@ -2627,6 +2848,7 @@ impl AsyncAmtGatewayBuilder {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(32);
         let (data_tx, _) = broadcast::channel::<DataEvent>(1024);
         let state = Arc::new(AtomicU8::new(state_to_u8(GatewayState::Idle)));
+        let fatal: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
 
         let task = tokio::spawn(run_task(
             sock,
@@ -2634,6 +2856,7 @@ impl AsyncAmtGatewayBuilder {
             cmd_rx,
             data_tx.clone(),
             state.clone(),
+            fatal.clone(),
             self.log_target,
         ));
 
@@ -2642,6 +2865,7 @@ impl AsyncAmtGatewayBuilder {
             data_tx,
             state,
             task: Mutex::new(Some(task)),
+            fatal,
         })
     }
 }
@@ -2663,6 +2887,7 @@ async fn run_task(
     mut cmd_rx: mpsc::Receiver<Cmd>,
     data_tx: broadcast::Sender<DataEvent>,
     state: Arc<AtomicU8>,
+    fatal: Arc<Mutex<Option<anyhow::Error>>>,
     log_target: &'static str,
 ) {
     let platform = Arc::new(NativePlatform::new());
@@ -2690,7 +2915,8 @@ async fn run_task(
                         let _ = mgr.handle_datagram(&buf[..n], now_ms_local());
                     }
                     Err(e) => {
-                        tracing::warn!(target: log_target, error=?e, "socket recv error");
+                        tracing::error!(target: log_target, error=?e, "socket recv error (fatal)");
+                        *fatal.lock().await = Some(anyhow!("socket recv: {e}"));
                         break;
                     }
                 }
@@ -2707,7 +2933,9 @@ async fn run_task(
                 Event::Transmit { dst, port, payload } => {
                     let target = SocketAddr::new(dst, port);
                     if let Err(e) = sock.send_to(&payload, target).await {
-                        tracing::warn!(target: log_target, error=?e, "socket send error");
+                        tracing::error!(target: log_target, error=?e, "socket send error (fatal)");
+                        *fatal.lock().await = Some(anyhow!("socket send: {e}"));
+                        // Don't break mid-drain — let the next select iteration exit.
                     }
                 }
                 Event::Data { src, group, src_port, dst_port, payload } => {
@@ -2730,7 +2958,11 @@ async fn run_task(
         }
         state.store(state_to_u8(mgr.state()), Ordering::SeqCst);
 
-        if mgr.state() == GatewayState::Closed {
+        // Loop-exit conditions:
+        // (a) SubscriptionManager has been shut down (covers Active-teardown
+        //     AND Idle-direct-close paths — fixes shutdown-from-Idle hang).
+        // (b) A fatal socket error was just recorded.
+        if mgr.is_closed() || fatal.lock().await.is_some() {
             if let Some(ack) = shutdown_ack.take() {
                 let _ = ack.send(Ok(()));
             }
@@ -2853,6 +3085,9 @@ Inside `impl AsyncAmtGateway` (in `src/native/gateway.rs`), append:
     }
 
     /// Initiate graceful shutdown. Waits for the runtime task to finish.
+    /// Returns `Err(...)` if a fatal runtime error was observed during the
+    /// lifetime of this gateway (per spec "Fatal runtime → shutdown future
+    /// resolves with Err").
     pub async fn shutdown(self) -> Result<()> {
         let (ack, rx) = oneshot::channel::<Result<()>>();
         let _ = self.cmd_tx.send(Cmd::Shutdown { ack }).await;
@@ -2860,6 +3095,10 @@ Inside `impl AsyncAmtGateway` (in `src/native/gateway.rs`), append:
         let mut guard = self.task.lock().await;
         if let Some(handle) = guard.take() {
             handle.await.map_err(|e| anyhow!("task join: {e}"))?;
+        }
+        // Surface any fatal runtime error captured by run_task.
+        if let Some(e) = self.fatal.lock().await.take() {
+            return Err(e);
         }
         Ok(())
     }
@@ -3118,32 +3357,14 @@ git tag -a m2-async-runtime -m "M2 complete: AsyncAmtGateway native runtime + Ti
 
 Gate: `cargo build --no-default-features --features native --bin amt-verify` succeeds; hand-tested against fake relay (or wait for M5 to run against staging).
 
-### Task 3.1: Add `clap` to native feature + `[[bin]]` declaration
+### Task 3.1: Add `[[bin]]` declaration for `amt-verify`
 
 **Files:**
 - Modify: `Cargo.toml`
 
-- [ ] **Step 1: Add the dep + bin**
+> `clap` already lives in the `native` feature + optional `[dependencies]` from Task 2.1 — do not re-add. This task only adds the `[[bin]]` block so Cargo knows about `src/bin/amt-verify.rs`.
 
-In `Cargo.toml`, update the `native` feature to include `clap`:
-
-```toml
-native = [
-    "dep:tokio",
-    "dep:tracing",
-    "dep:tracing-subscriber",
-    "dep:bytes",
-    "dep:anyhow",
-    "dep:serde_json",
-    "dep:clap",
-]
-```
-
-Add to `[dependencies]`:
-
-```toml
-clap = { version = "4", features = ["derive", "env"], optional = true }
-```
+- [ ] **Step 1: Add the bin**
 
 Add a new `[[bin]]` block at the bottom of `Cargo.toml`:
 
@@ -3174,10 +3395,11 @@ Expected: FAIL — `couldn't read 'src/bin/amt-verify.rs'`. This proves Cargo wi
 
 ```bash
 git add Cargo.toml Cargo.lock
-git commit -m "build(cli): add clap dep + [[bin]] amt-verify
+git commit -m "build(cli): declare [[bin]] amt-verify
 
 bin gated on required-features = [\"native\"] so it doesn't
-disturb WASM/FFI/JNI paths. Source file lands in next commit."
+disturb WASM/FFI/JNI paths. clap dep was added in Task 2.1.
+Source file lands in next commit."
 ```
 
 ---
@@ -3219,9 +3441,14 @@ struct Args {
     #[arg(long)]
     group: IpAddr,
 
-    /// SSM source address (mandatory for SSM; omit for ASM)
+    /// SSM source address — REQUIRED for SSM verify (the spec contract).
+    /// ASM verify is out of scope for this CLI; for ASM, use the library.
     #[arg(long)]
-    source: Option<IpAddr>,
+    source: IpAddr,
+
+    /// Force IP family. `auto` infers from --relay.
+    #[arg(long, value_enum, default_value_t = Family::Auto)]
+    family: Family,
 
     /// Wait at most this many seconds for first data
     #[arg(long, default_value = "30")]
@@ -3235,13 +3462,44 @@ struct Args {
     #[arg(long, default_value_t = false)]
     watch: bool,
 
-    /// Machine-readable JSON output (one-shot mode only)
+    /// Machine-readable JSON output (one-shot mode only).
+    /// Rejected with exit 2 if combined with --watch.
     #[arg(long, default_value_t = false)]
     json: bool,
 
     /// Verbose logging (sets RUST_LOG=debug for crate=amt)
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
+}
+
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum Family { V4, V6, Auto }
+
+/// Exit-code classification per spec:
+///   0 → success (one-shot data observed, or watch SIGINT clean teardown)
+///   1 → handshake / verify failure (timeout, nonce mismatch, broadcast closed)
+///   2 → config error (clap rejects, --json with --watch, family mismatch arg combo)
+///   3 → fatal runtime (socket bind / send / recv unrecoverable)
+#[derive(Debug)]
+enum ExitCategory {
+    HandshakeFail(anyhow::Error),
+    Config(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl ExitCategory {
+    fn code(&self) -> u8 {
+        match self {
+            ExitCategory::HandshakeFail(_) => 1,
+            ExitCategory::Config(_)        => 2,
+            ExitCategory::Fatal(_)         => 3,
+        }
+    }
+    fn err(&self) -> &anyhow::Error {
+        match self {
+            ExitCategory::HandshakeFail(e) | ExitCategory::Config(e) | ExitCategory::Fatal(e) => e,
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -3273,37 +3531,84 @@ async fn main() -> ExitCode {
 
     match run(args).await {
         Ok(()) => ExitCode::from(0),
-        Err(e) => {
-            eprintln!("amt-verify: {e:#}");
-            ExitCode::from(1)
+        Err(cat) => {
+            eprintln!("amt-verify: {:#}", cat.err());
+            ExitCode::from(cat.code())
         }
     }
 }
 
-async fn run(args: Args) -> Result<()> {
-    let family = if args.relay.is_ipv4() { "v4" } else { "v6" };
+async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
+    // ----- Config validation (exit 2) -----
+    if args.json && args.watch {
+        return Err(ExitCategory::Config(anyhow!(
+            "--json is one-shot only; combining with --watch is rejected"
+        )));
+    }
+    let inferred_family = if args.relay.is_ipv4() { Family::V4 } else { Family::V6 };
+    let effective_family = match args.family {
+        Family::Auto => inferred_family,
+        explicit => {
+            let relay_family = inferred_family;
+            let same = matches!((explicit, relay_family),
+                (Family::V4, Family::V4) | (Family::V6, Family::V6));
+            if !same {
+                return Err(ExitCategory::Config(anyhow!(
+                    "--family explicitly set but does not match --relay family"
+                )));
+            }
+            explicit
+        }
+    };
+    let family_str = match effective_family { Family::V4 => "v4", Family::V6 => "v6", Family::Auto => unreachable!() };
+
+    // group/source family checks (exit 2 — caught before any network)
+    if args.group.is_ipv4() != args.source.is_ipv4() {
+        return Err(ExitCategory::Config(anyhow!(
+            "--group and --source must be the same IP family"
+        )));
+    }
+    if args.group.is_ipv4() != args.relay.is_ipv4() {
+        return Err(ExitCategory::Config(anyhow!(
+            "--group and --relay must be the same IP family"
+        )));
+    }
+
+    // ----- Build gateway -----
     let gw = AsyncAmtGateway::builder(args.relay)
         .relay_port(args.port)
         .keepalive(Duration::from_secs(args.keepalive))
         .build()
-        .await?;
+        .await
+        .map_err(ExitCategory::Fatal)?;
     let mut data_rx = gw.subscribe_data();
 
     let started = Instant::now();
-    gw.subscribe(args.group, args.source).await?;
-    let evt = tokio::time::timeout(Duration::from_secs(args.timeout), data_rx.recv())
+    gw.subscribe(args.group, Some(args.source))
         .await
-        .map_err(|_| anyhow!("timed out after {}s waiting for first data", args.timeout))?
-        .map_err(|_| anyhow!("data broadcast closed before first packet"))?;
+        .map_err(ExitCategory::HandshakeFail)?;
+
+    // ----- First data matching (group, source) within timeout -----
+    let evt = match recv_first_matching(
+        &mut data_rx,
+        args.group,
+        args.source,
+        Duration::from_secs(args.timeout),
+    )
+    .await
+    {
+        Ok(e) => e,
+        Err(e) => return Err(ExitCategory::HandshakeFail(e)),
+    };
     let first_data_ms = started.elapsed().as_millis() as u64;
 
     if args.json {
         let report = OneshotReport {
             outcome: "ok",
             relay: args.relay.to_string(),
-            family,
+            family: family_str,
             group: args.group.to_string(),
-            source: args.source.map(|s| s.to_string()),
+            source: Some(args.source.to_string()),
             timings_ms: Timings { first_data: first_data_ms },
             first_packet: FirstPacket {
                 src: format!("{}:{}", evt.src, evt.src_port),
@@ -3311,21 +3616,51 @@ async fn run(args: Args) -> Result<()> {
                 len: evt.payload.len(),
             },
         };
-        println!("{}", serde_json::to_string(&report)?);
+        println!("{}", serde_json::to_string(&report).map_err(|e| ExitCategory::Fatal(e.into()))?);
     } else {
         println!(
-            "ok — relay={} family={} group={} source={:?} first_data={}ms first_pkt={}:{} len={}",
-            args.relay, family, args.group, args.source,
+            "ok — relay={} family={} group={} source={} first_data={}ms first_pkt={}:{} len={}",
+            args.relay, family_str, args.group, args.source,
             first_data_ms, evt.src, evt.src_port, evt.payload.len()
         );
     }
 
     if args.watch {
-        run_watch(gw, data_rx).await?;
+        run_watch(gw, data_rx).await.map_err(ExitCategory::Fatal)?;
     } else {
-        gw.shutdown().await?;
+        // shutdown surfaces fatal runtime errors; map them to category 3.
+        gw.shutdown().await.map_err(ExitCategory::Fatal)?;
     }
     Ok(())
+}
+
+/// Loop on the broadcast channel until a DataEvent matches (group, source)
+/// or the timeout fires. Unrelated events from the same tunnel are skipped.
+/// This implements the spec's "await first DataEvent matching (group, source)"
+/// contract; without the filter loop, the CLI could complete successfully on
+/// noise from another subscription sharing the tunnel.
+async fn recv_first_matching(
+    rx: &mut tokio::sync::broadcast::Receiver<amt_protocol::native::DataEvent>,
+    group: IpAddr,
+    source: IpAddr,
+    timeout: Duration,
+) -> Result<amt_protocol::native::DataEvent> {
+    use tokio::sync::broadcast::error::RecvError;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())
+            .ok_or_else(|| anyhow!("timed out after {}s waiting for first data matching ({}, {})",
+                timeout.as_secs(), group, source))?;
+        let recv = tokio::time::timeout(remaining, rx.recv()).await
+            .map_err(|_| anyhow!("timed out after {}s waiting for first data matching ({}, {})",
+                timeout.as_secs(), group, source))?;
+        match recv {
+            Ok(evt) if evt.group == group && evt.src == source => return Ok(evt),
+            Ok(_skip) => continue,
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => return Err(anyhow!("data broadcast closed before first matching packet")),
+        }
+    }
 }
 
 async fn run_watch(
@@ -3802,7 +4137,7 @@ use anyhow::{anyhow, Context, Result};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
-use amt_protocol::driad::{DriadRelayAddress, DriadResolver};
+use crate::driad::{DriadRelayAddress, DriadResolver};
 
 const DNS_PORT: u16 = 53;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -4083,8 +4418,10 @@ async fn follow_up_a_or_aaaa(name: &str, nameservers: &[IpAddr]) -> Result<IpAdd
 }
 
 async fn follow_up_a_or_aaaa_one(name: &str, ns: IpAddr, port: u16) -> Result<IpAddr> {
-    let a_q   = DriadResolver::build_dns_a_query(name, rand_id());
-    let aaaa_q = DriadResolver::build_dns_aaaa_query(name, rand_id());
+    let a_id = rand_id();
+    let aaaa_id = rand_id();
+    let a_q   = DriadResolver::build_dns_a_query(name, a_id);
+    let aaaa_q = DriadResolver::build_dns_aaaa_query(name, aaaa_id);
     let bind = if ns.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     let sock = UdpSocket::bind(bind).await?;
     let target = std::net::SocketAddr::new(ns, port);
@@ -4097,14 +4434,57 @@ async fn follow_up_a_or_aaaa_one(name: &str, ns: IpAddr, port: u16) -> Result<Ip
             .ok_or_else(|| anyhow!("A/AAAA follow-up timed out for {}", name))?;
         let (n, _) = timeout(remaining, sock.recv_from(&mut buf)).await
             .map_err(|_| anyhow!("A/AAAA recv_from timed out for {}", name))??;
-        if let Some(addr) = DriadResolver::parse_dns_aaaa_response(&buf[..n]) {
-            return Ok(addr);
+        let pkt = &buf[..n];
+        // Validate response TXID + qname BEFORE trusting any answer bytes.
+        // Without this, a stray / spoofed / stale packet could be accepted
+        // as the relay's address.
+        if pkt.len() < 12 { continue; }
+        let resp_id = u16::from_be_bytes([pkt[0], pkt[1]]);
+        let matches_a    = resp_id == a_id;
+        let matches_aaaa = resp_id == aaaa_id;
+        if !matches_a && !matches_aaaa {
+            // Not for either of our queries — ignore.
+            continue;
         }
-        if let Some(addr) = DriadResolver::parse_dns_a_response(&buf[..n]) {
-            return Ok(addr);
+        // qname match: the question section starts at offset 12. Compare
+        // against the expected wire-encoded name length we sent.
+        if !response_qname_matches(pkt, name) {
+            continue;
         }
-        // Unrecognized — keep waiting.
+        if matches_aaaa {
+            if let Some(addr) = DriadResolver::parse_dns_aaaa_response(pkt) {
+                return Ok(addr);
+            }
+        }
+        if matches_a {
+            if let Some(addr) = DriadResolver::parse_dns_a_response(pkt) {
+                return Ok(addr);
+            }
+        }
+        // Matched ID + qname but no usable answer — keep waiting for the sibling.
     }
+}
+
+/// Compare the question-section qname in a DNS response to an expected hostname.
+/// Returns true iff the wire-encoded labels match (case-insensitive ASCII).
+fn response_qname_matches(pkt: &[u8], expected: &str) -> bool {
+    if pkt.len() < 12 { return false; }
+    let mut off = 12usize;
+    let mut expected_labels: Vec<&str> = expected.trim_end_matches('.').split('.').collect();
+    expected_labels.retain(|s| !s.is_empty());
+    let mut got_labels: Vec<String> = Vec::new();
+    while off < pkt.len() {
+        let len = pkt[off] as usize;
+        if len == 0 { off += 1; break; }
+        if len >= 0xC0 { return false; } // pointer in question is malformed
+        off += 1;
+        if off + len > pkt.len() { return false; }
+        let label = String::from_utf8_lossy(&pkt[off..off + len]).to_string();
+        got_labels.push(label);
+        off += len;
+    }
+    if got_labels.len() != expected_labels.len() { return false; }
+    got_labels.iter().zip(expected_labels.iter()).all(|(g, e)| g.eq_ignore_ascii_case(e))
 }
 
 #[cfg(test)]
@@ -4206,10 +4586,14 @@ struct Args {
     #[arg(long)]
     group: IpAddr,
 
-    /// SSM source address. Mandatory for SSM AND when --relay is omitted
-    /// (DRIAD needs the source). Omit only for ASM with explicit --relay.
+    /// SSM source address — REQUIRED. DRIAD-only mode also needs it
+    /// (DRIAD queries on the source).
     #[arg(long)]
-    source: Option<IpAddr>,
+    source: IpAddr,
+
+    /// Force IP family. `auto` infers from --relay (or resolved relay).
+    #[arg(long, value_enum, default_value_t = Family::Auto)]
+    family: Family,
 
     /// Disable DRIAD. Forces --relay to be explicit.
     #[arg(long, default_value_t = false)]
@@ -4227,7 +4611,8 @@ struct Args {
     #[arg(long, default_value_t = false)]
     watch: bool,
 
-    /// Machine-readable JSON output (one-shot mode only)
+    /// Machine-readable JSON output (one-shot mode only).
+    /// Rejected with exit 2 if combined with --watch.
     #[arg(long, default_value_t = false)]
     json: bool,
 
@@ -4237,52 +4622,109 @@ struct Args {
 }
 ```
 
+The `Family` and `ExitCategory` enums from Task 3.2 are unchanged and reused.
+
 Replace the `run()` function:
 
 ```rust
-async fn run(args: Args) -> Result<()> {
-    let gw = match (args.relay, args.no_driad, args.source) {
-        (Some(r), _, _) => {
-            AsyncAmtGateway::builder(r)
+async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
+    // ----- Config validation (exit 2) -----
+    if args.json && args.watch {
+        return Err(ExitCategory::Config(anyhow!(
+            "--json is one-shot only; combining with --watch is rejected"
+        )));
+    }
+    if args.no_driad && args.relay.is_none() {
+        return Err(ExitCategory::Config(anyhow!(
+            "--no-driad set but --relay missing"
+        )));
+    }
+
+    // ----- Build gateway (relay path OR DRIAD path) -----
+    let (gw, resolved_relay) = match args.relay {
+        Some(r) => {
+            let gw = AsyncAmtGateway::builder(r)
                 .relay_port(args.port)
                 .keepalive(Duration::from_secs(args.keepalive))
                 .build()
-                .await?
+                .await
+                .map_err(ExitCategory::Fatal)?;
+            (gw, r)
         }
-        (None, true, _) => {
-            return Err(anyhow!("--no-driad set but --relay missing"));
-        }
-        (None, false, Some(src)) => {
-            AsyncAmtGateway::builder_for_source(src)
+        None => {
+            // DRIAD path — resolve internally, then build.
+            let gw = AsyncAmtGateway::builder_for_source(args.source)
                 .relay_port(args.port)
                 .keepalive(Duration::from_secs(args.keepalive))
                 .build()
-                .await?
-        }
-        (None, false, None) => {
-            return Err(anyhow!("either --relay or --source (for DRIAD) is required"));
+                .await
+                .map_err(ExitCategory::HandshakeFail)?;
+            // For JSON output we want to print the resolved relay. Re-resolve
+            // once explicitly (cheap) — alternative would be having
+            // builder_for_source expose the resolved address.
+            let resolved = amt_protocol::native::resolver::resolve_amt_relay(args.source)
+                .await
+                .map_err(ExitCategory::HandshakeFail)?;
+            (gw, resolved)
         }
     };
-    let family = match gw.state() {
-        _ => if args.relay.map(|r| r.is_ipv4()).unwrap_or(true) { "v4" } else { "v6" },
+
+    // Family inference now that we know the relay (resolved or explicit).
+    let inferred_family = if resolved_relay.is_ipv4() { Family::V4 } else { Family::V6 };
+    let effective_family = match args.family {
+        Family::Auto => inferred_family,
+        explicit => {
+            let same = matches!((explicit, inferred_family),
+                (Family::V4, Family::V4) | (Family::V6, Family::V6));
+            if !same {
+                return Err(ExitCategory::Config(anyhow!(
+                    "--family explicitly set but does not match --relay family"
+                )));
+            }
+            explicit
+        }
     };
+    let family_str = match effective_family { Family::V4 => "v4", Family::V6 => "v6", Family::Auto => unreachable!() };
+
+    // group/source family checks (caught before any further wire traffic)
+    if args.group.is_ipv4() != args.source.is_ipv4() {
+        return Err(ExitCategory::Config(anyhow!(
+            "--group and --source must be the same IP family"
+        )));
+    }
+    if args.group.is_ipv4() != resolved_relay.is_ipv4() {
+        return Err(ExitCategory::Config(anyhow!(
+            "--group and --relay must be the same IP family"
+        )));
+    }
+
     let mut data_rx = gw.subscribe_data();
 
     let started = Instant::now();
-    gw.subscribe(args.group, args.source).await?;
-    let evt = tokio::time::timeout(Duration::from_secs(args.timeout), data_rx.recv())
+    gw.subscribe(args.group, Some(args.source))
         .await
-        .map_err(|_| anyhow!("timed out after {}s waiting for first data", args.timeout))?
-        .map_err(|_| anyhow!("data broadcast closed before first packet"))?;
+        .map_err(ExitCategory::HandshakeFail)?;
+
+    let evt = match recv_first_matching(
+        &mut data_rx,
+        args.group,
+        args.source,
+        Duration::from_secs(args.timeout),
+    )
+    .await
+    {
+        Ok(e) => e,
+        Err(e) => return Err(ExitCategory::HandshakeFail(e)),
+    };
     let first_data_ms = started.elapsed().as_millis() as u64;
 
     if args.json {
         let report = OneshotReport {
             outcome: "ok",
-            relay: args.relay.map(|r| r.to_string()).unwrap_or_else(|| "<driad>".into()),
-            family,
+            relay: resolved_relay.to_string(),
+            family: family_str,
             group: args.group.to_string(),
-            source: args.source.map(|s| s.to_string()),
+            source: Some(args.source.to_string()),
             timings_ms: Timings { first_data: first_data_ms },
             first_packet: FirstPacket {
                 src: format!("{}:{}", evt.src, evt.src_port),
@@ -4290,18 +4732,19 @@ async fn run(args: Args) -> Result<()> {
                 len: evt.payload.len(),
             },
         };
-        println!("{}", serde_json::to_string(&report)?);
+        println!("{}", serde_json::to_string(&report).map_err(|e| ExitCategory::Fatal(e.into()))?);
     } else {
         println!(
-            "ok — first_data={}ms first_pkt={}:{} len={}",
+            "ok — relay={} family={} group={} source={} first_data={}ms first_pkt={}:{} len={}",
+            resolved_relay, family_str, args.group, args.source,
             first_data_ms, evt.src, evt.src_port, evt.payload.len()
         );
     }
 
     if args.watch {
-        run_watch(gw, data_rx).await?;
+        run_watch(gw, data_rx).await.map_err(ExitCategory::Fatal)?;
     } else {
-        gw.shutdown().await?;
+        gw.shutdown().await.map_err(ExitCategory::Fatal)?;
     }
     Ok(())
 }
@@ -4595,14 +5038,42 @@ git tag -a m5-staging-e2e -m "M5 complete: staging E2E + runbook"
 | Test Tier 3 (staging E2E, ignored) | 5.1 |
 | Runbook | 5.2 |
 
-### Known simplifications
+### Codex review (gstack-codex consult, 2026-05-15, session 019e2b4b-…)
 
-These are deliberate corner-cutting in the plan, not gaps in the spec. Address as follow-ups if they bite during execution:
+22 findings (10 P1, 9 P2, 3 P3). User selected "Full revision". Below is the
+disposition of each. Numbering matches the Codex output order.
 
-1. **CLI exit codes**: the spec calls for exit 2 (config error) and exit 3 (fatal runtime); the plan uses 0 (success) and 1 (anything else). Discriminating requires a small error-category enum in `amt-verify`'s `run()`. Add Task 3.5 if CI scripts care about the distinction.
-2. **`discovery_retries` not reset on Advertisement success**: latent — a successful re-Discovery on retry 2 leaves the counter at 2, so a later re-Discovery starting from Active failure begins with a deficit. Fix: in `handle_advertisement` (Task 1.6), `self.discovery_retries = 0;` on the `Ok(())` arm.
-3. **AMTRELAY mock response bytes in Task 4.3**: the test fabricates a raw TYPE260 (260 = 0x0104) RDATA block. If the existing `parse_dns_response` parser is stricter about the precedence/D/type bytes than the comments suggest, run the existing `driad::tests::test_parse_dns_response_ipv4_relay` first to confirm the byte layout still matches; mirror it.
-4. **`run_task` doesn't surface socket-bind errors as `AsyncAmtGateway` errors after construction** — bind happens in `build()`, so `bind` failures already surface there. Once the task is spawned, recv/send errors emit `tracing::warn!` and exit the loop. If consumers need to observe loss-of-task, expose `task` join status via a `joined()` method in a follow-up.
+| # | Codex finding | Disposition | Tasks touched |
+|---|---|---|---|
+| 1 | CLI exit codes 0/1/2/3 not implemented | **Fixed**: added `ExitCategory` enum, `main()` maps to 0/1/2/3 | 3.2, 4.5 |
+| 2 | `AsyncAmtGateway::shutdown()` hangs from Idle | **Fixed**: added `closed` flag to manager; `run_task` checks `mgr.is_closed()` not `state==Closed` | 1.4, 1.13, 2.4 |
+| 3 | MulticastData emitted for unsubscribed (S,G) | **Fixed**: demux now filters against `self.groups`; silent drop on miss | 1.9 |
+| 4 | CLI doesn't filter first data by (group, source) | **Fixed**: added `recv_first_matching` loop | 3.2, 4.5 |
+| 5 | `amt_protocol::driad` import inside crate | **Fixed**: changed to `crate::driad` | 4.3 |
+| 6 | `tokio::process::Command` without `process` feature | **Fixed**: added `process` to dev tokio features | 2.1 |
+| 7 | MulticastData "bypasses nonce/MAC validation" | **Reframed**: `AmtMessage::MulticastData` carries no nonce/MAC on the wire (`messages.rs:167-174`). The spec's `mac_drift_on_data_warns` test was misnamed — the right test is Query nonce mismatch, which is now added | 1.8 (new test) |
+| 8 | IPv6 MLDv2 incremental allow/block missing | **Fixed**: added `build_allow_v6` / `build_block_v6` in `report.rs`; subscribe/unsubscribe v6 paths now use them | 1.7, 1.10, 1.11 |
+| 9 | Request retry vs Idle-reset | **Deliberate**: plan goes Idle-reset on Request timeout; this is a small spec amendment (invariant 6 wording "Request retry" → "Request fail-to-Idle"). Spec amendment commit follows this revision | (spec, not plan) |
+| 10 | Fatal runtime errors swallowed | **Fixed**: `run_task` stores fatal errors in `Arc<Mutex<Option<anyhow::Error>>>`; `AsyncAmtGateway::shutdown` checks and returns Err | 2.4, 2.5 |
+| 11 | `clap` staging inconsistent | **Fixed**: clap now in `native` feature from Task 2.1; Task 3.1 only declares `[[bin]]` | 2.1, 3.1 |
+| 12 | DNS TXID correlation missing in A/AAAA follow-up | **Fixed**: response now validated against query TXID and qname before any answer bytes are trusted | 4.4 |
+| 13 | DRIAD fallback test never implemented | **Open**: test_port helper exists but multi-nameserver fallback test still placeholder. Added to TODO below — small follow-up | 4.3 |
+| 14 | IPv6 inner parser only handles `Next Header = UDP` | **Documented as deliberate limitation**: inline doc comment in `inner_packet.rs` | 1.3 |
+| 15 | HandshakeComplete ordering | **Documented**: emit order is part of the contract — Transmit BEFORE HandshakeComplete | 1.8 |
+| 16 | `--source` mandatory vs optional | **Fixed**: `--source` is now required IpAddr (no Option) | 3.2, 4.5 |
+| 17 | `--family v4\|v6\|auto` missing | **Fixed**: added `Family` enum + arg | 3.2, 4.5 |
+| 18 | `--json + --watch` allowed | **Fixed**: rejected with exit 2 (config error) | 3.2, 4.5 |
+| 19 | TunnelFull check ordering | **Fixed**: dedup before cap; added idempotent-resub-at-cap test | 1.5 |
+| 20 | "Replace body of error.rs" wording | **Fixed**: Task 1.1 now does additive Edit, preserves existing impls | 1.1 |
+| 21 | Tier-1 doesn't cover all named invariants | **Partially fixed**: added query_nonce_mismatch, unsubscribed_data_dropped, wrong_source_dropped, next_wakeup_ms tests. Open: v6 incremental record-type assertions still TODO | 1.8, 1.9, 1.12 |
+| 22 | LOC estimates low | **Acknowledged**: realistic M1 is more like 800-1200 impl + 900-1400 test. Estimates left as written; execution will validate | (none) |
+| 23 (P3) | Random bytes test flaky | **Acknowledged**: 1/(2^64) false-fail rate; left as-is | (none) |
+
+### Open follow-ups (Codex findings not fully resolved in this revision)
+
+- **#9 spec wording**: amend spec invariant 6 to clarify "Request fail-to-Idle (no retry)" — separate commit on the spec file.
+- **#13 DRIAD multi-nameserver fallback test**: stub helper exists; add full timeout-then-success test in M4 execution.
+- **#21 v6 incremental record-type assertion tests**: add MLDv2 ALLOW (type 5) / BLOCK (type 6) byte-level assertions analogous to the v4 tests.
 
 ### Placeholder scan
 
