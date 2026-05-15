@@ -97,7 +97,15 @@ impl<P: Platform> SubscriptionManager<P> {
             GatewayState::Discovering
             | GatewayState::Requesting
             | GatewayState::Querying => { /* queued; handshake in flight */ }
-            GatewayState::Active => { /* incremental Allow lands in Task 1.10 */ }
+            GatewayState::Active => {
+                // Move newly-queued group(s) from pending into groups + emit ALLOW Update.
+                while let Some(key) = self.pending.pop_front() {
+                    let mut state = GroupState::new(key.clone(), now_ms);
+                    state.announced = true;
+                    self.groups.insert(key.clone(), state);
+                    self.emit_incremental_allow(&key, now_ms)?;
+                }
+            }
             GatewayState::Closed => return Err(AmtError::ShutdownInProgress),
         }
         Ok(())
@@ -273,6 +281,22 @@ impl<P: Platform> SubscriptionManager<P> {
         self.out_queue.push_back(Event::Transmit {
             dst: relay,
             port,
+            payload: msg.encode(),
+        });
+        self.last_update_at_ms = Some(now_ms);
+        Ok(())
+    }
+
+    fn emit_incremental_allow(&mut self, key: &GroupKey, now_ms: u64) -> Result<()> {
+        let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
+        let report = match relay {
+            IpAddr::V4(_) => crate::subscription::report::build_allow_v4(key)?,
+            IpAddr::V6(_) => crate::subscription::report::build_allow_v6(key)?,
+        };
+        let msg = self.inner.send_update(report)?;
+        self.out_queue.push_back(Event::Transmit {
+            dst: relay,
+            port: self.inner.relay_port(),
             payload: msg.encode(),
         });
         self.last_update_at_ms = Some(now_ms);
@@ -689,5 +713,34 @@ mod tests {
         m.handle_datagram(&data_msg.encode(), 1300).unwrap();
         let events = drain(&mut m);
         assert!(!events.iter().any(|ev| matches!(ev, Event::Data { .. })));
+    }
+
+    #[test]
+    fn subscribe_in_active_emits_incremental_allow_update() {
+        let mut m = mgr();
+        let k1 = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, k1);
+
+        let k2 = GroupKey {
+            group: "232.0.0.2".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(k2.clone(), 1400).unwrap();
+        assert_eq!(m.state(), GatewayState::Active);
+        assert_eq!(m.groups().len(), 2);
+        assert_eq!(m.pending_len(), 0);
+
+        let events = drain(&mut m);
+        let update = events.iter().find_map(|ev| match ev {
+            Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
+            _ => None,
+        }).expect("expected MembershipUpdate transmit");
+        let report = &update[12..];
+        assert_eq!(report[0], 0x22, "IGMPv3 report type");
+        assert_eq!(u16::from_be_bytes([report[6], report[7]]), 1, "single ALLOW record");
+        assert_eq!(report[8], 5, "record type = ALLOW_NEW_SOURCES");
     }
 }
