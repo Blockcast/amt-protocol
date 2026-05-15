@@ -69,6 +69,11 @@ wasm-bindgen-test = "0.3"
 # (Task 3.4) which spawns the built bin via tokio::process::Command.
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "process", "io-util"] }
 
+[[bin]]
+name = "amt-verify"
+path = "src/bin/amt-verify.rs"
+required-features = ["native"]
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = true          # Link-time optimization
