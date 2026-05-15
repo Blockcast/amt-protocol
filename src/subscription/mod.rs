@@ -148,6 +148,40 @@ impl<P: Platform> SubscriptionManager<P> {
             AmtMessage::MembershipQuery { request_nonce, response_mac, query_data } => {
                 self.handle_query(request_nonce, response_mac, query_data, now_ms)?;
             }
+            AmtMessage::MulticastData { ip_packet } => {
+                if self.inner.state() != GatewayState::Active {
+                    self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
+                    return Ok(());
+                }
+                match crate::subscription::inner_packet::parse_inner(&ip_packet) {
+                    Ok(p) => {
+                        // Filter by subscribed (S,G). The relay can deliver
+                        // data for any (S,G) on the tunnel, including ones
+                        // we have NOT subscribed to (stale state from another
+                        // gateway sharing the tunnel, ASM noise, or a
+                        // misconfigured relay). Drop silently if not subscribed
+                        // — the manager's groups map is the source of truth.
+                        let asm_key = GroupKey { group: p.dst, source: None };
+                        let ssm_key = GroupKey { group: p.dst, source: Some(p.src) };
+                        if !self.groups.contains_key(&ssm_key)
+                            && !self.groups.contains_key(&asm_key)
+                        {
+                            // Not a subscription we care about. No event.
+                            return Ok(());
+                        }
+                        self.out_queue.push_back(Event::Data {
+                            src: p.src,
+                            group: p.dst,
+                            src_port: p.src_port,
+                            dst_port: p.dst_port,
+                            payload: p.payload.to_vec(),
+                        });
+                    }
+                    Err(_) => {
+                        self.out_queue.push_back(Event::Warning(AmtError::MalformedInner));
+                    }
+                }
+            }
             _ => {
                 self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
             }
@@ -530,5 +564,130 @@ mod tests {
         assert_eq!(u16::from_be_bytes([report[6], report[7]]), 2);
 
         assert!(events.iter().any(|ev| matches!(ev, Event::HandshakeComplete)));
+    }
+
+    fn drive_to_active(m: &mut SubscriptionManager<TestPlatform>, key: GroupKey) {
+        m.subscribe(key, 1000).unwrap();
+        let initial = drain(m);
+        let disc_nonce = discovery_nonce_from(&initial);
+        let advert = AmtMessage::RelayAdvertisement {
+            nonce: disc_nonce,
+            relay_address: "192.0.2.96".parse::<IpAddr>().unwrap(),
+        };
+        m.handle_datagram(&advert.encode(), 1100).unwrap();
+        let after_advert = drain(m);
+        let req_nonce = after_advert.iter().find_map(|ev| match ev {
+            Event::Transmit { payload, .. } if payload[0] == 0x03 => {
+                Some(u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]))
+            }
+            _ => None,
+        }).unwrap();
+        let query = AmtMessage::MembershipQuery {
+            request_nonce: req_nonce,
+            response_mac: [0; 6],
+            query_data: vec![0x11; 12],
+        };
+        m.handle_datagram(&query.encode(), 1200).unwrap();
+        drain(m);
+    }
+
+    fn synth_v4_udp_packet(src: [u8; 4], dst: [u8; 4], sp: u16, dp: u16, payload: &[u8]) -> Vec<u8> {
+        let total_len = (20 + 8 + payload.len()) as u16;
+        let mut buf = vec![0x45, 0x00];
+        buf.extend_from_slice(&total_len.to_be_bytes());
+        buf.extend_from_slice(&[0, 0, 0x40, 0, 0x40, 17, 0, 0]);
+        buf.extend_from_slice(&src);
+        buf.extend_from_slice(&dst);
+        buf.extend_from_slice(&sp.to_be_bytes());
+        buf.extend_from_slice(&dp.to_be_bytes());
+        let udp_len = (8 + payload.len()) as u16;
+        buf.extend_from_slice(&udp_len.to_be_bytes());
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[test]
+    fn multicast_data_emits_data_event_with_demux() {
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, key);
+
+        let inner = synth_v4_udp_packet([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"abcd");
+        let data_msg = AmtMessage::MulticastData { ip_packet: inner };
+        m.handle_datagram(&data_msg.encode(), 1300).unwrap();
+
+        let events = drain(&mut m);
+        let data = events.iter().find_map(|ev| match ev {
+            Event::Data { src, group, src_port, dst_port, payload } =>
+                Some((*src, *group, *src_port, *dst_port, payload.clone())),
+            _ => None,
+        }).expect("expected Event::Data");
+        assert_eq!(data.0, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(data.1, "232.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(data.2, 5004);
+        assert_eq!(data.3, 5005);
+        assert_eq!(data.4, b"abcd");
+    }
+
+    #[test]
+    fn malformed_inner_warns_not_panics() {
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, key);
+
+        let data_msg = AmtMessage::MulticastData { ip_packet: vec![0x45, 0x00] };
+        m.handle_datagram(&data_msg.encode(), 1300).unwrap();
+        assert_eq!(m.state(), GatewayState::Active);
+        let events = drain(&mut m);
+        assert!(events.iter().any(|ev| matches!(ev, Event::Warning(AmtError::MalformedInner))));
+        assert!(!events.iter().any(|ev| matches!(ev, Event::Data { .. })));
+    }
+
+    #[test]
+    fn unsubscribed_multicast_data_dropped_silently() {
+        let mut m = mgr();
+        let subscribed = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, subscribed);
+
+        // Inner packet for an UNSUBSCRIBED (S,G).
+        let inner = synth_v4_udp_packet([10, 0, 0, 2], [232, 0, 0, 99], 5004, 5005, b"junk");
+        let data_msg = AmtMessage::MulticastData { ip_packet: inner };
+        m.handle_datagram(&data_msg.encode(), 1300).unwrap();
+
+        let events = drain(&mut m);
+        assert!(
+            !events.iter().any(|ev| matches!(ev, Event::Data { .. })),
+            "expected no Data event for unsubscribed (S,G); got: {:?}",
+            events
+        );
+        // Also no Warning — silent drop is the intent.
+        assert!(events.is_empty(), "expected zero events; got: {:?}", events);
+    }
+
+    #[test]
+    fn wrong_source_for_subscribed_group_dropped() {
+        let mut m = mgr();
+        let subscribed = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active(&mut m, subscribed);
+
+        // Right group, WRONG source.
+        let inner = synth_v4_udp_packet([10, 0, 0, 99], [232, 0, 0, 1], 5004, 5005, b"x");
+        let data_msg = AmtMessage::MulticastData { ip_packet: inner };
+        m.handle_datagram(&data_msg.encode(), 1300).unwrap();
+        let events = drain(&mut m);
+        assert!(!events.iter().any(|ev| matches!(ev, Event::Data { .. })));
     }
 }
