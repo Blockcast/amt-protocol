@@ -238,8 +238,44 @@ async fn recv_first_matching(
 }
 
 async fn run_watch(
-    _gw: AsyncAmtGateway,
-    _data_rx: tokio::sync::broadcast::Receiver<amt_protocol::native::DataEvent>,
+    gw: AsyncAmtGateway,
+    mut data_rx: tokio::sync::broadcast::Receiver<amt_protocol::native::DataEvent>,
 ) -> Result<()> {
-    Err(anyhow!("--watch mode not yet implemented"))
+    use tokio::sync::broadcast::error::RecvError;
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut pkts: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut last_seen = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("amt-verify: SIGINT received, tearing down");
+                break;
+            }
+            recv = data_rx.recv() => {
+                match recv {
+                    Ok(evt) => {
+                        pkts += 1;
+                        bytes += evt.payload.len() as u64;
+                        last_seen = Instant::now();
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        eprintln!("amt-verify: WARN lagged {} packets", skipped);
+                    }
+                    Err(RecvError::Closed) => {
+                        eprintln!("amt-verify: data broadcast closed");
+                        break;
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                let age = last_seen.elapsed().as_millis();
+                println!("pkts={} bytes={} last_seen={}ms_ago state={:?}",
+                    pkts, bytes, age, gw.state());
+            }
+        }
+    }
+    gw.shutdown().await?;
+    Ok(())
 }
