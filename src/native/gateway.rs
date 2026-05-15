@@ -79,6 +79,43 @@ impl AsyncAmtGateway {
     pub fn subscribe_data(&self) -> broadcast::Receiver<DataEvent> {
         self.data_tx.subscribe()
     }
+
+    pub async fn subscribe(&self, group: IpAddr, source: Option<IpAddr>) -> Result<()> {
+        let key = GroupKey { group, source };
+        let (ack, rx) = oneshot::channel::<Result<()>>();
+        self.cmd_tx
+            .send(Cmd::Subscribe { key, ack })
+            .await
+            .map_err(|_| anyhow!("AsyncAmtGateway task is gone"))?;
+        rx.await.map_err(|_| anyhow!("subscribe ack dropped"))?
+    }
+
+    pub async fn unsubscribe(&self, group: IpAddr, source: Option<IpAddr>) -> Result<()> {
+        let key = GroupKey { group, source };
+        let (ack, rx) = oneshot::channel::<Result<()>>();
+        self.cmd_tx
+            .send(Cmd::Unsubscribe { key, ack })
+            .await
+            .map_err(|_| anyhow!("AsyncAmtGateway task is gone"))?;
+        rx.await.map_err(|_| anyhow!("unsubscribe ack dropped"))?
+    }
+
+    /// Initiate graceful shutdown. Waits for the runtime task to finish.
+    /// Returns `Err(...)` if a fatal runtime error was observed during the
+    /// lifetime of this gateway.
+    pub async fn shutdown(self) -> Result<()> {
+        let (ack, rx) = oneshot::channel::<Result<()>>();
+        let _ = self.cmd_tx.send(Cmd::Shutdown { ack }).await;
+        let _ = rx.await;
+        let mut guard = self.task.lock().await;
+        if let Some(handle) = guard.take() {
+            handle.await.map_err(|e| anyhow!("task join: {e}"))?;
+        }
+        if let Some(e) = self.fatal.lock().await.take() {
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 impl AsyncAmtGatewayBuilder {
