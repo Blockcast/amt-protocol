@@ -8,6 +8,8 @@ pub use event::Event;
 pub mod group;
 pub use group::GroupState;
 
+pub mod report;
+
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
