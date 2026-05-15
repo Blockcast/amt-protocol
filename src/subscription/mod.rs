@@ -145,7 +145,9 @@ impl<P: Platform> SubscriptionManager<P> {
             AmtMessage::RelayAdvertisement { nonce, relay_address } => {
                 self.handle_advertisement(nonce, relay_address, now_ms)?;
             }
-            // Other branches land in subsequent tasks (1.7, 1.9).
+            AmtMessage::MembershipQuery { request_nonce, response_mac, query_data } => {
+                self.handle_query(request_nonce, response_mac, query_data, now_ms)?;
+            }
             _ => {
                 self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
             }
@@ -189,6 +191,57 @@ impl<P: Platform> SubscriptionManager<P> {
             payload: msg.encode(),
         });
         self.last_request_at_ms = Some(now_ms);
+        Ok(())
+    }
+
+    fn handle_query(
+        &mut self,
+        nonce: u32,
+        mac: [u8; 6],
+        query_data: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<()> {
+        if self.inner.state() != GatewayState::Requesting {
+            self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
+            return Ok(());
+        }
+        if let Err(e) = self.inner.handle_query(nonce, mac, query_data) {
+            self.out_queue.push_back(Event::Warning(e));
+            return Ok(());
+        }
+        // Flush pending into groups map.
+        while let Some(key) = self.pending.pop_front() {
+            self.groups.insert(key.clone(), GroupState::new(key, now_ms));
+        }
+        // Event-emit ORDER is part of the public contract: Transmit(Update)
+        // FIRST, HandshakeComplete SECOND. Consumers that want to know "tunnel
+        // is up" via HandshakeComplete must drain in-order; they will have
+        // already enqueued the Update for transmission by the time they see
+        // the signal. Consumers that want "tunnel is up AND Update sent"
+        // semantics get exactly that. Flipping this order would let a consumer
+        // gate on HandshakeComplete and then drop the Update.
+        self.send_current_state_update(now_ms)?;
+        self.out_queue.push_back(Event::HandshakeComplete);
+        Ok(())
+    }
+
+    fn send_current_state_update(&mut self, now_ms: u64) -> Result<()> {
+        let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
+        let port = self.inner.relay_port();
+        let report = match relay {
+            IpAddr::V4(_) => crate::subscription::report::build_current_state_v4(self.groups.keys())?,
+            IpAddr::V6(_) => crate::subscription::report::build_current_state_v6(self.groups.keys())?,
+        };
+        let msg = self.inner.send_update(report)?;
+        for g in self.groups.values_mut() {
+            g.announced = true;
+        }
+        self.out_queue.push_back(Event::Transmit {
+            dst: relay,
+            port,
+            payload: msg.encode(),
+        });
+        self.last_update_at_ms = Some(now_ms);
         Ok(())
     }
 
@@ -387,5 +440,95 @@ mod tests {
         assert_eq!(m.state(), GatewayState::Discovering, "state must not advance on bad nonce");
         let events = drain(&mut m);
         assert!(events.iter().any(|ev| matches!(ev, Event::Warning(_))));
+    }
+
+    #[test]
+    fn query_with_wrong_nonce_warns_no_transition() {
+        // The spec's "mac_drift_on_data_warns" was misnamed:
+        // AmtMessage::MulticastData carries no nonce / response_mac on the wire
+        // (per messages.rs:167-174 — just type/reserved/ip_packet). The validation
+        // we DO want is on MembershipQuery: a Query whose request_nonce does not
+        // match our outstanding nonce must Warning + leave state in Requesting.
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(key, 1000).unwrap();
+        let initial = drain(&mut m);
+        let disc_nonce = discovery_nonce_from(&initial);
+        let advert = AmtMessage::RelayAdvertisement {
+            nonce: disc_nonce,
+            relay_address: "192.0.2.96".parse::<IpAddr>().unwrap(),
+        };
+        m.handle_datagram(&advert.encode(), 1100).unwrap();
+        let _ = drain(&mut m);
+
+        // Inject a Query with the WRONG nonce.
+        let bad_query = AmtMessage::MembershipQuery {
+            request_nonce: 0xDEAD_BEEF,
+            response_mac: [0xAA; 6],
+            query_data: vec![0; 12],
+        };
+        m.handle_datagram(&bad_query.encode(), 1200).unwrap();
+
+        assert_eq!(m.state(), GatewayState::Requesting, "state must not advance");
+        let events = drain(&mut m);
+        assert!(events.iter().any(|ev| matches!(ev, Event::Warning(_))));
+        assert!(!events.iter().any(|ev| matches!(ev, Event::HandshakeComplete)));
+    }
+
+    #[test]
+    fn query_flushes_pending_into_one_update_v4() {
+        let mut m = mgr();
+        let k1 = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        let k2 = GroupKey {
+            group: "232.0.0.2".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(k1.clone(), 1000).unwrap();
+        m.subscribe(k2.clone(), 1010).unwrap();
+        let initial = drain(&mut m);
+        let disc_nonce = discovery_nonce_from(&initial);
+
+        let advert = AmtMessage::RelayAdvertisement {
+            nonce: disc_nonce,
+            relay_address: "192.0.2.96".parse::<IpAddr>().unwrap(),
+        };
+        m.handle_datagram(&advert.encode(), 1100).unwrap();
+        let after_advert = drain(&mut m);
+        let req_nonce = after_advert.iter().find_map(|ev| match ev {
+            Event::Transmit { payload, .. } if payload[0] == 0x03 => {
+                Some(u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]))
+            }
+            _ => None,
+        }).expect("expected Request transmit");
+
+        // Synthesize a MembershipQuery and feed it in.
+        let query = AmtMessage::MembershipQuery {
+            request_nonce: req_nonce,
+            response_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            query_data: vec![0x11; 12],
+        };
+        m.handle_datagram(&query.encode(), 1200).unwrap();
+
+        assert_eq!(m.state(), GatewayState::Active);
+        assert_eq!(m.groups().len(), 2, "pending must flush to groups");
+        assert_eq!(m.pending_len(), 0);
+
+        let events = drain(&mut m);
+        let update = events.iter().find_map(|ev| match ev {
+            Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
+            _ => None,
+        }).expect("expected MembershipUpdate transmit");
+        // Update header is 12 bytes; report should contain 2 records.
+        let report = &update[12..];
+        assert_eq!(report[0], 0x22, "IGMPv3 report type");
+        assert_eq!(u16::from_be_bytes([report[6], report[7]]), 2);
+
+        assert!(events.iter().any(|ev| matches!(ev, Event::HandshakeComplete)));
     }
 }
