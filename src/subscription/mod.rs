@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::config::AmtConfig;
 use crate::error::{AmtError, Result};
 use crate::gateway::{AmtGateway, GatewayState, GroupKey};
+use crate::messages::AmtMessage;
 use crate::platform::Platform;
 
 /// Hard cap mirroring the IWA TS SharedAmtGateway limit.
@@ -128,6 +129,67 @@ impl<P: Platform> SubscriptionManager<P> {
         Ok(())
     }
 
+    /// Feed a raw datagram (received on the AMT control socket) into the manager.
+    /// Drives state transitions and produces output events.
+    pub fn handle_datagram(&mut self, bytes: &[u8], now_ms: u64) -> Result<()> {
+        let msg = match AmtMessage::decode(bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                self.out_queue.push_back(Event::Warning(e));
+                return Ok(());
+            }
+        };
+        match msg {
+            AmtMessage::RelayAdvertisement { nonce, relay_address } => {
+                self.handle_advertisement(nonce, relay_address, now_ms)?;
+            }
+            // Other branches land in subsequent tasks (1.7, 1.9).
+            _ => {
+                self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_advertisement(
+        &mut self,
+        nonce: u32,
+        relay_address: IpAddr,
+        now_ms: u64,
+    ) -> Result<()> {
+        if self.inner.state() != GatewayState::Discovering {
+            self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
+            return Ok(());
+        }
+        match self.inner.handle_advertisement(nonce, relay_address) {
+            Ok(()) => {
+                // Reset retry counter on successful Discovery — a later
+                // re-Discovery should start its budget at 0, not at the
+                // count left over from a previous successful handshake.
+                self.discovery_retries = 0;
+                self.last_discovery_at_ms = None;
+                self.send_request(now_ms)
+            }
+            Err(e) => {
+                self.out_queue.push_back(Event::Warning(e));
+                Ok(())
+            }
+        }
+    }
+
+    fn send_request(&mut self, now_ms: u64) -> Result<()> {
+        // P-flag=true: prefer pseudo-header checksum mode (RFC 7450 §5.1.3.2).
+        let msg = self.inner.request_membership(true)?;
+        let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
+        self.out_queue.push_back(Event::Transmit {
+            dst: relay,
+            port: self.inner.relay_port(),
+            payload: msg.encode(),
+        });
+        self.last_request_at_ms = Some(now_ms);
+        Ok(())
+    }
+
     // Test helpers (only compiled into the test binary).
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize { self.pending.len() }
@@ -138,6 +200,7 @@ impl<P: Platform> SubscriptionManager<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::AmtMessage;
     use crate::platform::test_platform::TestPlatform;
 
     fn mgr() -> SubscriptionManager<TestPlatform> {
@@ -259,5 +322,68 @@ mod tests {
             1000,
         ).unwrap_err();
         assert_eq!(err, AmtError::ShutdownInProgress);
+    }
+
+    fn drain(m: &mut SubscriptionManager<TestPlatform>) -> Vec<Event> {
+        let mut v = Vec::new();
+        while let Some(ev) = m.poll_event() { v.push(ev); }
+        v
+    }
+
+    fn discovery_nonce_from(events: &[Event]) -> u32 {
+        for ev in events {
+            if let Event::Transmit { payload, .. } = ev {
+                if payload[0] == 0x01 {
+                    return u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                }
+            }
+        }
+        panic!("no RelayDiscovery transmit in events: {:?}", events);
+    }
+
+    #[test]
+    fn advertisement_advances_to_requesting() {
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(key, 1000).unwrap();
+        let initial = drain(&mut m);
+        let nonce = discovery_nonce_from(&initial);
+
+        let advert = AmtMessage::RelayAdvertisement {
+            nonce,
+            relay_address: "192.0.2.96".parse::<IpAddr>().unwrap(),
+        };
+        m.handle_datagram(&advert.encode(), 1100).unwrap();
+
+        assert_eq!(m.state(), GatewayState::Requesting);
+        let events = drain(&mut m);
+        let req = events.iter().find_map(|ev| match ev {
+            Event::Transmit { payload, .. } if payload[0] == 0x03 => Some(payload.clone()),
+            _ => None,
+        }).expect("expected a Request transmit");
+        assert_eq!(req[1] & 0x80, 0x80, "P-flag should be set");
+    }
+
+    #[test]
+    fn advertisement_with_wrong_nonce_warns_no_transition() {
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(key, 1000).unwrap();
+        drain(&mut m);
+
+        let advert = AmtMessage::RelayAdvertisement {
+            nonce: 0xDEAD_BEEF,
+            relay_address: "192.0.2.96".parse::<IpAddr>().unwrap(),
+        };
+        m.handle_datagram(&advert.encode(), 1100).unwrap();
+        assert_eq!(m.state(), GatewayState::Discovering, "state must not advance on bad nonce");
+        let events = drain(&mut m);
+        assert!(events.iter().any(|ev| matches!(ev, Event::Warning(_))));
     }
 }
