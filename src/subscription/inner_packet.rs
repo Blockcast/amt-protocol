@@ -43,7 +43,12 @@ fn parse_ipv4(bytes: &[u8]) -> Result<InnerPacket<'_>> {
         return Err(AmtError::MalformedInner);
     }
     let ihl = (bytes[0] & 0x0F) as usize * 4;
-    if ihl < 20 || bytes.len() < ihl + 8 {
+    if ihl < 20 {
+        return Err(AmtError::MalformedInner);
+    }
+    // IP total length is authoritative; trailing bytes are not part of this datagram.
+    let total_len = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+    if total_len < ihl + 8 || bytes.len() < total_len {
         return Err(AmtError::MalformedInner);
     }
     if bytes[9] != IP_PROTOCOL_UDP {
@@ -51,7 +56,7 @@ fn parse_ipv4(bytes: &[u8]) -> Result<InnerPacket<'_>> {
     }
     let src = Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]);
     let dst = Ipv4Addr::new(bytes[16], bytes[17], bytes[18], bytes[19]);
-    let udp = &bytes[ihl..];
+    let udp = &bytes[ihl..total_len];  // trimmed to declared IP boundary
     let src_port = u16::from_be_bytes([udp[0], udp[1]]);
     let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
     let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
@@ -71,12 +76,17 @@ fn parse_ipv6(bytes: &[u8]) -> Result<InnerPacket<'_>> {
     if bytes.len() < 40 + 8 {
         return Err(AmtError::MalformedInner);
     }
+    // IPv6 payload length is authoritative; field excludes the 40-byte fixed header.
+    let payload_len = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    if payload_len < 8 || bytes.len() < 40 + payload_len {
+        return Err(AmtError::MalformedInner);
+    }
     if bytes[6] != IPV6_NEXT_UDP {
         return Err(AmtError::MalformedInner);
     }
     let src_octets: [u8; 16] = bytes[8..24].try_into().map_err(|_| AmtError::MalformedInner)?;
     let dst_octets: [u8; 16] = bytes[24..40].try_into().map_err(|_| AmtError::MalformedInner)?;
-    let udp = &bytes[40..];
+    let udp = &bytes[40..40 + payload_len];  // trimmed to declared IPv6 boundary
     let src_port = u16::from_be_bytes([udp[0], udp[1]]);
     let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
     let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
@@ -164,5 +174,55 @@ mod tests {
         assert_eq!(p.src_port, 5004);
         assert_eq!(p.dst_port, 5005);
         assert_eq!(p.payload, b"abc");
+    }
+
+    #[test]
+    fn parse_ipv4_with_options_ihl_6() {
+        // IHL = 6 (24-byte header). Insert a 4-byte option word at the end of the
+        // mandatory 20-byte header so the parser must skip past it to find UDP.
+        let mut pkt = ipv4_udp_packet([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"hi");
+        // Bump IHL nibble: 0x45 → 0x46
+        pkt[0] = 0x46;
+        // Insert 4 zero option bytes after the 20-byte fixed header (before UDP).
+        let opt_pos = 20;
+        for _ in 0..4 { pkt.insert(opt_pos, 0); }
+        // Re-stamp total_length (bytes 2-3) — new total is original + 4.
+        let new_total = (24 + 8 + 2) as u16;
+        pkt[2] = (new_total >> 8) as u8;
+        pkt[3] = new_total as u8;
+        let p = parse_inner(&pkt).unwrap();
+        assert_eq!(p.src_port, 5004);
+        assert_eq!(p.dst_port, 5005);
+        assert_eq!(p.payload, b"hi");
+    }
+
+    #[test]
+    fn parse_ipv6_non_udp_next_header_returns_err() {
+        // IPv6 Hop-by-Hop (Next Header = 0). Per the deliberate-limitation
+        // doc comment, extension headers are NOT walked — the parser must
+        // return MalformedInner.
+        let mut pkt = vec![0x60, 0x00, 0x00, 0x00];
+        let payload_len: u16 = 8 + 1;
+        pkt.extend_from_slice(&payload_len.to_be_bytes());
+        pkt.push(0);  // Next Header = Hop-by-Hop (NOT UDP)
+        pkt.push(64); // hop limit
+        pkt.extend_from_slice(&[0xfd; 16]);
+        let mut dst = vec![0xff, 0x0e]; dst.extend_from_slice(&[0; 14]); pkt.extend_from_slice(&dst);
+        pkt.extend_from_slice(&5004u16.to_be_bytes());
+        pkt.extend_from_slice(&5005u16.to_be_bytes());
+        pkt.extend_from_slice(&payload_len.to_be_bytes());
+        pkt.extend_from_slice(&[0, 0]);
+        pkt.push(0xAA);
+        assert_eq!(parse_inner(&pkt), Err(AmtError::MalformedInner));
+    }
+
+    #[test]
+    fn parse_ipv4_udp_zero_payload() {
+        // udp_len = 8 (UDP header only, no payload). Must succeed; payload empty.
+        let pkt = ipv4_udp_packet([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"");
+        let p = parse_inner(&pkt).unwrap();
+        assert_eq!(p.payload, b"");
+        assert_eq!(p.src_port, 5004);
+        assert_eq!(p.dst_port, 5005);
     }
 }
