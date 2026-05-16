@@ -23,6 +23,9 @@ const AMTRELAY_TYPE: u16 = 260;
 /// DNS record type A (IPv4 address)
 const DNS_TYPE_A: u16 = 1;
 
+/// DNS record type AAAA (IPv6 address)
+const DNS_TYPE_AAAA: u16 = 28;
+
 /// DNS class IN
 const DNS_CLASS_IN: u16 = 1;
 
@@ -110,6 +113,13 @@ impl DriadResolver {
         Self::build_dns_query_packet(hostname, DNS_TYPE_A, transaction_id)
     }
 
+    /// Build a DNS wire-format AAAA record query for a hostname.
+    ///
+    /// Used to resolve DRIAD type=3 DNS name relays to IPv6 addresses.
+    pub fn build_dns_aaaa_query(hostname: &str, transaction_id: u16) -> Vec<u8> {
+        Self::build_dns_query_packet(hostname, DNS_TYPE_AAAA, transaction_id)
+    }
+
     /// Build DNS wire-format query packet for any QNAME and QTYPE.
     fn build_dns_query_packet(qname: &str, qtype: u16, transaction_id: u16) -> Vec<u8> {
         let mut packet = Vec::with_capacity(64);
@@ -157,6 +167,19 @@ impl DriadResolver {
         } else {
             None
         }
+    }
+
+    /// Parse a DNS AAAA record response and extract the first IPv6 address.
+    ///
+    /// Used to resolve DRIAD type=3 DNS name relays to IPv6.
+    pub fn parse_dns_aaaa_response(data: &[u8]) -> Option<IpAddr> {
+        let rdata = Self::find_dns_answer(data, DNS_TYPE_AAAA)?;
+        if rdata.len() != 16 {
+            return None;
+        }
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&rdata);
+        Some(IpAddr::V6(Ipv6Addr::from(octets)))
     }
 
     /// Find the RDATA of the first DNS answer record matching the given type.
@@ -702,5 +725,46 @@ mod tests {
 
         let dns = DriadRelayAddress::DnsName("sfo12.bcast.id".to_string());
         assert_eq!(dns.to_string(), "sfo12.bcast.id");
+    }
+
+    #[test]
+    fn build_dns_aaaa_query_packet_structure() {
+        let packet = DriadResolver::build_dns_aaaa_query("relay.example.", 0x1234);
+        // DNS header: ID(2) + flags(2) + counts(8) = 12 bytes
+        assert_eq!(&packet[..2], &[0x12, 0x34]);
+        // QTYPE at end before QCLASS: AAAA = 28 = 0x001C
+        let qtype_off = packet.len() - 4;
+        assert_eq!(&packet[qtype_off..qtype_off + 2], &[0x00, 0x1C]);
+    }
+
+    #[test]
+    fn parse_dns_aaaa_response_extracts_ipv6() {
+        // Construct minimal AAAA response: header + question echo + 1 answer.
+        // No trailing dot — the builder's `split('.')` adds an extra zero label
+        // for empty trailing labels, which misaligns the question-section length
+        // with what the parser computes. Same convention as build_dns_a_query tests.
+        let query = DriadResolver::build_dns_aaaa_query("relay.example", 0xABCD);
+        let mut response = query.clone();
+        // Set flags: response (QR=1) + recursion available
+        response[2] = 0x81;
+        response[3] = 0x80;
+        // Set ANCOUNT to 1 (bytes 6-7)
+        response[6] = 0;
+        response[7] = 1;
+        // Append answer: pointer (0xC00C) + TYPE(28) + CLASS(1) + TTL(4) + RDLEN(16) + IPv6(16)
+        response.extend_from_slice(&[
+            0xC0, 0x0C, // pointer to QNAME at offset 12
+            0x00, 0x1C, // TYPE AAAA = 28
+            0x00, 0x01, // CLASS IN
+            0x00, 0x00, 0x00, 0x3C, // TTL
+            0x00, 0x10, // RDLENGTH = 16
+            0x20, 0x01, 0x0D, 0xB8, // IPv6 2001:db8::
+            0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x01, // ::1
+        ]);
+
+        let addr = DriadResolver::parse_dns_aaaa_response(&response).expect("AAAA parse");
+        assert_eq!(addr, "2001:db8::1".parse::<std::net::IpAddr>().unwrap());
     }
 }

@@ -237,9 +237,19 @@ impl IgmpV3Report {
         // Destination IP = multicast group address
         buf.extend_from_slice(&multicast_group.octets());
 
-        // Options padding (4 zero bytes) - matching go-amt
-        // go-amt uses empty IPv4Option array then appends 4 zero bytes
-        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        // IPv4 Router Alert option (RFC 2113).
+        //
+        //   type=0x94 (copy=1, class=0, number=20 — "Router Alert")
+        //   len=4
+        //   value=0x0000 (the "examine this packet" sentinel)
+        //
+        // Required by the kernel relay's ip_mc_check_igmp() — IGMP Membership
+        // Reports without RA are NOT delivered to the mc subsystem (the
+        // kernel forwards them as ordinary L3 traffic instead, never
+        // installing the join). go-amt's "empty IPv4Option array + 4 zero
+        // pad bytes" silently produced an unparseable header; switched to
+        // emitting the real RA option here.
+        buf.extend_from_slice(&[0x94, 0x04, 0x00, 0x00]);
 
         // Calculate and insert IP header checksum
         let checksum = Self::calculate_checksum(&buf);
@@ -365,8 +375,9 @@ mod tests {
         // Check destination IP = multicast group (232.0.0.1)
         assert_eq!(&encoded[16..20], &[232, 0, 0, 1]);
 
-        // Check options padding (4 zero bytes like go-amt)
-        assert_eq!(&encoded[20..24], &[0x00, 0x00, 0x00, 0x00]);
+        // Check IPv4 Router Alert option (RFC 2113): type=0x94, len=4, value=0x0000.
+        // Required so the kernel relay's ip_mc_check_igmp accepts the report.
+        assert_eq!(&encoded[20..24], &[0x94, 0x04, 0x00, 0x00]);
 
         // Check IGMP report starts at byte 24
         assert_eq!(encoded[24], IGMP_V3_MEMBERSHIP_REPORT);

@@ -61,6 +61,13 @@ impl From<crate::error::AmtError> for AmtResult {
             crate::error::AmtError::InvalidMessage(_) => AmtResult::DecodeError,
             crate::error::AmtError::UnexpectedMessage => AmtResult::InvalidArgument,
             crate::error::AmtError::IoError(_) => AmtResult::Unknown,
+            // Subscription-layer errors (M1)
+            crate::error::AmtError::FamilyMismatch => AmtResult::InvalidArgument,
+            crate::error::AmtError::TunnelFull => AmtResult::InvalidArgument,
+            crate::error::AmtError::DiscoveryFailed => AmtResult::Unknown,
+            crate::error::AmtError::QueryFailed => AmtResult::Unknown,
+            crate::error::AmtError::MalformedInner => AmtResult::DecodeError,
+            crate::error::AmtError::ShutdownInProgress => AmtResult::InvalidState,
         }
     }
 }
