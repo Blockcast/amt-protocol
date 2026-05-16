@@ -224,8 +224,15 @@ impl<P: Platform> SubscriptionManager<P> {
     }
 
     fn send_request(&mut self, now_ms: u64) -> Result<()> {
-        // P-flag=true: prefer pseudo-header checksum mode (RFC 7450 §5.1.3.2).
-        let msg = self.inner.request_membership(true)?;
+        // RFC 7450 §5.1.3.1 — P-flag selects the inner-protocol family of
+        // the Membership Query the relay returns:
+        //   false → IGMPv3 (for IPv4 SSM subscriptions)
+        //   true  → MLDv2  (for IPv6 SSM subscriptions)
+        // The relay's address family is the source of truth; mismatching it
+        // makes the relay emit a Query the gateway can't reconcile with its
+        // configured group/source, surfacing as QueryFailed.
+        let want_mld = matches!(self.inner.relay_address(), Some(IpAddr::V6(_)));
+        let msg = self.inner.request_membership(want_mld)?;
         let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
         self.out_queue.push_back(Event::Transmit {
             dst: relay,
@@ -612,7 +619,9 @@ mod tests {
             Event::Transmit { payload, .. } if payload[0] == 0x03 => Some(payload.clone()),
             _ => None,
         }).expect("expected a Request transmit");
-        assert_eq!(req[1] & 0x80, 0x80, "P-flag should be set");
+        // Relay address is IPv4 (192.0.2.96) → P-flag MUST be 0 per RFC 7450
+        // §5.1.3.1 so the relay returns an IGMPv3 General Query, not MLDv2.
+        assert_eq!(req[1] & 0x80, 0x00, "P-flag MUST be 0 for IPv4 relay");
     }
 
     #[test]
@@ -717,8 +726,9 @@ mod tests {
             Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
             _ => None,
         }).expect("expected MembershipUpdate transmit");
-        // Update header is 12 bytes; report should contain 2 records.
-        let report = &update[12..];
+        // Update layout: 12B AMT header + 24B IPv4(RA) envelope + IGMPv3 body.
+        // Skip AMT + IPv4 to land on the IGMPv3 report.
+        let report = &update[12 + 24..];
         assert_eq!(report[0], 0x22, "IGMPv3 report type");
         assert_eq!(u16::from_be_bytes([report[6], report[7]]), 2);
 
@@ -873,7 +883,8 @@ mod tests {
             Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
             _ => None,
         }).expect("expected MembershipUpdate transmit");
-        let report = &update[12..];
+        // Skip AMT (12B) + IPv4(RA) (24B) to reach the IGMPv3 body.
+        let report = &update[12 + 24..];
         assert_eq!(report[0], 0x22, "IGMPv3 report type");
         assert_eq!(u16::from_be_bytes([report[6], report[7]]), 1, "single ALLOW record");
         assert_eq!(report[8], 5, "record type = ALLOW_NEW_SOURCES");
@@ -896,7 +907,8 @@ mod tests {
             Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
             _ => None,
         }).expect("expected MembershipUpdate transmit");
-        let report = &update[12..];
+        // Skip AMT (12B) + IPv4(RA) (24B) to reach the IGMPv3 body.
+        let report = &update[12 + 24..];
         assert_eq!(report[8], 6, "record type = BLOCK_OLD_SOURCES");
     }
 
@@ -932,7 +944,8 @@ mod tests {
             Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
             _ => None,
         }).expect("expected keep-alive Update");
-        let report = &update[12..];
+        // Skip AMT (12B) + IPv4(RA) (24B) to reach the IGMPv3 body.
+        let report = &update[12 + 24..];
         assert_eq!(report[0], 0x22);
         assert_eq!(u16::from_be_bytes([report[6], report[7]]), 1);
     }

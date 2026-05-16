@@ -140,6 +140,105 @@ impl MldV2Report {
         buf
     }
 
+    /// Encode the MLDv2 Listener Report wrapped in a full IPv6 packet with
+    /// Hop-by-Hop Router Alert, for use inside AMT Membership Update.
+    ///
+    /// The relay's amt_update_handler calls ipv6_mc_check_mld which expects:
+    ///   1. IPv6 header with HopLimit=1, NextHeader=0 (Hop-by-Hop Options).
+    ///   2. Hop-by-Hop Options header containing the MLD Router Alert option
+    ///      (option type 0x05, value=0 for MLD per RFC 2711).
+    ///   3. The actual ICMPv6 MLDv2 Listener Report (type 143).
+    ///
+    /// The ICMPv6 checksum is computed over the IPv6 pseudo-header (src, dst,
+    /// upper-layer length, next-header=58 ICMPv6) plus the ICMPv6 message
+    /// itself, per RFC 4443 §2.3.
+    ///
+    /// `source` and `group` populate the IPv6 header. RFC-canonical values
+    /// for an MLDv2 Report are `::` (unspecified source) and `ff02::16` (all
+    /// MLDv2-capable routers). The relay only uses the header to validate
+    /// framing; the (S, G) data is in the records.
+    pub fn encode_with_ip(&self, source: Ipv6Addr, group: Ipv6Addr) -> Vec<u8> {
+        let mld_report = self.encode();
+        let mld_len = mld_report.len();
+
+        // Hop-by-Hop Options header carrying the MLD Router Alert option.
+        // RFC 2711: option type 0x05, opt-data-len 2, value 0x0000 (MLD).
+        // PadN (0x01, 0x00) brings the HBH header to an 8-byte boundary.
+        let hbh: [u8; 8] = [
+            58, 0,         // next_header=ICMPv6 (58), hdr_ext_len=0 (8 bytes total)
+            0x05, 0x02,    // opt_type=Router Alert, opt_data_len=2
+            0x00, 0x00,    // value=MLD (0)
+            0x01, 0x00,    // PadN (type=1, len=0) — single-byte pad after RA
+        ];
+
+        // IPv6 header: 40 bytes.
+        let payload_len = (hbh.len() + mld_len) as u16;
+        let mut buf = Vec::with_capacity(40 + hbh.len() + mld_len);
+
+        // Version=6, Traffic Class=0, Flow Label=0.
+        buf.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+        // Payload Length.
+        buf.extend_from_slice(&payload_len.to_be_bytes());
+        // Next Header=0 (Hop-by-Hop Options).
+        buf.push(0);
+        // Hop Limit=1 (link-local multicast).
+        buf.push(1);
+        // Source address.
+        buf.extend_from_slice(&source.octets());
+        // Destination address.
+        buf.extend_from_slice(&group.octets());
+
+        // HBH options block.
+        buf.extend_from_slice(&hbh);
+
+        // ICMPv6 MLDv2 Report — checksum is zero at this point; compute it
+        // over (pseudo-header || MLD message) and patch in place.
+        let mld_start = 40 + hbh.len();
+        buf.extend_from_slice(&mld_report);
+        let csum = Self::icmpv6_pseudo_checksum(
+            &source.octets(),
+            &group.octets(),
+            mld_len as u32,
+            58, // ICMPv6
+            &buf[mld_start..],
+        );
+        // Checksum field is at MLD offset 2..4.
+        buf[mld_start + 2..mld_start + 4].copy_from_slice(&csum.to_be_bytes());
+
+        buf
+    }
+
+    /// ICMPv6 checksum over the IPv6 pseudo-header (RFC 4443 §2.3) plus the
+    /// ICMPv6 message bytes. Returns the one's-complement sum suitable to
+    /// drop into the checksum field.
+    fn icmpv6_pseudo_checksum(
+        src: &[u8; 16],
+        dst: &[u8; 16],
+        upper_len: u32,
+        next_header: u8,
+        icmp_msg: &[u8],
+    ) -> u16 {
+        let mut sum: u32 = 0;
+        for w in src.chunks(2).chain(dst.chunks(2)) {
+            sum += u16::from_be_bytes([w[0], w[1]]) as u32;
+        }
+        sum += (upper_len >> 16) & 0xFFFF;
+        sum += upper_len & 0xFFFF;
+        sum += next_header as u32;
+        let mut i = 0;
+        while i + 1 < icmp_msg.len() {
+            sum += u16::from_be_bytes([icmp_msg[i], icmp_msg[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < icmp_msg.len() {
+            sum += (icmp_msg[i] as u32) << 8;
+        }
+        while sum > 0xFFFF {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !sum as u16
+    }
+
     /// Calculate ICMPv6 checksum (RFC 2463)
     ///
     /// Note: For ICMPv6, the checksum includes a pseudo-header with source/dest IPv6 addresses.
