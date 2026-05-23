@@ -38,6 +38,31 @@ Expected output (one line of JSON):
 
 Exit code: 0 on success, 1 on timeout / handshake failure.
 
+## Billing shutdown matrix
+
+Use the same `--relay`, `--source`, `--group`, and `--timeout` values as the
+direct-path check. The final flag selects the AMT shutdown shape the relay must
+bill:
+
+```bash
+# Nominal: Membership Update leave, then AMT Teardown.
+./target/release/amt-verify --relay "$STAGING_RELAY" \
+    --source "$STAGING_SOURCE" --group "$STAGING_GROUP" --timeout 30 --json
+
+# Non-graceful app leave: skip Membership Update leave, send AMT Teardown.
+./target/release/amt-verify --relay "$STAGING_RELAY" \
+    --source "$STAGING_SOURCE" --group "$STAGING_GROUP" --timeout 30 --json \
+    --no-graceful-leave
+
+# Hard loss: drop the gateway runtime with no leave and no AMT Teardown.
+# Staging sets EBPF_BILLING_STALE_TIMEOUT=45s and
+# EBPF_BILLING_STALE_SWEEP_INTERVAL=5s, so billing should finalize within
+# roughly 50s after first data.
+./target/release/amt-verify --relay "$STAGING_RELAY" \
+    --source "$STAGING_SOURCE" --group "$STAGING_GROUP" --timeout 30 --json \
+    --drop-without-teardown
+```
+
 ## DRIAD path — from in-cluster pod
 
 ```bash
