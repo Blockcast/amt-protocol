@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -50,6 +50,16 @@ struct Args {
     #[arg(long, default_value_t = false)]
     watch: bool,
 
+    /// On shutdown, skip the Membership Update leave and send only AMT Teardown.
+    /// Useful for billing-path negative tests.
+    #[arg(long, default_value_t = false)]
+    no_graceful_leave: bool,
+
+    /// On shutdown, drop the gateway runtime without Membership Update leave or AMT Teardown.
+    /// This simulates hard client loss for relay-side stale-expiry billing tests.
+    #[arg(long, default_value_t = false)]
+    drop_without_teardown: bool,
+
     /// Machine-readable JSON output (one-shot mode only).
     /// Rejected with exit 2 if combined with --watch.
     #[arg(long, default_value_t = false)]
@@ -61,7 +71,11 @@ struct Args {
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
-enum Family { V4, V6, Auto }
+enum Family {
+    V4,
+    V6,
+    Auto,
+}
 
 /// Exit-code classification per spec:
 ///   0 → success (one-shot data observed, or watch SIGINT clean teardown)
@@ -75,12 +89,19 @@ enum ExitCategory {
     Fatal(anyhow::Error),
 }
 
+#[derive(Copy, Clone, Debug)]
+enum ShutdownMode {
+    GracefulLeave,
+    TeardownOnly,
+    DropWithoutTeardown,
+}
+
 impl ExitCategory {
     fn code(&self) -> u8 {
         match self {
             ExitCategory::HandshakeFail(_) => 1,
-            ExitCategory::Config(_)        => 2,
-            ExitCategory::Fatal(_)         => 3,
+            ExitCategory::Config(_) => 2,
+            ExitCategory::Fatal(_) => 3,
         }
     }
     fn err(&self) -> &anyhow::Error {
@@ -102,10 +123,16 @@ struct OneshotReport {
 }
 
 #[derive(serde::Serialize)]
-struct Timings { first_data: u64 }
+struct Timings {
+    first_data: u64,
+}
 
 #[derive(serde::Serialize)]
-struct FirstPacket { src: String, dst_port: u16, len: usize }
+struct FirstPacket {
+    src: String,
+    dst_port: u16,
+    len: usize,
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -113,9 +140,13 @@ async fn main() -> ExitCode {
     let filter = if args.verbose {
         EnvFilter::new("amt=debug,amt_protocol=debug")
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("amt=info,amt_protocol=info"))
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("amt=info,amt_protocol=info"))
     };
-    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     match run(args).await {
         Ok(()) => ExitCode::from(0),
@@ -138,6 +169,18 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             "--no-driad set but --relay missing"
         )));
     }
+    if args.no_graceful_leave && args.drop_without_teardown {
+        return Err(ExitCategory::Config(anyhow!(
+            "--no-graceful-leave and --drop-without-teardown are mutually exclusive"
+        )));
+    }
+    let shutdown_mode = if args.drop_without_teardown {
+        ShutdownMode::DropWithoutTeardown
+    } else if args.no_graceful_leave {
+        ShutdownMode::TeardownOnly
+    } else {
+        ShutdownMode::GracefulLeave
+    };
 
     // ----- Build gateway (explicit relay OR DRIAD path) -----
     let (gw, resolved_relay) = match args.relay {
@@ -259,9 +302,13 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     }
 
     if args.watch {
-        run_watch(gw, data_rx).await.map_err(ExitCategory::Fatal)?;
+        run_watch(gw, data_rx, args.group, args.source, shutdown_mode)
+            .await
+            .map_err(ExitCategory::Fatal)?;
     } else {
-        gw.shutdown().await.map_err(ExitCategory::Fatal)?;
+        finish_gateway(gw, args.group, args.source, shutdown_mode)
+            .await
+            .map_err(ExitCategory::Fatal)?;
     }
     Ok(())
 }
@@ -275,17 +322,35 @@ async fn recv_first_matching(
     use tokio::sync::broadcast::error::RecvError;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())
-            .ok_or_else(|| anyhow!("timed out after {}s waiting for first data matching ({}, {})",
-                timeout.as_secs(), group, source))?;
-        let recv = tokio::time::timeout(remaining, rx.recv()).await
-            .map_err(|_| anyhow!("timed out after {}s waiting for first data matching ({}, {})",
-                timeout.as_secs(), group, source))?;
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or_else(|| {
+                anyhow!(
+                    "timed out after {}s waiting for first data matching ({}, {})",
+                    timeout.as_secs(),
+                    group,
+                    source
+                )
+            })?;
+        let recv = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "timed out after {}s waiting for first data matching ({}, {})",
+                    timeout.as_secs(),
+                    group,
+                    source
+                )
+            })?;
         match recv {
             Ok(evt) if evt.group == group && evt.src == source => return Ok(evt),
             Ok(_skip) => continue,
             Err(RecvError::Lagged(_)) => continue,
-            Err(RecvError::Closed) => return Err(anyhow!("data broadcast closed before first matching packet")),
+            Err(RecvError::Closed) => {
+                return Err(anyhow!(
+                    "data broadcast closed before first matching packet"
+                ));
+            }
         }
     }
 }
@@ -293,6 +358,9 @@ async fn recv_first_matching(
 async fn run_watch(
     gw: AsyncAmtGateway,
     mut data_rx: tokio::sync::broadcast::Receiver<amt_protocol::native::DataEvent>,
+    group: IpAddr,
+    source: IpAddr,
+    shutdown_mode: ShutdownMode,
 ) -> Result<()> {
     use tokio::sync::broadcast::error::RecvError;
     let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -329,6 +397,29 @@ async fn run_watch(
             }
         }
     }
-    gw.shutdown().await?;
+    finish_gateway(gw, group, source, shutdown_mode).await?;
     Ok(())
+}
+
+async fn finish_gateway(
+    gw: AsyncAmtGateway,
+    group: IpAddr,
+    source: IpAddr,
+    mode: ShutdownMode,
+) -> Result<()> {
+    match mode {
+        ShutdownMode::GracefulLeave => {
+            if let Err(e) = gw.unsubscribe(group, Some(source)).await {
+                tracing::warn!(target: "amt", error=?e, "unsubscribe before shutdown failed");
+            } else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            gw.shutdown().await
+        }
+        ShutdownMode::TeardownOnly => gw.shutdown().await,
+        ShutdownMode::DropWithoutTeardown => {
+            drop(gw);
+            Ok(())
+        }
+    }
 }
