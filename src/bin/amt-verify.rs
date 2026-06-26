@@ -42,6 +42,10 @@ struct Args {
     #[arg(long, default_value = "30")]
     timeout: u64,
 
+    /// Matching multicast packets to receive before successful one-shot shutdown
+    #[arg(long, default_value = "1")]
+    packet_count: u64,
+
     /// Keep-alive interval in seconds
     #[arg(long, default_value = "60")]
     keepalive: u64,
@@ -118,6 +122,8 @@ struct OneshotReport {
     family: &'static str,
     group: String,
     source: Option<String>,
+    packet_count: u64,
+    byte_count: u64,
     timings_ms: Timings,
     first_packet: FirstPacket,
 }
@@ -172,6 +178,11 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     if args.no_graceful_leave && args.drop_without_teardown {
         return Err(ExitCategory::Config(anyhow!(
             "--no-graceful-leave and --drop-without-teardown are mutually exclusive"
+        )));
+    }
+    if args.packet_count == 0 {
+        return Err(ExitCategory::Config(anyhow!(
+            "--packet-count must be greater than 0"
         )));
     }
     let shutdown_mode = if args.drop_without_teardown {
@@ -254,10 +265,11 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
         .await
         .map_err(ExitCategory::HandshakeFail)?;
 
-    let evt = match recv_first_matching(
+    let stats = match recv_matching_packets(
         &mut data_rx,
         args.group,
         args.source,
+        args.packet_count,
         Duration::from_secs(args.timeout),
     )
     .await
@@ -274,13 +286,15 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             family: family_str,
             group: args.group.to_string(),
             source: Some(args.source.to_string()),
+            packet_count: stats.packet_count,
+            byte_count: stats.byte_count,
             timings_ms: Timings {
                 first_data: first_data_ms,
             },
             first_packet: FirstPacket {
-                src: format!("{}:{}", evt.src, evt.src_port),
-                dst_port: evt.dst_port,
-                len: evt.payload.len(),
+                src: format!("{}:{}", stats.first.src, stats.first.src_port),
+                dst_port: stats.first.dst_port,
+                len: stats.first.payload.len(),
             },
         };
         println!(
@@ -295,9 +309,9 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             args.group,
             args.source,
             first_data_ms,
-            evt.src,
-            evt.src_port,
-            evt.payload.len()
+            stats.first.src,
+            stats.first.src_port,
+            stats.first.payload.len()
         );
     }
 
@@ -313,14 +327,24 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     Ok(())
 }
 
-async fn recv_first_matching(
+struct PacketStats {
+    first: amt_protocol::native::DataEvent,
+    packet_count: u64,
+    byte_count: u64,
+}
+
+async fn recv_matching_packets(
     rx: &mut tokio::sync::broadcast::Receiver<amt_protocol::native::DataEvent>,
     group: IpAddr,
     source: IpAddr,
+    want_count: u64,
     timeout: Duration,
-) -> Result<amt_protocol::native::DataEvent> {
+) -> Result<PacketStats> {
     use tokio::sync::broadcast::error::RecvError;
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut first = None;
+    let mut packet_count = 0;
+    let mut byte_count = 0;
     loop {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
@@ -343,7 +367,20 @@ async fn recv_first_matching(
                 )
             })?;
         match recv {
-            Ok(evt) if evt.group == group && evt.src == source => return Ok(evt),
+            Ok(evt) if evt.group == group && evt.src == source => {
+                if first.is_none() {
+                    first = Some(evt.clone());
+                }
+                packet_count += 1;
+                byte_count += evt.payload.len() as u64;
+                if packet_count >= want_count {
+                    return Ok(PacketStats {
+                        first: first.expect("first matching packet recorded"),
+                        packet_count,
+                        byte_count,
+                    });
+                }
+            }
             Ok(_skip) => continue,
             Err(RecvError::Lagged(_)) => continue,
             Err(RecvError::Closed) => {
