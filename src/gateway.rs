@@ -212,7 +212,7 @@ impl<P: Platform> AmtGateway<P> {
         })
     }
 
-    /// Process Membership Query response
+    /// Process an initial or active-tunnel Membership Query.
     ///
     /// Validates nonce and extracts response MAC and query data
     pub fn handle_query(
@@ -221,7 +221,7 @@ impl<P: Platform> AmtGateway<P> {
         response_mac: [u8; 6],
         query_data: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        if self.state != GatewayState::Requesting {
+        if self.state != GatewayState::Requesting && self.state != GatewayState::Active {
             self.platform.log_error("[AMT handle_query] Error: InvalidState");
             return Err(AmtError::InvalidState);
         }
@@ -483,6 +483,51 @@ mod tests {
             },
             _ => panic!("Expected Teardown"),
         };
+    }
+
+    #[test]
+    fn test_active_membership_query_refreshes_response_state() {
+        let mut gw = AmtGateway::new(test_config(), test_platform());
+
+        let discovery = gw.start_discovery().unwrap();
+        let discovery_nonce = match discovery {
+            AmtMessage::RelayDiscovery { nonce } => nonce,
+            _ => panic!("Expected RelayDiscovery"),
+        };
+        gw.handle_advertisement(discovery_nonce, "198.51.100.1".parse().unwrap()).unwrap();
+
+        let request = gw.request_membership(false).unwrap();
+        let request_nonce = match request {
+            AmtMessage::Request { request_nonce, .. } => request_nonce,
+            _ => panic!("Expected Request"),
+        };
+        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11]).unwrap();
+        gw.send_update(vec![0x22]).unwrap();
+        assert_eq!(gw.state(), GatewayState::Active);
+
+        let refreshed_mac = [6, 5, 4, 3, 2, 1];
+        let query_data = vec![0x33, 0x44];
+        let parsed = gw
+            .handle_query(request_nonce, refreshed_mac, query_data.clone())
+            .unwrap();
+        assert_eq!(parsed, query_data);
+        assert_eq!(gw.state(), GatewayState::Querying);
+
+        let refreshed_report = vec![0x55, 0x66];
+        let update = gw.send_update(refreshed_report.clone()).unwrap();
+        assert_eq!(gw.state(), GatewayState::Active);
+        match update {
+            AmtMessage::MembershipUpdate {
+                request_nonce: nonce,
+                response_mac,
+                report_data,
+            } => {
+                assert_eq!(nonce, request_nonce);
+                assert_eq!(response_mac, refreshed_mac);
+                assert_eq!(report_data, refreshed_report);
+            },
+            _ => panic!("Expected MembershipUpdate"),
+        }
     }
 
     #[test]
