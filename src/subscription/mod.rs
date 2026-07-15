@@ -250,17 +250,23 @@ impl<P: Platform> SubscriptionManager<P> {
         query_data: Vec<u8>,
         now_ms: u64,
     ) -> Result<()> {
-        if self.inner.state() != GatewayState::Requesting {
-            self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
-            return Ok(());
-        }
+        let initial_handshake = match self.inner.state() {
+            GatewayState::Requesting => true,
+            GatewayState::Active => false,
+            _ => {
+                self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
+                return Ok(());
+            }
+        };
         if let Err(e) = self.inner.handle_query(nonce, mac, query_data) {
             self.out_queue.push_back(Event::Warning(e));
             return Ok(());
         }
-        // Flush pending into groups map.
-        while let Some(key) = self.pending.pop_front() {
-            self.groups.insert(key.clone(), GroupState::new(key, now_ms));
+        if initial_handshake {
+            // Flush pending into groups map only when the tunnel first becomes active.
+            while let Some(key) = self.pending.pop_front() {
+                self.groups.insert(key.clone(), GroupState::new(key, now_ms));
+            }
         }
         // Event-emit ORDER is part of the public contract: Transmit(Update)
         // FIRST, HandshakeComplete SECOND. Consumers that want to know "tunnel
@@ -270,7 +276,9 @@ impl<P: Platform> SubscriptionManager<P> {
         // semantics get exactly that. Flipping this order would let a consumer
         // gate on HandshakeComplete and then drop the Update.
         self.send_current_state_update(now_ms)?;
-        self.out_queue.push_back(Event::HandshakeComplete);
+        if initial_handshake {
+            self.out_queue.push_back(Event::HandshakeComplete);
+        }
         Ok(())
     }
 
@@ -735,7 +743,7 @@ mod tests {
         assert!(events.iter().any(|ev| matches!(ev, Event::HandshakeComplete)));
     }
 
-    fn drive_to_active(m: &mut SubscriptionManager<TestPlatform>, key: GroupKey) {
+    fn drive_to_active(m: &mut SubscriptionManager<TestPlatform>, key: GroupKey) -> u32 {
         m.subscribe(key, 1000).unwrap();
         let initial = drain(m);
         let disc_nonce = discovery_nonce_from(&initial);
@@ -758,6 +766,46 @@ mod tests {
         };
         m.handle_datagram(&query.encode(), 1200).unwrap();
         drain(m);
+        req_nonce
+    }
+
+    #[test]
+    fn active_query_emits_refresh_without_duplicate_handshake() {
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        let request_nonce = drive_to_active(&mut m, key);
+        let refreshed_mac = [6, 5, 4, 3, 2, 1];
+        let query = AmtMessage::MembershipQuery {
+            request_nonce,
+            response_mac: refreshed_mac,
+            query_data: vec![0x11; 12],
+        };
+
+        m.handle_datagram(&query.encode(), 1300).unwrap();
+
+        assert_eq!(m.state(), GatewayState::Active);
+        let events = drain(&mut m);
+        assert!(!events.iter().any(|event| matches!(event, Event::HandshakeComplete)));
+        let update = events.iter().find_map(|event| match event {
+            Event::Transmit { payload, .. } if payload[0] == 0x05 => {
+                Some(AmtMessage::decode(payload).unwrap())
+            }
+            _ => None,
+        }).expect("expected active MembershipUpdate transmit");
+        match update {
+            AmtMessage::MembershipUpdate {
+                request_nonce: nonce,
+                response_mac,
+                ..
+            } => {
+                assert_eq!(nonce, request_nonce);
+                assert_eq!(response_mac, refreshed_mac);
+            }
+            _ => panic!("Expected MembershipUpdate"),
+        }
     }
 
     fn synth_v4_udp_packet(src: [u8; 4], dst: [u8; 4], sp: u16, dp: u16, payload: &[u8]) -> Vec<u8> {
