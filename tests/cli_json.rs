@@ -3,7 +3,7 @@
 mod common;
 
 use amt_protocol::messages::MessageType;
-use common::fake_relay::{FakeRelay, synth_v4_udp};
+use common::fake_relay::{synth_v4_udp, FakeRelay};
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -42,8 +42,36 @@ async fn json_output_is_parseable() {
 
     let v: serde_json::Value = serde_json::from_str(buf.trim()).expect(&buf);
     assert_eq!(v["outcome"], "ok");
+    assert_eq!(v["packet_count"], 1);
+    assert_eq!(v["byte_count"], 1);
+    assert!(v["first_data"].is_u64());
     assert_eq!(v["group"], "232.0.0.1");
     assert_eq!(v["first_packet"]["src"], "10.0.0.1:5004");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn help_exposes_d2_probe_flags() {
+    let output = Command::new(env!("CARGO_BIN_EXE_amt-verify"))
+        .arg("--help")
+        .output()
+        .await
+        .expect("spawn amt-verify --help");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in [
+        "--relay",
+        "--port",
+        "--source",
+        "--group",
+        "--no-driad",
+        "--family",
+        "--timeout",
+        "--packet-count",
+        "--json",
+    ] {
+        assert!(stdout.contains(flag), "missing {flag} in:\n{stdout}");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

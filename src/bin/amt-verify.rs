@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -41,6 +41,10 @@ struct Args {
     /// Wait at most this many seconds for first data
     #[arg(long, default_value = "30")]
     timeout: u64,
+
+    /// Number of matching packets required before one-shot success
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    packet_count: u64,
 
     /// Keep-alive interval in seconds
     #[arg(long, default_value = "60")]
@@ -114,6 +118,9 @@ impl ExitCategory {
 #[derive(serde::Serialize)]
 struct OneshotReport {
     outcome: &'static str,
+    packet_count: u64,
+    byte_count: u64,
+    first_data: u64,
     relay: String,
     family: &'static str,
     group: String,
@@ -254,7 +261,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
         .await
         .map_err(ExitCategory::HandshakeFail)?;
 
-    let evt = match recv_first_matching(
+    let first_evt = match recv_first_matching(
         &mut data_rx,
         args.group,
         args.source,
@@ -266,10 +273,27 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
         Err(e) => return Err(ExitCategory::HandshakeFail(e)),
     };
     let first_data_ms = started.elapsed().as_millis() as u64;
+    let mut packet_count = 1;
+    let mut byte_count = first_evt.payload.len() as u64;
+    while packet_count < args.packet_count {
+        let evt = recv_first_matching(
+            &mut data_rx,
+            args.group,
+            args.source,
+            Duration::from_secs(args.timeout),
+        )
+        .await
+        .map_err(ExitCategory::HandshakeFail)?;
+        packet_count += 1;
+        byte_count += evt.payload.len() as u64;
+    }
 
     if args.json {
         let report = OneshotReport {
             outcome: "ok",
+            packet_count,
+            byte_count,
+            first_data: first_data_ms,
             relay: resolved_relay.to_string(),
             family: family_str,
             group: args.group.to_string(),
@@ -278,9 +302,9 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
                 first_data: first_data_ms,
             },
             first_packet: FirstPacket {
-                src: format!("{}:{}", evt.src, evt.src_port),
-                dst_port: evt.dst_port,
-                len: evt.payload.len(),
+                src: format!("{}:{}", first_evt.src, first_evt.src_port),
+                dst_port: first_evt.dst_port,
+                len: first_evt.payload.len(),
             },
         };
         println!(
@@ -289,15 +313,17 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
         );
     } else {
         println!(
-            "ok — relay={} family={} group={} source={} first_data={}ms first_pkt={}:{} len={}",
+            "ok — relay={} family={} group={} source={} packets={} bytes={} first_data={}ms first_pkt={}:{} len={}",
             resolved_relay,
             family_str,
             args.group,
             args.source,
+            packet_count,
+            byte_count,
             first_data_ms,
-            evt.src,
-            evt.src_port,
-            evt.payload.len()
+            first_evt.src,
+            first_evt.src_port,
+            first_evt.payload.len()
         );
     }
 
