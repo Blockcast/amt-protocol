@@ -30,6 +30,8 @@ pub mod gateway;
 pub mod igmp;
 pub mod mld;
 pub mod driad;
+#[cfg(feature = "hickory-proof")]
+pub mod hickory_proof;
 pub mod subscription;
 
 #[cfg(feature = "wasm")]

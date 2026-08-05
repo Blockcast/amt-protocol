@@ -38,9 +38,14 @@ native = [
     "dep:clap",
 ]
 
+# Proof-only dependency set for the AMT-01 Hickory feasibility gate.
+hickory-proof = ["dep:hickory-proto", "dep:getrandom03"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 getrandom = "0.2"
+hickory-proto = { version = "=0.25.2", default-features = false, features = ["std", "wasm-bindgen"], optional = true }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"], optional = true }
 
 # WASM dependencies (optional)
 wasm-bindgen = { version = "0.2", optional = true }
