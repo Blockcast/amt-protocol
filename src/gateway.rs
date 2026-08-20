@@ -190,9 +190,28 @@ impl<P: Platform> AmtGateway<P> {
 
     /// Request membership (send AMT Request)
     ///
-    /// Returns Request message to send to relay
+    /// Valid in two states, which differ in more than the guard:
+    ///
+    /// * `Idle` — bootstrap. Mints a fresh request nonce and moves to
+    ///   `Requesting` to await the relay's Membership Query.
+    /// * `Active` — keepalive re-Request. RFC 7450 §4.2.1.2: *"This query
+    ///   cycle may continue indefinitely once started."* This is the other
+    ///   half of `handle_query` accepting `Active`: a Query can only arrive
+    ///   while Active if a Request could be sent from Active in the first
+    ///   place.
+    ///
+    /// The nonce is **reused** on the keepalive path rather than regenerated.
+    /// It identifies the tunnel to the relay for the tunnel's lifetime, and
+    /// `handle_query` validates the incoming Query against it. Minting a new
+    /// one here would invalidate any Membership Update built between this
+    /// Request and the Query that answers it, because the relay validates the
+    /// nonce/MAC pair carried by the last Query.
+    ///
+    /// The state also stays `Active`, so multicast data arriving during the
+    /// query round trip is still accepted by `handle_data`. Dropping back to
+    /// `Requesting` would blackhole data once per keepalive interval.
     pub fn request_membership(&mut self, p_flag: bool) -> Result<AmtMessage> {
-        if self.state != GatewayState::Idle {
+        if self.state != GatewayState::Idle && self.state != GatewayState::Active {
             return Err(AmtError::InvalidState);
         }
 
@@ -200,11 +219,17 @@ impl<P: Platform> AmtGateway<P> {
             return Err(AmtError::InvalidState);
         }
 
-        // Generate request nonce
-        let nonce = generate_nonce(self.platform.as_ref());
-        self.request_nonce = Some(nonce);
+        let nonce = if self.state == GatewayState::Active {
+            // Keepalive: reuse the tunnel's nonce and stay Active.
+            self.request_nonce.ok_or(AmtError::InvalidState)?
+        } else {
+            // Bootstrap: mint a nonce and wait for the Query.
+            let nonce = generate_nonce(self.platform.as_ref());
+            self.request_nonce = Some(nonce);
+            self.state = GatewayState::Requesting;
+            nonce
+        };
         self.p_flag = p_flag;
-        self.state = GatewayState::Requesting;
 
         Ok(AmtMessage::Request {
             request_nonce: nonce,
@@ -528,6 +553,88 @@ mod tests {
             },
             _ => panic!("Expected MembershipUpdate"),
         }
+    }
+
+    /// A keepalive Request is what makes an active-tunnel Membership Query
+    /// reachable, so this covers the other half of
+    /// `test_active_membership_query_refreshes_response_state`.
+    #[test]
+    fn test_keepalive_request_from_active_reuses_nonce_and_keeps_data_flowing() {
+        let mut gw = AmtGateway::new(test_config(), test_platform());
+
+        let discovery = gw.start_discovery().unwrap();
+        let discovery_nonce = match discovery {
+            AmtMessage::RelayDiscovery { nonce } => nonce,
+            _ => panic!("Expected RelayDiscovery"),
+        };
+        gw.handle_advertisement(discovery_nonce, "198.51.100.1".parse().unwrap()).unwrap();
+
+        let request = gw.request_membership(false).unwrap();
+        let request_nonce = match request {
+            AmtMessage::Request { request_nonce, .. } => request_nonce,
+            _ => panic!("Expected Request"),
+        };
+        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11]).unwrap();
+        gw.send_update(vec![0x22]).unwrap();
+        assert_eq!(gw.state(), GatewayState::Active);
+
+        // The keepalive re-Request itself: permitted from Active, carries the
+        // tunnel's existing nonce, and does NOT drop back to Requesting.
+        let keepalive = gw.request_membership(false).unwrap();
+        match keepalive {
+            AmtMessage::Request { request_nonce: nonce, .. } => {
+                assert_eq!(nonce, request_nonce, "keepalive Request must reuse the tunnel nonce");
+            },
+            _ => panic!("Expected Request for keepalive"),
+        }
+        assert_eq!(gw.state(), GatewayState::Active, "keepalive must not leave Active");
+
+        // Data arriving during the query round trip is still accepted. This is
+        // what the state-preserving branch buys: dropping to Requesting would
+        // blackhole data once per keepalive interval.
+        let payload = vec![0xAA, 0xBB];
+        assert_eq!(gw.handle_data(payload.clone()).unwrap(), payload);
+
+        // The relay answers the keepalive with a Query bearing the same nonce
+        // and a refreshed MAC, and the cycle continues.
+        let refreshed_mac = [9, 8, 7, 6, 5, 4];
+        gw.handle_query(request_nonce, refreshed_mac, vec![0x33]).unwrap();
+        assert_eq!(gw.state(), GatewayState::Querying);
+
+        let update = gw.send_update(vec![0x44]).unwrap();
+        assert_eq!(gw.state(), GatewayState::Active);
+        match update {
+            AmtMessage::MembershipUpdate { request_nonce: nonce, response_mac, .. } => {
+                assert_eq!(nonce, request_nonce);
+                assert_eq!(response_mac, refreshed_mac);
+            },
+            _ => panic!("Expected MembershipUpdate"),
+        }
+    }
+
+    /// The relaxation is scoped to Active. The intermediate handshake states
+    /// must still be refused, so a second Request cannot race the first.
+    #[test]
+    fn test_request_membership_still_rejects_intermediate_states() {
+        let mut gw = AmtGateway::new(test_config(), test_platform());
+
+        // Discovering: covered by test_state_validation, restated here so this
+        // test reads as the complete boundary for the relaxed guard.
+        let discovery = gw.start_discovery().unwrap();
+        assert_eq!(gw.state(), GatewayState::Discovering);
+        assert!(matches!(gw.request_membership(false), Err(AmtError::InvalidState)));
+
+        let discovery_nonce = match discovery {
+            AmtMessage::RelayDiscovery { nonce } => nonce,
+            _ => panic!("Expected RelayDiscovery"),
+        };
+        gw.handle_advertisement(discovery_nonce, "198.51.100.1".parse().unwrap()).unwrap();
+
+        // Requesting: a Query is already outstanding, so re-Requesting here
+        // would mint a second nonce and orphan the first.
+        gw.request_membership(false).unwrap();
+        assert_eq!(gw.state(), GatewayState::Requesting);
+        assert!(matches!(gw.request_membership(false), Err(AmtError::InvalidState)));
     }
 
     #[test]
