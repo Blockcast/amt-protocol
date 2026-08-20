@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# A superseded push should not leave three stale matrix legs occupying runners.
+# `main` is excluded from cancellation so a push-to-main run always completes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
   # Deliberately no `RUSTFLAGS: -D warnings`: RUSTFLAGS also applies to
@@ -30,6 +36,14 @@ jobs:
     # protection, and renaming a leg silently drops its gate.
     name: test (${{ matrix.id }})
     runs-on: ubuntu-latest
+    # The native leg's integration tests are not uniformly bounded: tests/cli_json.rs
+    # awaits `read_to_string` then `child.wait()` on a spawned amt-verify with no
+    # `tokio::time::timeout` wrapper, and tests/watch_smoke.rs awaits `shutdown()`
+    # unwrapped. (tests/native_runtime.rs does wrap its recv in 5s.) Without this,
+    # a stalled child or a dropped packet holds a runner for GitHub's 6-hour
+    # default on the job meant to gate every PR.
+    timeout-minutes: 20
+
     strategy:
       fail-fast: false
       matrix:
@@ -80,15 +94,44 @@ jobs:
           fi
           # src/gateway.rs holds the AMT state machine and the nonce/MAC guards that
           # BLO-28805 regressed. If its tests stop being compiled in, the suite can
-          # still be non-empty while the guards go unexercised.
-          if [ "${gateway}" -lt 1 ]; then
-            echo "::error::No gateway::tests ran. src/gateway.rs's state-machine guards are the regression surface this job exists to protect (BLO-29411)."
+          # still be non-empty while the guards go unexercised. The floor is 8
+          # against 12 present today: high enough that feature-gating most of the
+          # module trips it, with headroom for deleting a genuinely obsolete test.
+          # Raise it alongside the module rather than leaving it at 1, where a
+          # single surviving test would satisfy a check whose stated purpose is
+          # the guards, plural.
+          if [ "${gateway}" -lt 8 ]; then
+            echo "::error::Only ${gateway} gateway::tests ran (expected >= 8). src/gateway.rs's state-machine guards are the regression surface this job exists to protect (BLO-29411)."
             exit 1
           fi
 
-      # Integration targets (native leg) plus doc-tests.
-      - name: cargo test (all targets)
-        run: cargo test ${{ matrix.flags }}
+      # Integration targets and doc-tests. Scoped with `--test '*'` rather than a
+      # bare `cargo test`, which would re-run the whole library suite the step
+      # above already ran and asserted on — six redundant lib executions across
+      # the matrix. `--doc` cannot be combined with other target selectors, so it
+      # is a second invocation; there are no doc-tests today, and running it keeps
+      # the first one that lands from being silently skipped.
+      - name: cargo test (integration targets + doc-tests)
+        run: |
+          set -euo pipefail
+          cargo test ${{ matrix.flags }} --test '*'
+          cargo test ${{ matrix.flags }} --doc
+
+      # The WASM artifact the IWA/browser consumer loads, built exactly as
+      # `make wasm` does. The default-wasm leg above compiles and tests the
+      # wasm-bindgen surface on the HOST target only, so without this a host-only
+      # API in src/wasm.rs — or a dep without wasm support — still goes green
+      # while `make wasm` is broken. That is the same asymmetry the ffi artifact
+      # check below closes for CGO consumers.
+      - name: cargo build --release --target wasm32 (make wasm) + artifact check
+        if: matrix.id == 'default-wasm'
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-unknown-unknown
+          cargo build --release --target wasm32-unknown-unknown --features wasm
+          wasm=target/wasm32-unknown-unknown/release/amt_protocol.wasm
+          test -f "$wasm" || { echo "::error::$wasm missing — wasm-bindgen consumes this in \`make wasm\`."; exit 1; }
+          ls -l "$wasm"
 
       # The artifact go-amt links against, built exactly as `make ffi` does, so a
       # break in the `ffi` selection fails this PR instead of the downstream
