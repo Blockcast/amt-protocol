@@ -252,7 +252,7 @@ impl<P: Platform> AmtGateway<P> {
     /// RFC 7450 §5.2.3.4: gateway re-sends Membership Update before the
     /// relay's AMT query timer expires to maintain tunnel state.
     pub fn send_update(&mut self, report_data: Vec<u8>) -> Result<AmtMessage> {
-        if self.state != GatewayState::Querying && self.state != GatewayState::Active {
+        if self.state != GatewayState::Querying {
             return Err(AmtError::InvalidState);
         }
 
