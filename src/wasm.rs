@@ -435,15 +435,38 @@ impl JsDriad {
 
     /// Parse a DNS response packet and extract the AMT relay address.
     ///
-    /// Looks for TYPE260 (AMTRELAY) answer records and returns the relay
-    /// address from the first valid record. May return an IP address string
-    /// (for type 1/2) or a DNS hostname (for type 3) that needs further resolution.
+    /// Considers every TYPE260 (AMTRELAY) answer whose owner name and class
+    /// match the question echoed in the response, and returns the relay from
+    /// the most-preferred usable record (RFC 8777 §4.2 precedence: lower wins,
+    /// falling through when the best record is unusable). May return an IP
+    /// address string (type 1/2) or a DNS hostname (type 3) needing further
+    /// resolution.
+    ///
+    /// Prefer `parseDnsResponseValidated` whenever the caller still holds the
+    /// query bytes: this entry point cannot check the transaction ID, so it
+    /// cannot distinguish our answer from a forged one over an unauthenticated
+    /// transport.
     ///
     /// @param data - Raw DNS response bytes (Uint8Array)
     /// @returns Relay address as string (IP or hostname), or null if no AMTRELAY record found
     #[wasm_bindgen(js_name = parseDnsResponse)]
     pub fn parse_dns_response(data: &[u8]) -> Option<String> {
         DriadResolver::parse_dns_response(data).map(|addr| addr.to_string())
+    }
+
+    /// Parse a DNS response, binding it to the query that produced it.
+    ///
+    /// Same selection as `parseDnsResponse`, plus a transaction-ID and question
+    /// match against `query` — the packet returned by `buildDnsQuery`. Pass the
+    /// query bytes through so the parser can reject a reply that answers a
+    /// different question than the one asked.
+    ///
+    /// @param query - The DNS query packet that was sent (Uint8Array)
+    /// @param data - Raw DNS response bytes (Uint8Array)
+    /// @returns Relay address as string (IP or hostname), or null if the response is not a valid answer to `query`
+    #[wasm_bindgen(js_name = parseDnsResponseValidated)]
+    pub fn parse_dns_response_validated(query: &[u8], data: &[u8]) -> Option<String> {
+        DriadResolver::parse_dns_response_validated(query, data).map(|addr| addr.to_string())
     }
 
     /// Build a DNS A record query for a hostname.
@@ -465,6 +488,16 @@ impl JsDriad {
     #[wasm_bindgen(js_name = parseDnsAResponse)]
     pub fn parse_dns_a_response(data: &[u8]) -> Option<String> {
         DriadResolver::parse_dns_a_response(data).map(|addr| addr.to_string())
+    }
+
+    /// Parse a DNS A response, binding it to the query that produced it.
+    ///
+    /// @param query - The DNS A query packet that was sent (Uint8Array)
+    /// @param data - Raw DNS response bytes (Uint8Array)
+    /// @returns IPv4 address as string, or null if the response is not a valid answer to `query`
+    #[wasm_bindgen(js_name = parseDnsAResponseValidated)]
+    pub fn parse_dns_a_response_validated(query: &[u8], data: &[u8]) -> Option<String> {
+        DriadResolver::parse_dns_a_response_validated(query, data).map(|addr| addr.to_string())
     }
 }
 

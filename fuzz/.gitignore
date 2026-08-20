@@ -1,0 +1,4 @@
+# Build output and crash artifacts are disposable; the seed corpus is not.
+target/
+artifacts/
+Cargo.lock

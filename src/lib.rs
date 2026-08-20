@@ -35,6 +35,18 @@ pub mod subscription;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+/// Private DRIAD decoders, re-exported for the out-of-tree `fuzz/` crate only.
+///
+/// Enabled by the `fuzzing` feature, which no shipping build turns on. These are
+/// deliberately not part of the public API: they take raw RDATA rather than a
+/// whole DNS message, so a caller reaching them directly would bypass the
+/// transaction-ID, question, owner-name and class checks that make the message
+/// path safe (BLO-28790).
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_api {
+    pub use crate::driad::fuzz_exports::{parse_amtrelay_rdata, parse_dns_wire_name};
+}
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 

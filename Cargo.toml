@@ -15,6 +15,11 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [features]
 default = ["wasm"]
 
+# Expose the private DRIAD RDATA/name decoders to the out-of-tree `fuzz/` crate.
+# Off by default and never enabled for a shipping build, so it adds no code to
+# the release WASM and no dependency to the graph.
+fuzzing = []
+
 # WASM target (web browsers via wasm-bindgen)
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys", "dep:js-sys", "getrandom/js"]
 

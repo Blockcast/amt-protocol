@@ -1,0 +1,43 @@
+[package]
+name = "amt-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Deliberately NOT a member of the parent workspace: the fuzz harness pulls in
+# libfuzzer-sys and arbitrary, and neither may reach the shipping crate's
+# dependency graph. BLO-28790 caps the release WASM at +2% gzip, so the
+# hardening had to land with zero new runtime dependencies.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.amt-protocol]
+path = ".."
+# `fuzzing` re-exports the private RDATA/name decoders. No target-specific
+# feature is needed, so build the crate bare and let the fuzzer link fast.
+default-features = false
+features = ["fuzzing"]
+
+[[bin]]
+name = "driad_parse_response"
+path = "fuzz_targets/driad_parse_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "driad_amtrelay_rdata"
+path = "fuzz_targets/driad_amtrelay_rdata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "driad_query_roundtrip"
+path = "fuzz_targets/driad_query_roundtrip.rs"
+test = false
+doc = false
+bench = false

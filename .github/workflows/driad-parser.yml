@@ -1,0 +1,81 @@
+name: DRIAD parser
+
+# The DRIAD parser consumes unauthenticated DNS responses: plain UDP:53 on the
+# native path, DoH bytes handed to WASM on the browser path. This lane gates the
+# golden wire corpus, the bounded mutation harness, and the libFuzzer targets
+# that cover the hand-rolled bounds handling in the message walker (BLO-28790).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to test
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: driad-parser-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: golden corpus + mutation harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Covers the whole crate, including the 25 in-module driad.rs unit tests.
+      - name: cargo test (lib)
+        run: cargo test --lib --no-default-features
+
+      # Golden wire vectors: IPv4/IPv6/name relays, compression, multi-answer
+      # precedence, transaction IDs, questions, answer ownership and class.
+      # `fixtures_on_disk_match_generator` fails if a checked-in fixture has
+      # drifted from the generator that documents its intent.
+      - name: golden DRIAD corpus
+        run: cargo test --test driad_golden --no-default-features
+
+      # Deterministic bounded mutation over the same corpus. Runs on stable so
+      # totality is gated on every PR, not only when the nightly fuzz job runs.
+      - name: bounded mutation harness
+        run: cargo test --test driad_fuzz_corpus --no-default-features --features fuzzing
+
+  fuzz:
+    name: libFuzzer (bounded)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Bounded so this is a regression gate, not an open-ended fuzzing session:
+      # each target runs the checked-in seed corpus plus a fixed time budget.
+      # A crash writes to fuzz/artifacts/ and fails the job.
+      - name: fuzz parse_dns_response
+        run: cargo fuzz run driad_parse_response -- -max_total_time=120 -max_len=4096
+      - name: fuzz parse_amtrelay_rdata
+        run: cargo fuzz run driad_amtrelay_rdata -- -max_total_time=120 -max_len=512
+      - name: fuzz validated/unvalidated differential
+        run: cargo fuzz run driad_query_roundtrip -- -max_total_time=120 -max_len=4096
+
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

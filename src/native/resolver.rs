@@ -59,8 +59,11 @@ async fn try_one(ns: IpAddr, query: &[u8]) -> Result<DriadRelayAddress> {
     let (n, _) = timeout(QUERY_TIMEOUT, sock.recv_from(&mut buf))
         .await
         .map_err(|_| anyhow!("DNS query to {} timed out", ns))??;
-    DriadResolver::parse_dns_response(&buf[..n])
-        .ok_or_else(|| anyhow!("DNS reply from {} had no AMTRELAY answer", ns))
+    // Bind the reply to the query we sent. This socket is unauthenticated
+    // UDP:53, so an off-path attacker who guesses the 5-tuple can race a forged
+    // AMTRELAY answer and point relay discovery wherever it likes.
+    DriadResolver::parse_dns_response_validated(query, &buf[..n])
+        .ok_or_else(|| anyhow!("DNS reply from {} had no valid AMTRELAY answer", ns))
 }
 
 async fn follow_up_a_or_aaaa(name: &str, nameservers: &[IpAddr]) -> Result<IpAddr> {
@@ -95,67 +98,19 @@ async fn follow_up_a_or_aaaa_one(name: &str, ns: IpAddr, port: u16) -> Result<Ip
             .await
             .map_err(|_| anyhow!("A/AAAA recv_from timed out for {}", name))??;
         let pkt = &buf[..n];
-        // Validate response TXID + qname BEFORE trusting any answer bytes —
-        // a stray, spoofed, or stale packet must not be accepted as the relay.
-        if pkt.len() < 12 {
-            continue;
+        // Validate transaction ID + question against the exact query bytes we
+        // sent BEFORE trusting any answer bytes — a stray, spoofed, or stale
+        // packet must not be accepted as the relay. Each validated parser binds
+        // to its own query, so a reply is only ever matched against the sibling
+        // it actually answers.
+        if let Some(addr) = DriadResolver::parse_dns_aaaa_response_validated(&aaaa_q, pkt) {
+            return Ok(addr);
         }
-        let resp_id = u16::from_be_bytes([pkt[0], pkt[1]]);
-        let matches_a = resp_id == a_id;
-        let matches_aaaa = resp_id == aaaa_id;
-        if !matches_a && !matches_aaaa {
-            continue;
+        if let Some(addr) = DriadResolver::parse_dns_a_response_validated(&a_q, pkt) {
+            return Ok(addr);
         }
-        if !response_qname_matches(pkt, name) {
-            continue;
-        }
-        if matches_aaaa {
-            if let Some(addr) = DriadResolver::parse_dns_aaaa_response(pkt) {
-                return Ok(addr);
-            }
-        }
-        if matches_a {
-            if let Some(addr) = DriadResolver::parse_dns_a_response(pkt) {
-                return Ok(addr);
-            }
-        }
-        // ID + qname matched but no usable answer — keep waiting for the sibling.
+        // No usable answer — keep waiting for the sibling until the deadline.
     }
-}
-
-/// Compare the question-section qname in a DNS response to an expected hostname.
-/// Returns true iff the wire-encoded labels match (case-insensitive ASCII).
-fn response_qname_matches(pkt: &[u8], expected: &str) -> bool {
-    if pkt.len() < 12 {
-        return false;
-    }
-    let mut off = 12usize;
-    let mut expected_labels: Vec<&str> = expected.trim_end_matches('.').split('.').collect();
-    expected_labels.retain(|s| !s.is_empty());
-    let mut got_labels: Vec<String> = Vec::new();
-    while off < pkt.len() {
-        let len = pkt[off] as usize;
-        if len == 0 {
-            break;
-        }
-        if len >= 0xC0 {
-            return false;
-        } // pointer in question is malformed
-        off += 1;
-        if off + len > pkt.len() {
-            return false;
-        }
-        let label = String::from_utf8_lossy(&pkt[off..off + len]).to_string();
-        got_labels.push(label);
-        off += len;
-    }
-    if got_labels.len() != expected_labels.len() {
-        return false;
-    }
-    got_labels
-        .iter()
-        .zip(expected_labels.iter())
-        .all(|(g, e)| g.eq_ignore_ascii_case(e))
 }
 
 #[cfg(test)]
@@ -183,8 +138,8 @@ async fn try_one_at_port(ns: IpAddr, port: u16, query: &[u8]) -> Result<DriadRel
     let (n, _) = timeout(QUERY_TIMEOUT, sock.recv_from(&mut buf))
         .await
         .map_err(|_| anyhow!("DNS query to {}:{} timed out", ns, port))??;
-    DriadResolver::parse_dns_response(&buf[..n])
-        .ok_or_else(|| anyhow!("DNS reply from {}:{} had no AMTRELAY answer", ns, port))
+    DriadResolver::parse_dns_response_validated(query, &buf[..n])
+        .ok_or_else(|| anyhow!("DNS reply from {}:{} had no valid AMTRELAY answer", ns, port))
 }
 
 #[cfg(test)]
