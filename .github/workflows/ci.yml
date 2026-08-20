@@ -1,0 +1,104 @@
+name: CI
+
+# This crate is the Rust FFI implementation that production go-amt links against
+# (CGO_ENABLED=1 + libamt_protocol). Before BLO-29411 nothing here ran `cargo test`,
+# so `src/gateway.rs`'s state-machine tests executed nowhere and guard regressions
+# were only caught downstream — see BLO-28805, where `send_update` was single-shot
+# per Membership Query for the life of the pin and surfaced only once go-amt's
+# `cgo-test` job exercised the FFI selection.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately no `RUSTFLAGS: -D warnings`: RUSTFLAGS also applies to
+  # dependencies, and Cargo.lock is gitignored here, so dep versions float on
+  # every run. One upstream release with a deprecation warning would turn this
+  # required check red for reasons unrelated to the PR. Deny-warnings belongs
+  # with `cargo clippy`, which lints only the local crate — see BLO-29411 for
+  # why that is deferred rather than landed here.
+
+jobs:
+  test:
+    # Keep these job names stable — they are the required-check names in branch
+    # protection, and renaming a leg silently drops its gate.
+    name: test (${{ matrix.id }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The crate's default selection (`default = ["wasm"]`). The wasm-bindgen
+          # surface compiles and its library tests run on a host target, so the
+          # default selection is covered rather than skipped.
+          - id: default-wasm
+            flags: ""
+          # The selection production consumers actually link: `make ffi`.
+          - id: ffi
+            flags: --no-default-features --features ffi
+          # tokio/clap runtime + CLI. Carries the `tests/*.rs` integration suite,
+          # which is `#![cfg(feature = "native")]` and therefore invisible to
+          # every other leg.
+          - id: native
+            flags: --no-default-features --features native
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.id }}
+
+      # Anti-vacuity gate. `cargo test` over all targets is NOT a safe signal here:
+      # every `tests/*.rs` target is `#![cfg(feature = "native")]`, so on the
+      # default and ffi legs they each print "test result: ok. 0 passed" and a
+      # naive "did it exit 0" check would go green having run nothing. Same failure
+      # mode as `-run`-filtered Go tests in go-amt's cgo-test job. So assert on the
+      # library target's own count.
+      - name: cargo test (library target) + non-zero count assertion
+        run: |
+          set -euo pipefail
+          cargo test ${{ matrix.flags }} --lib 2>&1 | tee lib-test.log
+
+          passed="$(sed -n 's/^test result: ok\. \([0-9]\{1,\}\) passed.*/\1/p' lib-test.log | head -1)"
+          passed="${passed:-0}"
+          gateway="$(grep -c '^test gateway::tests::' lib-test.log || true)"
+
+          echo "library tests passed: ${passed}"
+          echo "gateway::tests executed: ${gateway}"
+
+          if [ "${passed}" -lt 1 ]; then
+            echo "::error::Vacuous run: the library target reported ${passed} passing tests. A green tick here would mean nothing (BLO-29411)."
+            exit 1
+          fi
+          # src/gateway.rs holds the AMT state machine and the nonce/MAC guards that
+          # BLO-28805 regressed. If its tests stop being compiled in, the suite can
+          # still be non-empty while the guards go unexercised.
+          if [ "${gateway}" -lt 1 ]; then
+            echo "::error::No gateway::tests ran. src/gateway.rs's state-machine guards are the regression surface this job exists to protect (BLO-29411)."
+            exit 1
+          fi
+
+      # Integration targets (native leg) plus doc-tests.
+      - name: cargo test (all targets)
+        run: cargo test ${{ matrix.flags }}
+
+      # The artifact go-amt links against, built exactly as `make ffi` does, so a
+      # break in the `ffi` selection fails this PR instead of the downstream
+      # submodule bump.
+      - name: cargo build --release (make ffi) + artifact check
+        if: matrix.id == 'ffi'
+        run: |
+          set -euo pipefail
+          cargo build --release --features ffi --no-default-features
+          for lib in target/release/libamt_protocol.a target/release/libamt_protocol.so; do
+            test -f "$lib" || { echo "::error::$lib missing — CGO consumers link this."; exit 1; }
+            ls -l "$lib"
+          done
