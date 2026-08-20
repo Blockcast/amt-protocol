@@ -133,8 +133,15 @@ impl DriadResolver {
         packet.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
 
         // Question section - RFC 1035 Section 4.1.2
-        // QNAME: sequence of length-prefixed labels
-        for label in qname.split('.') {
+        // QNAME: sequence of length-prefixed labels.
+        //
+        // Empty labels are skipped so that a fully-qualified name written with a
+        // trailing dot ("relay.example.") frames identically to its relative
+        // spelling ("relay.example"). `split('.')` yields a trailing "" for the
+        // former, which previously emitted a second zero length-octet after the
+        // explicit root label below — two root labels, a QNAME one byte longer
+        // than the parser computes, and every subsequent section misaligned.
+        for label in qname.split('.').filter(|label| !label.is_empty()) {
             packet.push(label.len() as u8);
             packet.extend_from_slice(label.as_bytes());
         }
@@ -148,85 +155,178 @@ impl DriadResolver {
         packet
     }
 
-    /// Parse a DNS response packet and extract the relay address from the first
-    /// AMTRELAY (TYPE260) answer record.
+    /// Parse a DNS response packet and extract the best AMTRELAY (TYPE260) relay.
     ///
-    /// Returns the relay address (IP or DNS name), or None if no valid record found.
+    /// Records are considered in RFC 8777 §4.2 precedence order (lower value
+    /// preferred); if the most-preferred record is unusable the next is tried.
+    ///
+    /// Answer records are accepted only when their owner name and class match
+    /// the question echoed in this same response. That is self-consistency, not
+    /// authentication: it cannot detect a spoofed reply that rewrote the
+    /// question to match its own forged answers. Callers that hold the query
+    /// they sent MUST use [`parse_dns_response_validated`], which additionally
+    /// binds the transaction ID and question to the outgoing request.
+    ///
+    /// [`parse_dns_response_validated`]: DriadResolver::parse_dns_response_validated
     pub fn parse_dns_response(data: &[u8]) -> Option<DriadRelayAddress> {
-        let rdata = Self::find_dns_answer(data, AMTRELAY_TYPE)?;
-        Self::parse_amtrelay_rdata(&rdata)
+        Self::select_amtrelay(data, None)
+    }
+
+    /// Parse a DNS response, binding it to the query that produced it.
+    ///
+    /// Rejects the reply unless, in addition to the checks in
+    /// [`parse_dns_response`], the response transaction ID equals the query's
+    /// and the echoed question matches the question we asked. This is the entry
+    /// point for any unauthenticated transport (plain UDP:53), where an off-path
+    /// attacker can race a forged answer and redirect relay discovery.
+    ///
+    /// [`parse_dns_response`]: DriadResolver::parse_dns_response
+    pub fn parse_dns_response_validated(query: &[u8], data: &[u8]) -> Option<DriadRelayAddress> {
+        let expect = DnsQuestionRef::from_query(query)?;
+        Self::select_amtrelay(data, Some(&expect))
+    }
+
+    /// Collect every acceptable AMTRELAY answer, then pick by precedence.
+    fn select_amtrelay(data: &[u8], expect: Option<&DnsQuestionRef>) -> Option<DriadRelayAddress> {
+        let mut best: Option<(u8, DriadRelayAddress)> = None;
+        Self::for_each_answer(data, AMTRELAY_TYPE, expect, |rdata| {
+            // A record whose RDATA does not decode (unknown relay type, truncated
+            // relay field, type 0 "no relay") is skipped, not fatal — RFC 8777
+            // §4.2 requires falling through to the next candidate.
+            if let Some((precedence, addr)) = Self::parse_amtrelay_record(rdata) {
+                // Strictly-lower precedence wins, so ties keep the first record
+                // in wire order (stable selection).
+                if best.as_ref().is_none_or(|(b, _)| precedence < *b) {
+                    best = Some((precedence, addr));
+                }
+            }
+        })?;
+        best.map(|(_, addr)| addr)
     }
 
     /// Parse a DNS A record response and extract the first IPv4 address.
     ///
     /// Used to resolve DRIAD type=3 DNS name relays.
     pub fn parse_dns_a_response(data: &[u8]) -> Option<IpAddr> {
-        let rdata = Self::find_dns_answer(data, DNS_TYPE_A)?;
-        if rdata.len() == 4 {
-            Some(IpAddr::V4(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3])))
-        } else {
-            None
-        }
+        Self::first_address(data, DNS_TYPE_A, None)
+    }
+
+    /// Query-bound variant of [`parse_dns_a_response`].
+    ///
+    /// [`parse_dns_a_response`]: DriadResolver::parse_dns_a_response
+    pub fn parse_dns_a_response_validated(query: &[u8], data: &[u8]) -> Option<IpAddr> {
+        let expect = DnsQuestionRef::from_query(query)?;
+        Self::first_address(data, DNS_TYPE_A, Some(&expect))
     }
 
     /// Parse a DNS AAAA record response and extract the first IPv6 address.
     ///
     /// Used to resolve DRIAD type=3 DNS name relays to IPv6.
     pub fn parse_dns_aaaa_response(data: &[u8]) -> Option<IpAddr> {
-        let rdata = Self::find_dns_answer(data, DNS_TYPE_AAAA)?;
-        if rdata.len() != 16 {
-            return None;
-        }
-        let mut octets = [0u8; 16];
-        octets.copy_from_slice(&rdata);
-        Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        Self::first_address(data, DNS_TYPE_AAAA, None)
     }
 
-    /// Find the RDATA of the first DNS answer record matching the given type.
+    /// Query-bound variant of [`parse_dns_aaaa_response`].
     ///
-    /// Returns a copy of the RDATA bytes, or None if no matching record found.
-    fn find_dns_answer(data: &[u8], record_type: u16) -> Option<Vec<u8>> {
+    /// [`parse_dns_aaaa_response`]: DriadResolver::parse_dns_aaaa_response
+    pub fn parse_dns_aaaa_response_validated(query: &[u8], data: &[u8]) -> Option<IpAddr> {
+        let expect = DnsQuestionRef::from_query(query)?;
+        Self::first_address(data, DNS_TYPE_AAAA, Some(&expect))
+    }
+
+    /// Return the address from the first acceptable A/AAAA answer.
+    fn first_address(
+        data: &[u8],
+        record_type: u16,
+        expect: Option<&DnsQuestionRef>,
+    ) -> Option<IpAddr> {
+        let mut found: Option<IpAddr> = None;
+        Self::for_each_answer(data, record_type, expect, |rdata| {
+            if found.is_some() {
+                return;
+            }
+            found = match (record_type, rdata.len()) {
+                (DNS_TYPE_A, 4) => Some(IpAddr::V4(Ipv4Addr::new(
+                    rdata[0], rdata[1], rdata[2], rdata[3],
+                ))),
+                (DNS_TYPE_AAAA, 16) => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(rdata);
+                    Some(IpAddr::V6(Ipv6Addr::from(octets)))
+                }
+                _ => None,
+            };
+        })?;
+        found
+    }
+
+    /// Walk the answer section, invoking `visit` with the RDATA of every record
+    /// whose TYPE and CLASS match and whose owner name matches the question.
+    ///
+    /// Returns None if the message is not a usable response at all (malformed,
+    /// not a reply, RCODE set, or failing `expect`); Some(()) when the answer
+    /// section was walked successfully, even if nothing matched.
+    fn for_each_answer(
+        data: &[u8],
+        record_type: u16,
+        expect: Option<&DnsQuestionRef>,
+        mut visit: impl FnMut(&[u8]),
+    ) -> Option<()> {
         if data.len() < 12 {
             return None;
         }
 
-        // DNS Header
         let flags = u16::from_be_bytes([data[2], data[3]]);
-        let qr = (flags >> 15) & 1;
-        let rcode = flags & 0x0F;
-
-        // Must be a response (QR=1) with no error (RCODE=0)
-        if qr != 1 || rcode != 0 {
+        // Must be a response (QR=1) with no error (RCODE=0).
+        if (flags >> 15) & 1 != 1 || flags & 0x0F != 0 {
             return None;
         }
 
         let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
         let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
 
-        if ancount == 0 {
+        // Exactly one question: DRIAD never pipelines, and a multi-question
+        // reply gives us no single owner name to hold answers to.
+        if qdcount != 1 {
             return None;
         }
 
-        // Skip past the question section
-        let mut offset = 12;
-        for _ in 0..qdcount {
-            offset = Self::skip_dns_name(data, offset)?;
-            offset += 4; // QTYPE(2) + QCLASS(2)
-            if offset > data.len() {
+        if let Some(expect) = expect {
+            let txid = u16::from_be_bytes([data[0], data[1]]);
+            if txid != expect.txid {
                 return None;
             }
         }
 
-        // Parse answer records
+        // Decode the question: its owner name is what every answer must match.
+        let qname = DnsName::decode(data, 12)?;
+        let after_qname = qname.end;
+        if after_qname + 4 > data.len() {
+            return None;
+        }
+        let qtype = u16::from_be_bytes([data[after_qname], data[after_qname + 1]]);
+        let qclass = u16::from_be_bytes([data[after_qname + 2], data[after_qname + 3]]);
+
+        if let Some(expect) = expect {
+            if qtype != expect.qtype || qclass != expect.qclass {
+                return None;
+            }
+            if !DnsName::eq(data, &qname, expect.msg, &expect.name) {
+                return None;
+            }
+        }
+
+        let mut offset = after_qname + 4;
         for _ in 0..ancount {
-            // Skip NAME (may be a pointer)
-            offset = Self::skip_dns_name(data, offset)?;
+            let owner = DnsName::decode(data, offset)?;
+            offset = owner.end;
             if offset + 10 > data.len() {
                 return None;
             }
 
             let rtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
-            // skip CLASS(2) + TTL(4)
+            let rclass = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
+            // data[offset+4..offset+8] = TTL, unused for selection.
             let rdlength = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
             offset += 10;
 
@@ -234,56 +334,73 @@ impl DriadResolver {
                 return None;
             }
 
-            if rtype == record_type {
-                return Some(data[offset..offset + rdlength].to_vec());
+            // Owner/class must match the question. An in-bailiwick reply can
+            // otherwise smuggle a record for an unrelated name (or a bogus
+            // class) into the answer section and have it read as ours.
+            if rtype == record_type
+                && rclass == qclass
+                && DnsName::eq(data, &owner, data, &qname)
+            {
+                visit(&data[offset..offset + rdlength]);
             }
 
-            // Skip this record's RDATA
             offset += rdlength;
         }
 
-        None
+        Some(())
     }
 
-    /// Parse AMTRELAY RDATA (RFC 8777 Section 4.2)
+    /// Parse AMTRELAY RDATA (RFC 8777 Section 4.2), returning its precedence.
     ///
     /// Wire format: [precedence:1][D+type:1][relay:variable]
     ///   D (bit 7): discovery optional flag
     ///   type (bits 6-0): 0=none, 1=IPv4, 2=IPv6, 3=domain name
-    fn parse_amtrelay_rdata(rdata: &[u8]) -> Option<DriadRelayAddress> {
+    fn parse_amtrelay_record(rdata: &[u8]) -> Option<(u8, DriadRelayAddress)> {
         if rdata.len() < 2 {
             return None;
         }
 
-        // rdata[0] = precedence (unused for now)
+        let precedence = rdata[0];
         let relay_type = rdata[1] & 0x7F;
 
-        match relay_type {
+        let addr = match relay_type {
             1 => {
-                // IPv4: 4 bytes
+                // IPv4: exactly 4 bytes of relay field.
                 if rdata.len() < 6 {
                     return None;
                 }
-                Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+                DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
                     rdata[2], rdata[3], rdata[4], rdata[5],
-                ))))
+                )))
             }
             2 => {
-                // IPv6: 16 bytes
+                // IPv6: exactly 16 bytes of relay field.
                 if rdata.len() < 18 {
                     return None;
                 }
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&rdata[2..18]);
-                Some(DriadRelayAddress::Ip(IpAddr::V6(Ipv6Addr::from(octets))))
+                DriadRelayAddress::Ip(IpAddr::V6(Ipv6Addr::from(octets)))
             }
             3 => {
                 // DNS wire-format name (RFC 1035 Section 3.3)
                 // Per RFC 8777: compression pointers are NOT allowed in AMTRELAY RDATA
-                Self::parse_dns_wire_name(&rdata[2..]).map(DriadRelayAddress::DnsName)
+                DriadRelayAddress::DnsName(Self::parse_dns_wire_name(&rdata[2..])?)
             }
-            _ => None,
-        }
+            // Type 0 is "no relay"; anything else is unassigned. Both are
+            // unusable, so the caller falls through to the next record.
+            _ => return None,
+        };
+
+        Some((precedence, addr))
+    }
+
+    /// Parse AMTRELAY RDATA, discarding precedence. Retained for the RDATA-level
+    /// unit tests; production selection goes through `parse_amtrelay_record` so
+    /// that precedence is never dropped on the way.
+    #[cfg(test)]
+    fn parse_amtrelay_rdata(rdata: &[u8]) -> Option<DriadRelayAddress> {
+        Self::parse_amtrelay_record(rdata).map(|(_, addr)| addr)
     }
 
     /// Parse a DNS wire-format domain name (uncompressed label sequence).
@@ -321,49 +438,153 @@ impl DriadResolver {
 
         Some(labels.join("."))
     }
+}
 
-    /// Skip a DNS name at the given offset, handling both labels and pointers.
-    /// Returns the offset after the name, or None if malformed.
-    fn skip_dns_name(data: &[u8], mut offset: usize) -> Option<usize> {
-        let mut jumped = false;
-        let mut return_offset = 0;
+/// Re-exports of the private RDATA/name decoders for the `fuzz/` crate.
+/// See `crate::fuzz_api` for why these are not part of the public API.
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_exports {
+    use super::{DriadRelayAddress, DriadResolver};
+
+    pub fn parse_amtrelay_rdata(rdata: &[u8]) -> Option<(u8, DriadRelayAddress)> {
+        DriadResolver::parse_amtrelay_record(rdata)
+    }
+
+    pub fn parse_dns_wire_name(data: &[u8]) -> Option<String> {
+        DriadResolver::parse_dns_wire_name(data)
+    }
+}
+
+/// The question we asked, borrowed from the query packet we sent.
+struct DnsQuestionRef<'a> {
+    msg: &'a [u8],
+    txid: u16,
+    name: DnsName,
+    qtype: u16,
+    qclass: u16,
+}
+
+impl<'a> DnsQuestionRef<'a> {
+    /// Read back the transaction ID and question from an outgoing query.
+    ///
+    /// Deriving the expectation from the query bytes — rather than threading the
+    /// pieces through every call site — keeps one description of "what we asked"
+    /// and makes it impossible for a caller to validate against a question it
+    /// did not send.
+    fn from_query(query: &'a [u8]) -> Option<Self> {
+        if query.len() < 12 {
+            return None;
+        }
+        if u16::from_be_bytes([query[4], query[5]]) != 1 {
+            return None; // exactly one question
+        }
+        let name = DnsName::decode(query, 12)?;
+        let end = name.end;
+        if end + 4 > query.len() {
+            return None;
+        }
+        Some(Self {
+            msg: query,
+            txid: u16::from_be_bytes([query[0], query[1]]),
+            qtype: u16::from_be_bytes([query[end], query[end + 1]]),
+            qclass: u16::from_be_bytes([query[end + 2], query[end + 3]]),
+            name,
+        })
+    }
+}
+
+/// Maximum compression-pointer jumps allowed while decoding one name. A legal
+/// name needs none; the cap makes termination independent of the guard below.
+const MAX_NAME_JUMPS: usize = 16;
+
+/// Maximum labels in one name. RFC 1035 caps a name at 255 octets, so a name
+/// cannot carry more than 127 non-empty labels.
+const MAX_NAME_LABELS: usize = 128;
+
+/// A decoded DNS name: the byte ranges of its labels within the message, plus
+/// the offset just past the name.
+///
+/// Labels are kept as ranges rather than `String`s so comparison neither
+/// allocates nor has to decide what to do with non-UTF-8 label bytes (which are
+/// legal on the wire).
+struct DnsName {
+    labels: Vec<(usize, usize)>,
+    end: usize,
+}
+
+impl DnsName {
+    /// Decode the name at `start`, following compression pointers.
+    fn decode(msg: &[u8], start: usize) -> Option<Self> {
+        let mut labels = Vec::new();
+        let mut offset = start;
+        let mut jumps = 0usize;
+        let mut end = None;
 
         loop {
-            if offset >= data.len() {
+            if offset >= msg.len() {
                 return None;
             }
-
-            let len = data[offset] as usize;
+            let len = msg[offset] as usize;
 
             if len == 0 {
-                // Root label — end of name
-                offset += 1;
+                end.get_or_insert(offset + 1);
                 break;
             }
 
-            if (len & 0xC0) == 0xC0 {
-                // DNS pointer (compression) — 2 bytes
-                if !jumped {
-                    return_offset = offset + 2;
-                    jumped = true;
+            match len & 0xC0 {
+                0x00 => {
+                    if labels.len() >= MAX_NAME_LABELS {
+                        return None;
+                    }
+                    let from = offset + 1;
+                    let to = from + len;
+                    if to > msg.len() {
+                        return None;
+                    }
+                    labels.push((from, to));
+                    offset = to;
                 }
-                if offset + 1 >= data.len() {
-                    return None;
+                0xC0 => {
+                    if offset + 1 >= msg.len() {
+                        return None;
+                    }
+                    // The name ends after the first pointer, wherever it leads.
+                    end.get_or_insert(offset + 2);
+                    jumps += 1;
+                    if jumps > MAX_NAME_JUMPS {
+                        return None;
+                    }
+                    let ptr = ((len & 0x3F) << 8) | msg[offset + 1] as usize;
+                    // Backward-only: with a strictly decreasing target this
+                    // cannot cycle, and the jump cap bounds it regardless.
+                    if ptr >= offset {
+                        return None;
+                    }
+                    offset = ptr;
                 }
-                let ptr = ((len & 0x3F) << 8) | (data[offset + 1] as usize);
-                if ptr >= offset {
-                    // Prevent forward/self pointers (infinite loop)
-                    return None;
-                }
-                offset = ptr;
-                continue;
+                // 0x40/0x80 are reserved label types (RFC 6891 §6.1 / RFC 2671).
+                _ => return None,
             }
-
-            // Regular label
-            offset += 1 + len;
         }
 
-        Some(if jumped { return_offset } else { offset })
+        Some(Self {
+            labels,
+            end: end?,
+        })
+    }
+
+    /// Compare two decoded names case-insensitively (DNS names are ASCII-case
+    /// insensitive per RFC 4343). The names may live in different messages.
+    fn eq(a_msg: &[u8], a: &Self, b_msg: &[u8], b: &Self) -> bool {
+        if a.labels.len() != b.labels.len() {
+            return false;
+        }
+        a.labels
+            .iter()
+            .zip(b.labels.iter())
+            .all(|(&(a0, a1), &(b0, b1))| {
+                a1 - a0 == b1 - b0 && a_msg[a0..a1].eq_ignore_ascii_case(&b_msg[b0..b1])
+            })
     }
 }
 
