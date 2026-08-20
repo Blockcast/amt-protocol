@@ -65,6 +65,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Installed as part of the pinned toolchain resolution rather than via a
+          # `rustup target add` run step, so rust-cache below sees it and the wasm
+          # leg drops a network call from its critical path. Empty on the other two
+          # legs — only default-wasm builds the wasm32 artifact.
+          targets: ${{ matrix.id == 'default-wasm' && 'wasm32-unknown-unknown' || '' }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -83,7 +89,14 @@ jobs:
 
           passed="$(sed -n 's/^test result: ok\. \([0-9]\{1,\}\) passed.*/\1/p' lib-test.log | head -1)"
           passed="${passed:-0}"
-          gateway="$(grep -c '^test gateway::tests::' lib-test.log || true)"
+          # Anchored on `... ok` because libtest prints one `test <name> ... <outcome>`
+          # line per test for EVERY outcome — `ok`, `FAILED` and `ignored` all render
+          # identically up to the outcome word. An unanchored match would therefore
+          # count a `#[ignore]`d test as executed, and `#[ignore]` is a live idiom in
+          # this repo (tests/e2e_staging.rs:25,55). Without the anchor, slapping
+          # `#[ignore]` on all 12 gateway::tests keeps this at 12 while zero guards
+          # actually run — the exact vacuous green this step exists to prevent.
+          gateway="$(grep -cE '^test gateway::tests::.* \.\.\. ok$' lib-test.log || true)"
 
           echo "library tests passed: ${passed}"
           echo "gateway::tests executed: ${gateway}"
@@ -114,20 +127,45 @@ jobs:
       - name: cargo test (integration targets + doc-tests)
         run: |
           set -euo pipefail
-          cargo test ${{ matrix.flags }} --test '*'
+          cargo test ${{ matrix.flags }} --test '*' 2>&1 | tee int-test.log
           cargo test ${{ matrix.flags }} --doc
 
-      # The WASM artifact the IWA/browser consumer loads, built exactly as
-      # `make wasm` does. The default-wasm leg above compiles and tests the
-      # wasm-bindgen surface on the HOST target only, so without this a host-only
-      # API in src/wasm.rs — or a dep without wasm support — still goes green
-      # while `make wasm` is broken. That is the same asymmetry the ffi artifact
+          # Anti-vacuity gate for the native leg, mirroring the library gate above.
+          # On the default and ffi legs a zero here is CORRECT — all four tests/*.rs
+          # are `#![cfg(feature = "native")]`, so they compile to empty and print
+          # "test result: ok. 0 passed". The problem is that the native leg's real
+          # output is structurally indistinguishable from that legitimate zero: if a
+          # refactor renamed the `native` feature in those four cfg attributes, this
+          # leg would print the same four-zero block, exit 0, and stay green with the
+          # entire integration suite silently uncompiled — while step 1 still passes,
+          # because gateway::tests lives in the library target. This leg is the only
+          # place tests/*.rs runs at all, so that loss would be total.
+          if [ "${{ matrix.id }}" = "native" ]; then
+            ran="$(grep -cE '^test .* \.\.\. ok$' int-test.log || true)"
+            echo "integration tests executed: ${ran}"
+            # Floor of 8 against 11 executing today (6 + 4 + 1 across three binaries;
+            # e2e_staging.rs's 2 are #[ignore]d and correctly excluded by the anchor).
+            # Headroom to delete an obsolete test, not enough to lose a whole target.
+            if [ "${ran}" -lt 8 ]; then
+              echo "::error::Only ${ran} integration tests ran (expected >= 8). tests/*.rs is #![cfg(feature = \"native\")] and this leg is its only carrier — a zero here means the suite stopped compiling, not that it passed (BLO-29411)."
+              exit 1
+            fi
+          fi
+
+      # The WASM artifact the IWA/browser consumer loads, built as `make wasm-build`
+      # does. Note this is `wasm-build`, NOT all of `make wasm` (= wasm-build +
+      # wasm-bindgen): the `wasm-bindgen` CLI invocation at Makefile:58 is still
+      # ungated here, so a wasm-bindgen crate/CLI version skew — the characteristic
+      # failure for that toolchain — would surface only at `make wasm` time, not in
+      # this job. The default-wasm leg above compiles and tests the wasm-bindgen
+      # surface on the HOST target only, so without this step a host-only API in
+      # src/wasm.rs — or a dep without wasm support — still goes green while
+      # `make wasm-build` is broken. That is the same asymmetry the ffi artifact
       # check below closes for CGO consumers.
-      - name: cargo build --release --target wasm32 (make wasm) + artifact check
+      - name: cargo build --release --target wasm32 (make wasm-build) + artifact check
         if: matrix.id == 'default-wasm'
         run: |
           set -euo pipefail
-          rustup target add wasm32-unknown-unknown
           cargo build --release --target wasm32-unknown-unknown --features wasm
           wasm=target/wasm32-unknown-unknown/release/amt_protocol.wasm
           test -f "$wasm" || { echo "::error::$wasm missing — wasm-bindgen consumes this in \`make wasm\`."; exit 1; }
