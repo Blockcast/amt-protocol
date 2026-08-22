@@ -13,7 +13,11 @@ pub struct GroupState {
 
 impl GroupState {
     pub fn new(key: GroupKey, requested_at_ms: u64) -> Self {
-        Self { key, requested_at_ms, announced: false }
+        Self {
+            key,
+            requested_at_ms,
+            announced: false,
+        }
     }
 }
 

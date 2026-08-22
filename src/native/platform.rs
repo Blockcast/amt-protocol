@@ -1,13 +1,15 @@
 //! Platform impl for native (non-WASM, non-FFI) Rust callers.
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use crate::platform::Platform;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativePlatform;
 
 impl NativePlatform {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Platform for NativePlatform {

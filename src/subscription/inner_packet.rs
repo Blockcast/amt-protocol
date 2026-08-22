@@ -11,8 +11,8 @@
 //! is a separate ~80 LOC concern. If real traffic needs them, lift this
 //! limitation in a follow-up.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::error::{AmtError, Result};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct InnerPacket<'a> {
@@ -56,7 +56,7 @@ fn parse_ipv4(bytes: &[u8]) -> Result<InnerPacket<'_>> {
     }
     let src = Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]);
     let dst = Ipv4Addr::new(bytes[16], bytes[17], bytes[18], bytes[19]);
-    let udp = &bytes[ihl..total_len];  // trimmed to declared IP boundary
+    let udp = &bytes[ihl..total_len]; // trimmed to declared IP boundary
     let src_port = u16::from_be_bytes([udp[0], udp[1]]);
     let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
     let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
@@ -84,9 +84,13 @@ fn parse_ipv6(bytes: &[u8]) -> Result<InnerPacket<'_>> {
     if bytes[6] != IPV6_NEXT_UDP {
         return Err(AmtError::MalformedInner);
     }
-    let src_octets: [u8; 16] = bytes[8..24].try_into().map_err(|_| AmtError::MalformedInner)?;
-    let dst_octets: [u8; 16] = bytes[24..40].try_into().map_err(|_| AmtError::MalformedInner)?;
-    let udp = &bytes[40..40 + payload_len];  // trimmed to declared IPv6 boundary
+    let src_octets: [u8; 16] = bytes[8..24]
+        .try_into()
+        .map_err(|_| AmtError::MalformedInner)?;
+    let dst_octets: [u8; 16] = bytes[24..40]
+        .try_into()
+        .map_err(|_| AmtError::MalformedInner)?;
+    let udp = &bytes[40..40 + payload_len]; // trimmed to declared IPv6 boundary
     let src_port = u16::from_be_bytes([udp[0], udp[1]]);
     let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
     let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
@@ -109,11 +113,18 @@ mod tests {
     fn ipv4_udp_packet(src: [u8; 4], dst: [u8; 4], sp: u16, dp: u16, payload: &[u8]) -> Vec<u8> {
         let total_len = (20 + 8 + payload.len()) as u16;
         let mut buf = vec![
-            0x45, 0x00,                          // version+IHL, ToS
-            (total_len >> 8) as u8, total_len as u8,
-            0x00, 0x00, 0x40, 0x00, 0x40,        // ID, flags, frag, TTL
-            17,                                  // protocol UDP
-            0x00, 0x00,                          // checksum (ignored)
+            0x45,
+            0x00, // version+IHL, ToS
+            (total_len >> 8) as u8,
+            total_len as u8,
+            0x00,
+            0x00,
+            0x40,
+            0x00,
+            0x40, // ID, flags, frag, TTL
+            17,   // protocol UDP
+            0x00,
+            0x00, // checksum (ignored)
         ];
         buf.extend_from_slice(&src);
         buf.extend_from_slice(&dst);
@@ -164,7 +175,9 @@ mod tests {
         pkt.push(17); // next header UDP
         pkt.push(64); // hop limit
         pkt.extend_from_slice(&[0xfd; 16]); // src
-        let mut dst = vec![0xff, 0x0e]; dst.extend_from_slice(&[0; 14]); pkt.extend_from_slice(&dst);
+        let mut dst = vec![0xff, 0x0e];
+        dst.extend_from_slice(&[0; 14]);
+        pkt.extend_from_slice(&dst);
         pkt.extend_from_slice(&5004u16.to_be_bytes());
         pkt.extend_from_slice(&5005u16.to_be_bytes());
         pkt.extend_from_slice(&payload_len.to_be_bytes());
@@ -185,7 +198,9 @@ mod tests {
         pkt[0] = 0x46;
         // Insert 4 zero option bytes after the 20-byte fixed header (before UDP).
         let opt_pos = 20;
-        for _ in 0..4 { pkt.insert(opt_pos, 0); }
+        for _ in 0..4 {
+            pkt.insert(opt_pos, 0);
+        }
         // Re-stamp total_length (bytes 2-3) — new total is original + 4.
         let new_total = (24 + 8 + 2) as u16;
         pkt[2] = (new_total >> 8) as u8;
@@ -204,10 +219,12 @@ mod tests {
         let mut pkt = vec![0x60, 0x00, 0x00, 0x00];
         let payload_len: u16 = 8 + 1;
         pkt.extend_from_slice(&payload_len.to_be_bytes());
-        pkt.push(0);  // Next Header = Hop-by-Hop (NOT UDP)
+        pkt.push(0); // Next Header = Hop-by-Hop (NOT UDP)
         pkt.push(64); // hop limit
         pkt.extend_from_slice(&[0xfd; 16]);
-        let mut dst = vec![0xff, 0x0e]; dst.extend_from_slice(&[0; 14]); pkt.extend_from_slice(&dst);
+        let mut dst = vec![0xff, 0x0e];
+        dst.extend_from_slice(&[0; 14]);
+        pkt.extend_from_slice(&dst);
         pkt.extend_from_slice(&5004u16.to_be_bytes());
         pkt.extend_from_slice(&5005u16.to_be_bytes());
         pkt.extend_from_slice(&payload_len.to_be_bytes());

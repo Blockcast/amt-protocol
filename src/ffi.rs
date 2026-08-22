@@ -15,13 +15,13 @@
 //! Functions return error codes via `AmtResult`. Zero indicates success,
 //! non-zero indicates an error. Call `amt_error_message` to get error details.
 
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::net::IpAddr;
 use std::ptr;
 use std::sync::Arc;
 
-use crate::gateway::AmtGateway;
 use crate::config::AmtConfig;
+use crate::gateway::AmtGateway;
 use crate::messages::AmtMessage;
 use crate::platform::ffi_platform::FfiPlatform;
 
@@ -166,7 +166,11 @@ pub extern "C" fn amt_gateway_new(
         Err(_) => return AmtResult::InvalidArgument,
     };
 
-    let port = if relay_port == 0 { None } else { Some(relay_port) };
+    let port = if relay_port == 0 {
+        None
+    } else {
+        Some(relay_port)
+    };
 
     let config = if enable_driad {
         AmtConfig::with_driad(addr, port)
@@ -206,7 +210,11 @@ pub extern "C" fn amt_gateway_free(handle: AmtGatewayHandle) {
 pub extern "C" fn amt_buffer_free(buffer: AmtBuffer) {
     if !buffer.data.is_null() {
         unsafe {
-            drop(Vec::from_raw_parts(buffer.data, buffer.len, buffer.capacity));
+            drop(Vec::from_raw_parts(
+                buffer.data,
+                buffer.len,
+                buffer.capacity,
+            ));
         }
     }
 }
@@ -317,12 +325,13 @@ pub extern "C" fn amt_gateway_handle_advertisement(
     };
 
     match msg {
-        AmtMessage::RelayAdvertisement { nonce, relay_address } => {
-            match gateway.handle_advertisement(nonce, relay_address) {
-                Ok(()) => AmtResult::Ok,
-                Err(e) => e.into(),
-            }
-        }
+        AmtMessage::RelayAdvertisement {
+            nonce,
+            relay_address,
+        } => match gateway.handle_advertisement(nonce, relay_address) {
+            Ok(()) => AmtResult::Ok,
+            Err(e) => e.into(),
+        },
         _ => AmtResult::InvalidArgument,
     }
 }
@@ -395,22 +404,24 @@ pub extern "C" fn amt_gateway_handle_query(
     };
 
     match msg {
-        AmtMessage::MembershipQuery { request_nonce, response_mac, query_data } => {
-            match gateway.handle_query(request_nonce, response_mac, query_data) {
-                Ok(data) => {
-                    unsafe {
-                        *out_query_data = AmtBuffer::from_vec(data);
-                    }
-                    AmtResult::Ok
+        AmtMessage::MembershipQuery {
+            request_nonce,
+            response_mac,
+            query_data,
+        } => match gateway.handle_query(request_nonce, response_mac, query_data) {
+            Ok(data) => {
+                unsafe {
+                    *out_query_data = AmtBuffer::from_vec(data);
                 }
-                Err(e) => {
-                    unsafe {
-                        *out_query_data = AmtBuffer::null();
-                    }
-                    e.into()
-                }
+                AmtResult::Ok
             }
-        }
+            Err(e) => {
+                unsafe {
+                    *out_query_data = AmtBuffer::null();
+                }
+                e.into()
+            }
+        },
         _ => {
             unsafe {
                 *out_query_data = AmtBuffer::null();
@@ -491,22 +502,20 @@ pub extern "C" fn amt_gateway_handle_data(
     };
 
     match msg {
-        AmtMessage::MulticastData { ip_packet } => {
-            match gateway.handle_data(ip_packet) {
-                Ok(packet) => {
-                    unsafe {
-                        *out_packet = AmtBuffer::from_vec(packet);
-                    }
-                    AmtResult::Ok
+        AmtMessage::MulticastData { ip_packet } => match gateway.handle_data(ip_packet) {
+            Ok(packet) => {
+                unsafe {
+                    *out_packet = AmtBuffer::from_vec(packet);
                 }
-                Err(e) => {
-                    unsafe {
-                        *out_packet = AmtBuffer::null();
-                    }
-                    e.into()
-                }
+                AmtResult::Ok
             }
-        }
+            Err(e) => {
+                unsafe {
+                    *out_packet = AmtBuffer::null();
+                }
+                e.into()
+            }
+        },
         _ => {
             unsafe {
                 *out_packet = AmtBuffer::null();
@@ -710,7 +719,11 @@ pub extern "C" fn amt_igmp_ssm_join_multi(
     num_groups: usize,
     out_report: *mut AmtBuffer,
 ) -> AmtResult {
-    if source_address.is_null() || group_addresses.is_null() || out_report.is_null() || num_groups == 0 {
+    if source_address.is_null()
+        || group_addresses.is_null()
+        || out_report.is_null()
+        || num_groups == 0
+    {
         return AmtResult::NullPointer;
     }
 
