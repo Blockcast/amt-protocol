@@ -14,11 +14,11 @@
 //!   v6: src=::,      dst=ff02::16   (MLDv2 reports)  + HBH RouterAlert
 //! Records inside the IP packet carry the actual (S, G) tuples.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::error::{AmtError, Result};
 use crate::gateway::GroupKey;
 use crate::igmp::{IgmpRecord, IgmpV3Report, RecordType as IgmpRecordType};
 use crate::mld::{MldRecord, MldV2Report};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Canonical IPv4 destination for IGMPv3 Reports per RFC 3376 §4.2.
 const IGMPV3_REPORTS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 22);
@@ -97,7 +97,11 @@ pub fn build_block_v4(key: &GroupKey) -> Result<Vec<u8>> {
             report.add_record(IgmpRecord::new(IgmpRecordType::BlockOldSources, g, vec![s]));
         }
         (IpAddr::V4(g), None) => {
-            report.add_record(IgmpRecord::new(IgmpRecordType::ChangeToIncludeMode, g, vec![]));
+            report.add_record(IgmpRecord::new(
+                IgmpRecordType::ChangeToIncludeMode,
+                g,
+                vec![],
+            ));
         }
         _ => return Err(AmtError::FamilyMismatch),
     }
@@ -130,7 +134,11 @@ pub fn build_block_v6(key: &GroupKey) -> Result<Vec<u8>> {
             report.add_record(MldRecord::new(MldRecordType::BlockOldSources, g, vec![s]));
         }
         (IpAddr::V6(g), None) => {
-            report.add_record(MldRecord::new(MldRecordType::ChangeToIncludeMode, g, vec![]));
+            report.add_record(MldRecord::new(
+                MldRecordType::ChangeToIncludeMode,
+                g,
+                vec![],
+            ));
         }
         _ => return Err(AmtError::FamilyMismatch),
     }
@@ -173,20 +181,31 @@ mod tests {
         assert_eq!(&bytes[16..20], &[224, 0, 0, 22]);
         // IGMPv3 Report type at +24, num-records at +30..32 (big-endian).
         assert_eq!(bytes[V4_IGMP_OFF], 0x22);
-        assert_eq!(u16::from_be_bytes([bytes[V4_IGMP_OFF + 6], bytes[V4_IGMP_OFF + 7]]), 2);
+        assert_eq!(
+            u16::from_be_bytes([bytes[V4_IGMP_OFF + 6], bytes[V4_IGMP_OFF + 7]]),
+            2
+        );
     }
 
     #[test]
     fn allow_v4_emits_allow_new_sources_record() {
         let bytes = build_allow_v4(&k("232.0.0.1", Some("10.0.0.1"))).unwrap();
         // First group record starts at IGMP offset +8.
-        assert_eq!(bytes[V4_IGMP_OFF + 8], 5, "record type should be ALLOW_NEW_SOURCES");
+        assert_eq!(
+            bytes[V4_IGMP_OFF + 8],
+            5,
+            "record type should be ALLOW_NEW_SOURCES"
+        );
     }
 
     #[test]
     fn block_v4_emits_block_old_sources_record() {
         let bytes = build_block_v4(&k("232.0.0.1", Some("10.0.0.1"))).unwrap();
-        assert_eq!(bytes[V4_IGMP_OFF + 8], 6, "record type should be BLOCK_OLD_SOURCES");
+        assert_eq!(
+            bytes[V4_IGMP_OFF + 8],
+            6,
+            "record type should be BLOCK_OLD_SOURCES"
+        );
     }
 
     #[test]

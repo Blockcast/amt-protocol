@@ -3,13 +3,13 @@
 //! Implements the AMT gateway control plane state machine for establishing
 //! and maintaining multicast group memberships through AMT tunnels.
 
+use crate::config::AmtConfig;
+use crate::error::{AmtError, Result};
+use crate::messages::AmtMessage;
+use crate::platform::{generate_nonce, Platform};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use crate::error::{AmtError, Result};
-use crate::messages::AmtMessage;
-use crate::config::AmtConfig;
-use crate::platform::{Platform, generate_nonce};
 
 /// AMT Gateway States (RFC 7450 Section 5.2.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +155,8 @@ impl<P: Platform> AmtGateway<P> {
         self.state = GatewayState::Discovering;
 
         // Debug logging
-        self.platform.log_info(&format!("[AMT] Generated discovery nonce: 0x{:08x}", nonce));
+        self.platform
+            .log_info(&format!("[AMT] Generated discovery nonce: 0x{:08x}", nonce));
 
         Ok(AmtMessage::RelayDiscovery { nonce })
     }
@@ -169,8 +170,14 @@ impl<P: Platform> AmtGateway<P> {
         }
 
         // Debug logging
-        self.platform.log_info(&format!("[AMT] Received advertisement nonce: 0x{:08x}", nonce));
-        self.platform.log_info(&format!("[AMT] Expected discovery nonce: 0x{:08x}", self.discovery_nonce.unwrap_or(0)));
+        self.platform.log_info(&format!(
+            "[AMT] Received advertisement nonce: 0x{:08x}",
+            nonce
+        ));
+        self.platform.log_info(&format!(
+            "[AMT] Expected discovery nonce: 0x{:08x}",
+            self.discovery_nonce.unwrap_or(0)
+        ));
 
         // Validate nonce matches our discovery nonce
         if Some(nonce) != self.discovery_nonce {
@@ -292,20 +299,29 @@ impl<P: Platform> AmtGateway<P> {
         query_data: Vec<u8>,
     ) -> Result<Vec<u8>> {
         if self.state != GatewayState::Requesting && self.state != GatewayState::Active {
-            self.platform.log_error("[AMT handle_query] Error: InvalidState");
+            self.platform
+                .log_error("[AMT handle_query] Error: InvalidState");
             return Err(AmtError::InvalidState);
         }
 
         // Debug logging
-        self.platform.log_debug(&format!("[AMT handle_query] Stored request_nonce: {:?}", self.request_nonce));
-        self.platform.log_debug(&format!("[AMT handle_query] Received request_nonce: 0x{:08x}", request_nonce));
+        self.platform.log_debug(&format!(
+            "[AMT handle_query] Stored request_nonce: {:?}",
+            self.request_nonce
+        ));
+        self.platform.log_debug(&format!(
+            "[AMT handle_query] Received request_nonce: 0x{:08x}",
+            request_nonce
+        ));
 
         // Validate nonce matches our request nonce
         if Some(request_nonce) != self.request_nonce {
-            self.platform.log_error("[AMT handle_query] ❌ NONCE MISMATCH!");
+            self.platform
+                .log_error("[AMT handle_query] ❌ NONCE MISMATCH!");
             return Err(AmtError::InvalidNonce);
         }
-        self.platform.log_info("[AMT handle_query] ✅ Nonce validated");
+        self.platform
+            .log_info("[AMT handle_query] ✅ Nonce validated");
 
         // Store response MAC for future messages
         self.response_mac = Some(response_mac);
@@ -461,17 +477,21 @@ mod tests {
         assert_eq!(gw.state(), GatewayState::Requesting);
 
         let nonce = match msg {
-            AmtMessage::Request { request_nonce, p_flag } => {
+            AmtMessage::Request {
+                request_nonce,
+                p_flag,
+            } => {
                 assert!(!p_flag);
                 request_nonce
-            },
+            }
             _ => panic!("Expected Request"),
         };
 
         // Handle query
         let response_mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
         let query_data = vec![0x11, 0x22, 0x33];
-        gw.handle_query(nonce, response_mac, query_data.clone()).unwrap();
+        gw.handle_query(nonce, response_mac, query_data.clone())
+            .unwrap();
         assert_eq!(gw.state(), GatewayState::Querying);
     }
 
@@ -498,22 +518,27 @@ mod tests {
             AmtMessage::RelayDiscovery { nonce } => nonce,
             _ => panic!("Expected RelayDiscovery"),
         };
-        gw.handle_advertisement(disc_nonce, "198.51.100.1".parse().unwrap()).unwrap();
+        gw.handle_advertisement(disc_nonce, "198.51.100.1".parse().unwrap())
+            .unwrap();
 
         // Request
         let req_msg = gw.request_membership(true).unwrap();
         let req_nonce = match req_msg {
-            AmtMessage::Request { request_nonce, p_flag } => {
+            AmtMessage::Request {
+                request_nonce,
+                p_flag,
+            } => {
                 assert!(p_flag);
                 request_nonce
-            },
+            }
             _ => panic!("Expected Request"),
         };
 
         // Query
         let response_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let query_data = vec![0x11, 0x22];
-        gw.handle_query(req_nonce, response_mac, query_data).unwrap();
+        gw.handle_query(req_nonce, response_mac, query_data)
+            .unwrap();
 
         // Update
         let report_data = vec![0x33, 0x44, 0x55];
@@ -521,11 +546,15 @@ mod tests {
         assert_eq!(gw.state(), GatewayState::Active);
 
         match update_msg {
-            AmtMessage::MembershipUpdate { request_nonce, response_mac: mac, report_data: data } => {
+            AmtMessage::MembershipUpdate {
+                request_nonce,
+                response_mac: mac,
+                report_data: data,
+            } => {
                 assert_eq!(request_nonce, req_nonce);
                 assert_eq!(mac, response_mac);
                 assert_eq!(data, report_data);
-            },
+            }
             _ => panic!("Expected MembershipUpdate"),
         };
 
@@ -534,11 +563,15 @@ mod tests {
         let keepalive_msg = gw.send_update(keepalive_data.clone()).unwrap();
         assert_eq!(gw.state(), GatewayState::Active); // stays Active
         match keepalive_msg {
-            AmtMessage::MembershipUpdate { request_nonce, response_mac: mac, report_data: data } => {
+            AmtMessage::MembershipUpdate {
+                request_nonce,
+                response_mac: mac,
+                report_data: data,
+            } => {
                 assert_eq!(request_nonce, req_nonce); // same nonce
-                assert_eq!(mac, response_mac);        // same MAC
+                assert_eq!(mac, response_mac); // same MAC
                 assert_eq!(data, keepalive_data);
-            },
+            }
             _ => panic!("Expected MembershipUpdate for keep-alive"),
         };
 
@@ -547,10 +580,13 @@ mod tests {
         assert_eq!(gw.state(), GatewayState::Closed);
 
         match teardown_msg {
-            AmtMessage::Teardown { request_nonce, response_mac: mac } => {
+            AmtMessage::Teardown {
+                request_nonce,
+                response_mac: mac,
+            } => {
                 assert_eq!(request_nonce, req_nonce);
                 assert_eq!(mac, response_mac);
-            },
+            }
             _ => panic!("Expected Teardown"),
         };
     }
@@ -564,14 +600,16 @@ mod tests {
             AmtMessage::RelayDiscovery { nonce } => nonce,
             _ => panic!("Expected RelayDiscovery"),
         };
-        gw.handle_advertisement(discovery_nonce, "198.51.100.1".parse().unwrap()).unwrap();
+        gw.handle_advertisement(discovery_nonce, "198.51.100.1".parse().unwrap())
+            .unwrap();
 
         let request = gw.request_membership(false).unwrap();
         let request_nonce = match request {
             AmtMessage::Request { request_nonce, .. } => request_nonce,
             _ => panic!("Expected Request"),
         };
-        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11]).unwrap();
+        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11])
+            .unwrap();
         gw.send_update(vec![0x22]).unwrap();
         assert_eq!(gw.state(), GatewayState::Active);
 
@@ -595,7 +633,7 @@ mod tests {
                 assert_eq!(nonce, request_nonce);
                 assert_eq!(response_mac, refreshed_mac);
                 assert_eq!(report_data, refreshed_report);
-            },
+            }
             _ => panic!("Expected MembershipUpdate"),
         }
     }
@@ -612,14 +650,16 @@ mod tests {
             AmtMessage::RelayDiscovery { nonce } => nonce,
             _ => panic!("Expected RelayDiscovery"),
         };
-        gw.handle_advertisement(discovery_nonce, "198.51.100.1".parse().unwrap()).unwrap();
+        gw.handle_advertisement(discovery_nonce, "198.51.100.1".parse().unwrap())
+            .unwrap();
 
         let request = gw.request_membership(false).unwrap();
         let request_nonce = match request {
             AmtMessage::Request { request_nonce, .. } => request_nonce,
             _ => panic!("Expected Request"),
         };
-        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11]).unwrap();
+        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11])
+            .unwrap();
         gw.send_update(vec![0x22]).unwrap();
         assert_eq!(gw.state(), GatewayState::Active);
 
@@ -627,12 +667,22 @@ mod tests {
         // tunnel's existing nonce, and does NOT drop back to Requesting.
         let keepalive = gw.request_membership(false).unwrap();
         match keepalive {
-            AmtMessage::Request { request_nonce: nonce, .. } => {
-                assert_eq!(nonce, request_nonce, "keepalive Request must reuse the tunnel nonce");
-            },
+            AmtMessage::Request {
+                request_nonce: nonce,
+                ..
+            } => {
+                assert_eq!(
+                    nonce, request_nonce,
+                    "keepalive Request must reuse the tunnel nonce"
+                );
+            }
             _ => panic!("Expected Request for keepalive"),
         }
-        assert_eq!(gw.state(), GatewayState::Active, "keepalive must not leave Active");
+        assert_eq!(
+            gw.state(),
+            GatewayState::Active,
+            "keepalive must not leave Active"
+        );
 
         // Data arriving during the query round trip is still accepted. This is
         // what the state-preserving branch buys: dropping to Requesting would
@@ -643,16 +693,21 @@ mod tests {
         // The relay answers the keepalive with a Query bearing the same nonce
         // and a refreshed MAC, and the cycle continues.
         let refreshed_mac = [9, 8, 7, 6, 5, 4];
-        gw.handle_query(request_nonce, refreshed_mac, vec![0x33]).unwrap();
+        gw.handle_query(request_nonce, refreshed_mac, vec![0x33])
+            .unwrap();
         assert_eq!(gw.state(), GatewayState::Querying);
 
         let update = gw.send_update(vec![0x44]).unwrap();
         assert_eq!(gw.state(), GatewayState::Active);
         match update {
-            AmtMessage::MembershipUpdate { request_nonce: nonce, response_mac, .. } => {
+            AmtMessage::MembershipUpdate {
+                request_nonce: nonce,
+                response_mac,
+                ..
+            } => {
                 assert_eq!(nonce, request_nonce);
                 assert_eq!(response_mac, refreshed_mac);
-            },
+            }
             _ => panic!("Expected MembershipUpdate"),
         }
     }
@@ -669,19 +724,26 @@ mod tests {
         // test reads as the complete boundary for the relaxed guard.
         let discovery = gw.start_discovery().unwrap();
         assert_eq!(gw.state(), GatewayState::Discovering);
-        assert!(matches!(gw.request_membership(false), Err(AmtError::InvalidState)));
+        assert!(matches!(
+            gw.request_membership(false),
+            Err(AmtError::InvalidState)
+        ));
 
         let discovery_nonce = match discovery {
             AmtMessage::RelayDiscovery { nonce } => nonce,
             _ => panic!("Expected RelayDiscovery"),
         };
-        gw.handle_advertisement(discovery_nonce, "198.51.100.1".parse().unwrap()).unwrap();
+        gw.handle_advertisement(discovery_nonce, "198.51.100.1".parse().unwrap())
+            .unwrap();
 
         // Requesting: a Query is already outstanding, so re-Requesting here
         // would mint a second nonce and orphan the first.
         let request = gw.request_membership(false).unwrap();
         assert_eq!(gw.state(), GatewayState::Requesting);
-        assert!(matches!(gw.request_membership(false), Err(AmtError::InvalidState)));
+        assert!(matches!(
+            gw.request_membership(false),
+            Err(AmtError::InvalidState)
+        ));
 
         let request_nonce = match request {
             AmtMessage::Request { request_nonce, .. } => request_nonce,
@@ -692,9 +754,13 @@ mod tests {
         // is the one intermediate state a keepalive could plausibly race, so
         // it is the most load-bearing case here -- a Request accepted from
         // Querying would abandon an Update the caller still owes the relay.
-        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11]).unwrap();
+        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11])
+            .unwrap();
         assert_eq!(gw.state(), GatewayState::Querying);
-        assert!(matches!(gw.request_membership(false), Err(AmtError::InvalidState)));
+        assert!(matches!(
+            gw.request_membership(false),
+            Err(AmtError::InvalidState)
+        ));
 
         // Closed: a torn-down tunnel is not re-Requestable. Reaching Active
         // first is the only way in, which also proves the guard does not
@@ -703,7 +769,10 @@ mod tests {
         assert_eq!(gw.state(), GatewayState::Active);
         gw.send_teardown().unwrap();
         assert_eq!(gw.state(), GatewayState::Closed);
-        assert!(matches!(gw.request_membership(false), Err(AmtError::InvalidState)));
+        assert!(matches!(
+            gw.request_membership(false),
+            Err(AmtError::InvalidState)
+        ));
     }
 
     #[test]
@@ -786,7 +855,8 @@ mod tests {
             AmtMessage::RelayDiscovery { nonce } => nonce,
             _ => panic!("Expected RelayDiscovery"),
         };
-        gw.handle_advertisement(disc_nonce, "198.51.100.1".parse().unwrap()).unwrap();
+        gw.handle_advertisement(disc_nonce, "198.51.100.1".parse().unwrap())
+            .unwrap();
 
         let req_msg = gw.request_membership(false).unwrap();
         let req_nonce = match req_msg {
@@ -795,7 +865,8 @@ mod tests {
         };
 
         let response_mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
-        gw.handle_query(req_nonce, response_mac, vec![0x11]).unwrap();
+        gw.handle_query(req_nonce, response_mac, vec![0x11])
+            .unwrap();
         gw.send_update(vec![0x22]).unwrap();
 
         // Now we can handle data

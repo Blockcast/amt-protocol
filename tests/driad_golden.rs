@@ -129,7 +129,14 @@ const RELAY_V6: [u8; 16] = [
 
 /// Compose a full AMTRELAY response over the standard question.
 fn response(answers: &[Vec<u8>]) -> Vec<u8> {
-    response_with(TXID, FLAGS_RESPONSE, QNAME, AMTRELAY_TYPE, CLASS_IN, answers)
+    response_with(
+        TXID,
+        FLAGS_RESPONSE,
+        QNAME,
+        AMTRELAY_TYPE,
+        CLASS_IN,
+        answers,
+    )
 }
 
 fn response_with(
@@ -161,72 +168,267 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
 
     vec![
         // --- golden queries ---
-        ("q_amtrelay_v4_source.bin", DriadResolver::build_dns_query(src_v4, TXID)),
-        ("q_amtrelay_v6_source.bin", DriadResolver::build_dns_query(src_v6, TXID)),
-        ("q_a_relay_host.bin", DriadResolver::build_dns_a_query("sfo12.bcast.id", TXID)),
-        ("q_aaaa_relay_host.bin", DriadResolver::build_dns_aaaa_query("sfo12.bcast.id", TXID)),
+        (
+            "q_amtrelay_v4_source.bin",
+            DriadResolver::build_dns_query(src_v4, TXID),
+        ),
+        (
+            "q_amtrelay_v6_source.bin",
+            DriadResolver::build_dns_query(src_v6, TXID),
+        ),
+        (
+            "q_a_relay_host.bin",
+            DriadResolver::build_dns_a_query("sfo12.bcast.id", TXID),
+        ),
+        (
+            "q_aaaa_relay_host.bin",
+            DriadResolver::build_dns_aaaa_query("sfo12.bcast.id", TXID),
+        ),
         // Trailing dot must frame identically to the relative spelling.
-        ("q_aaaa_trailing_dot.bin", DriadResolver::build_dns_aaaa_query("sfo12.bcast.id.", TXID)),
+        (
+            "q_aaaa_trailing_dot.bin",
+            DriadResolver::build_dns_aaaa_query("sfo12.bcast.id.", TXID),
+        ),
         // --- well-formed responses ---
-        ("r_ipv4_relay.bin", response(&[answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4))])),
-        ("r_ipv6_relay.bin", response(&[answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v6(10, RELAY_V6))])),
-        ("r_dnsname_relay.bin", response(&[answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_name(10, "sfo12.bcast.id"))])),
+        (
+            "r_ipv4_relay.bin",
+            response(&[answer(
+                &ptr,
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &amtrelay_v4(10, RELAY_V4),
+            )]),
+        ),
+        (
+            "r_ipv6_relay.bin",
+            response(&[answer(
+                &ptr,
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &amtrelay_v6(10, RELAY_V6),
+            )]),
+        ),
+        (
+            "r_dnsname_relay.bin",
+            response(&[answer(
+                &ptr,
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &amtrelay_name(10, "sfo12.bcast.id"),
+            )]),
+        ),
         // Owner spelled out in full rather than compressed — same name, so accepted.
-        ("r_uncompressed_owner.bin", response(&[answer(&Owner::Literal(QNAME), AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4))])),
+        (
+            "r_uncompressed_owner.bin",
+            response(&[answer(
+                &Owner::Literal(QNAME),
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &amtrelay_v4(10, RELAY_V4),
+            )]),
+        ),
         // --- precedence (RFC 8777 §4.2: lower wins) ---
         // Wire order 30, 10, 20 → the 10 record must win, proving selection is
         // by precedence and not by arrival.
-        ("r_multi_precedence.bin", response(&[
-            answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(30, RELAY_V4_THIRD)),
-            answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4)),
-            answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(20, RELAY_V4_ALT)),
-        ])),
+        (
+            "r_multi_precedence.bin",
+            response(&[
+                answer(
+                    &ptr,
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(30, RELAY_V4_THIRD),
+                ),
+                answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4)),
+                answer(
+                    &ptr,
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(20, RELAY_V4_ALT),
+                ),
+            ]),
+        ),
         // Best precedence is unusable (type 0, then an unassigned type) — the
         // resolver must fall through to the usable record instead of failing.
-        ("r_precedence_fallthrough.bin", response(&[
-            answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_none(5)),
-            answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_unknown(7)),
-            answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(50, RELAY_V4_ALT)),
-        ])),
+        (
+            "r_precedence_fallthrough.bin",
+            response(&[
+                answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_none(5)),
+                answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_unknown(7)),
+                answer(
+                    &ptr,
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(50, RELAY_V4_ALT),
+                ),
+            ]),
+        ),
         // Ties keep wire order.
-        ("r_precedence_tie.bin", response(&[
-            answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4)),
-            answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4_ALT)),
-        ])),
+        (
+            "r_precedence_tie.bin",
+            response(&[
+                answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4)),
+                answer(
+                    &ptr,
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(10, RELAY_V4_ALT),
+                ),
+            ]),
+        ),
         // A non-AMTRELAY record ahead of ours must not shadow it.
-        ("r_other_type_first.bin", response(&[
-            answer(&ptr, TYPE_A, CLASS_IN, &[10, 0, 0, 1]),
-            answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4)),
-        ])),
+        (
+            "r_other_type_first.bin",
+            response(&[
+                answer(&ptr, TYPE_A, CLASS_IN, &[10, 0, 0, 1]),
+                answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4)),
+            ]),
+        ),
         // --- responses that must be REJECTED ---
         // Negative control: correct in every respect except the transaction ID.
-        ("r_txid_mismatch.bin", response_with(TXID ^ 0xFFFF, FLAGS_RESPONSE, QNAME, AMTRELAY_TYPE, CLASS_IN,
-            &[answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4))])),
+        (
+            "r_txid_mismatch.bin",
+            response_with(
+                TXID ^ 0xFFFF,
+                FLAGS_RESPONSE,
+                QNAME,
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &[answer(
+                    &ptr,
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(10, RELAY_V4),
+                )],
+            ),
+        ),
         // Right TXID, but answers a different question.
-        ("r_question_name_mismatch.bin", response_with(TXID, FLAGS_RESPONSE, "11.95.25.69.in-addr.arpa", AMTRELAY_TYPE, CLASS_IN,
-            &[answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4))])),
-        ("r_question_type_mismatch.bin", response_with(TXID, FLAGS_RESPONSE, QNAME, TYPE_A, CLASS_IN,
-            &[answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4))])),
-        ("r_question_class_mismatch.bin", response_with(TXID, FLAGS_RESPONSE, QNAME, AMTRELAY_TYPE, CLASS_CH,
-            &[answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4))])),
+        (
+            "r_question_name_mismatch.bin",
+            response_with(
+                TXID,
+                FLAGS_RESPONSE,
+                "11.95.25.69.in-addr.arpa",
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &[answer(
+                    &ptr,
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(10, RELAY_V4),
+                )],
+            ),
+        ),
+        (
+            "r_question_type_mismatch.bin",
+            response_with(
+                TXID,
+                FLAGS_RESPONSE,
+                QNAME,
+                TYPE_A,
+                CLASS_IN,
+                &[answer(
+                    &ptr,
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(10, RELAY_V4),
+                )],
+            ),
+        ),
+        (
+            "r_question_class_mismatch.bin",
+            response_with(
+                TXID,
+                FLAGS_RESPONSE,
+                QNAME,
+                AMTRELAY_TYPE,
+                CLASS_CH,
+                &[answer(
+                    &ptr,
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(10, RELAY_V4),
+                )],
+            ),
+        ),
         // Answer owner is a different name than the question asked.
-        ("r_answer_owner_mismatch.bin", response(&[answer(&Owner::Literal("relay.attacker.example"), AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4))])),
+        (
+            "r_answer_owner_mismatch.bin",
+            response(&[answer(
+                &Owner::Literal("relay.attacker.example"),
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &amtrelay_v4(10, RELAY_V4),
+            )]),
+        ),
         // Answer class is not the question's class.
-        ("r_answer_class_mismatch.bin", response(&[answer(&ptr, AMTRELAY_TYPE, CLASS_CH, &amtrelay_v4(10, RELAY_V4))])),
+        (
+            "r_answer_class_mismatch.bin",
+            response(&[answer(
+                &ptr,
+                AMTRELAY_TYPE,
+                CLASS_CH,
+                &amtrelay_v4(10, RELAY_V4),
+            )]),
+        ),
         // A wrong-owner record ahead of the legitimate one must be skipped, and
         // must not cause the good record behind it to be missed.
-        ("r_owner_mismatch_then_valid.bin", response(&[
-            answer(&Owner::Literal("relay.attacker.example"), AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(1, RELAY_V4_THIRD)),
-            answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4)),
-        ])),
-        ("r_rcode_nxdomain.bin", response_with(TXID, 0x8183, QNAME, AMTRELAY_TYPE, CLASS_IN,
-            &[answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4))])),
+        (
+            "r_owner_mismatch_then_valid.bin",
+            response(&[
+                answer(
+                    &Owner::Literal("relay.attacker.example"),
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(1, RELAY_V4_THIRD),
+                ),
+                answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4)),
+            ]),
+        ),
+        (
+            "r_rcode_nxdomain.bin",
+            response_with(
+                TXID,
+                0x8183,
+                QNAME,
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &[answer(
+                    &ptr,
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(10, RELAY_V4),
+                )],
+            ),
+        ),
         // QR=0 — a query, not a response.
-        ("r_qr_zero.bin", response_with(TXID, 0x0100, QNAME, AMTRELAY_TYPE, CLASS_IN,
-            &[answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4))])),
+        (
+            "r_qr_zero.bin",
+            response_with(
+                TXID,
+                0x0100,
+                QNAME,
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &[answer(
+                    &ptr,
+                    AMTRELAY_TYPE,
+                    CLASS_IN,
+                    &amtrelay_v4(10, RELAY_V4),
+                )],
+            ),
+        ),
         ("r_no_answers.bin", response(&[])),
         // --- malformed ---
-        ("r_forward_pointer_owner.bin", response(&[answer(&Owner::ForwardPtr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4))])),
+        (
+            "r_forward_pointer_owner.bin",
+            response(&[answer(
+                &Owner::ForwardPtr,
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &amtrelay_v4(10, RELAY_V4),
+            )]),
+        ),
         ("r_truncated_rdata.bin", {
             // RDLENGTH claims 6 bytes of RDATA but only 3 follow.
             let mut out = header(TXID, FLAGS_RESPONSE, 1, 1);
@@ -243,7 +445,12 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
             // ANCOUNT says 3, only one record present.
             let mut out = header(TXID, FLAGS_RESPONSE, 1, 3);
             out.extend_from_slice(&question(QNAME, AMTRELAY_TYPE, CLASS_IN));
-            out.extend_from_slice(&answer(&ptr, AMTRELAY_TYPE, CLASS_IN, &amtrelay_v4(10, RELAY_V4)));
+            out.extend_from_slice(&answer(
+                &ptr,
+                AMTRELAY_TYPE,
+                CLASS_IN,
+                &amtrelay_v4(10, RELAY_V4),
+            ));
             out
         }),
         ("r_header_only.bin", header(TXID, FLAGS_RESPONSE, 1, 1)),
@@ -254,12 +461,39 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
             out
         }),
         // --- A / AAAA follow-up responses ---
-        ("r_a_relay_host.bin", response_with(TXID, FLAGS_RESPONSE, "sfo12.bcast.id", TYPE_A, CLASS_IN,
-            &[answer(&ptr, TYPE_A, CLASS_IN, &[69, 25, 95, 128])])),
-        ("r_aaaa_relay_host.bin", response_with(TXID, FLAGS_RESPONSE, "sfo12.bcast.id", TYPE_AAAA, CLASS_IN,
-            &[answer(&ptr, TYPE_AAAA, CLASS_IN, &RELAY_V6)])),
-        ("r_a_txid_mismatch.bin", response_with(TXID ^ 0xFFFF, FLAGS_RESPONSE, "sfo12.bcast.id", TYPE_A, CLASS_IN,
-            &[answer(&ptr, TYPE_A, CLASS_IN, &[69, 25, 95, 128])])),
+        (
+            "r_a_relay_host.bin",
+            response_with(
+                TXID,
+                FLAGS_RESPONSE,
+                "sfo12.bcast.id",
+                TYPE_A,
+                CLASS_IN,
+                &[answer(&ptr, TYPE_A, CLASS_IN, &[69, 25, 95, 128])],
+            ),
+        ),
+        (
+            "r_aaaa_relay_host.bin",
+            response_with(
+                TXID,
+                FLAGS_RESPONSE,
+                "sfo12.bcast.id",
+                TYPE_AAAA,
+                CLASS_IN,
+                &[answer(&ptr, TYPE_AAAA, CLASS_IN, &RELAY_V6)],
+            ),
+        ),
+        (
+            "r_a_txid_mismatch.bin",
+            response_with(
+                TXID ^ 0xFFFF,
+                FLAGS_RESPONSE,
+                "sfo12.bcast.id",
+                TYPE_A,
+                CLASS_IN,
+                &[answer(&ptr, TYPE_A, CLASS_IN, &[69, 25, 95, 128])],
+            ),
+        ),
     ]
 }
 
@@ -318,7 +552,9 @@ fn unvalidated_entry_point_accepts_what_validated_rejects() {
     let resp = load("r_txid_mismatch.bin");
     assert_eq!(
         DriadResolver::parse_dns_response(&resp),
-        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))),
+        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+            192, 0, 2, 1
+        )))),
         "the query-less entry point cannot check the transaction ID"
     );
     let query = load("q_amtrelay_v4_source.bin");
@@ -359,7 +595,9 @@ fn validated_accepts_the_matching_reply() {
     let query = load("q_amtrelay_v4_source.bin");
     assert_eq!(
         DriadResolver::parse_dns_response_validated(&query, &load("r_ipv4_relay.bin")),
-        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))),
+        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+            192, 0, 2, 1
+        )))),
     );
 }
 
@@ -391,7 +629,9 @@ fn skips_mismatched_owner_and_still_finds_valid_record() {
     // owner grounds must not also lose the legitimate record behind it.
     assert_eq!(
         DriadResolver::parse_dns_response(&load("r_owner_mismatch_then_valid.bin")),
-        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))),
+        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+            192, 0, 2, 1
+        )))),
     );
 }
 
@@ -399,7 +639,9 @@ fn skips_mismatched_owner_and_still_finds_valid_record() {
 fn accepts_uncompressed_owner_name() {
     assert_eq!(
         DriadResolver::parse_dns_response(&load("r_uncompressed_owner.bin")),
-        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))),
+        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+            192, 0, 2, 1
+        )))),
         "an owner spelled out in full is the same name as the compressed form"
     );
 }
@@ -414,7 +656,9 @@ fn honors_precedence_over_wire_order() {
     // be chosen — the pre-fix parser returned 203.0.113.9, the first record.
     assert_eq!(
         DriadResolver::parse_dns_response(&load("r_multi_precedence.bin")),
-        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))),
+        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+            192, 0, 2, 1
+        )))),
     );
 }
 
@@ -424,7 +668,9 @@ fn falls_through_when_best_precedence_record_is_unusable() {
     // unassigned type; the usable record is precedence 50.
     assert_eq!(
         DriadResolver::parse_dns_response(&load("r_precedence_fallthrough.bin")),
-        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))),
+        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+            198, 51, 100, 7
+        )))),
         "an unusable best-precedence record must not fail the whole lookup"
     );
 }
@@ -433,7 +679,9 @@ fn falls_through_when_best_precedence_record_is_unusable() {
 fn precedence_tie_keeps_wire_order() {
     assert_eq!(
         DriadResolver::parse_dns_response(&load("r_precedence_tie.bin")),
-        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))),
+        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+            192, 0, 2, 1
+        )))),
     );
 }
 
@@ -441,7 +689,9 @@ fn precedence_tie_keeps_wire_order() {
 fn other_record_types_do_not_shadow_amtrelay() {
     assert_eq!(
         DriadResolver::parse_dns_response(&load("r_other_type_first.bin")),
-        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))),
+        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+            192, 0, 2, 1
+        )))),
     );
 }
 
@@ -536,7 +786,10 @@ fn a_and_aaaa_follow_up_validate_against_their_query() {
     );
     let aaaa_query = load("q_aaaa_relay_host.bin");
     assert_eq!(
-        DriadResolver::parse_dns_aaaa_response_validated(&aaaa_query, &load("r_aaaa_relay_host.bin")),
+        DriadResolver::parse_dns_aaaa_response_validated(
+            &aaaa_query,
+            &load("r_aaaa_relay_host.bin")
+        ),
         Some("2001:db8::1".parse::<IpAddr>().unwrap()),
     );
     // An A query must not be satisfied by the AAAA reply, or vice versa.

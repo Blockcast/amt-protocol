@@ -3,8 +3,8 @@
 //! Generates IGMPv3 Membership Reports for AMT tunnel establishment.
 //! For AMT, the IGMP report must be encapsulated in an IPv4 packet.
 
-use std::net::Ipv4Addr;
 use crate::constants::IGMP_V3_MEMBERSHIP_REPORT;
+use std::net::Ipv4Addr;
 
 /// IGMPv3 Reports destination address (RFC 3376)
 pub const IGMP_V3_REPORT_DEST: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 22);
@@ -366,8 +366,8 @@ mod tests {
         // Check IPv4 header
         assert_eq!(encoded[0], 0x46); // Version=4, IHL=6
         assert_eq!(encoded[1], 0xc0); // TOS
-        assert_eq!(encoded[8], 1);    // TTL=1
-        assert_eq!(encoded[9], 2);    // Protocol=IGMP
+        assert_eq!(encoded[8], 1); // TTL=1
+        assert_eq!(encoded[9], 2); // Protocol=IGMP
 
         // Check source IP = multicast source (69.25.95.10)
         assert_eq!(&encoded[12..16], &[69, 25, 95, 10]);

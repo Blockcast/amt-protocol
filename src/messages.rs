@@ -9,8 +9,8 @@
 //! 6. Multicast Data (Relay → Gateway)
 //! 7. Teardown (Gateway → Relay)
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::error::{AmtError, Result};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// AMT Message Type (RFC 7450 Section 5.1.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +35,10 @@ impl MessageType {
             5 => Ok(MessageType::MembershipUpdate),
             6 => Ok(MessageType::MulticastData),
             7 => Ok(MessageType::Teardown),
-            _ => Err(AmtError::InvalidMessage(format!("Unknown message type: {}", value))),
+            _ => Err(AmtError::InvalidMessage(format!(
+                "Unknown message type: {}",
+                value
+            ))),
         }
     }
 }
@@ -45,22 +48,17 @@ impl MessageType {
 pub enum AmtMessage {
     /// Relay Discovery (Gateway → Discovery Address)
     /// Length: 8 bytes
-    RelayDiscovery {
-        nonce: u32,
-    },
+    RelayDiscovery { nonce: u32 },
 
     /// Relay Advertisement (Relay → Gateway)
     /// Length: 12 bytes (IPv4) or 24 bytes (IPv6)
-    RelayAdvertisement {
-        nonce: u32,
-        relay_address: IpAddr,
-    },
+    RelayAdvertisement { nonce: u32, relay_address: IpAddr },
 
     /// Request (Gateway → Relay)
     /// Length: 8 bytes
     Request {
         request_nonce: u32,
-        p_flag: bool,  // Pseudo-header checksum flag
+        p_flag: bool, // Pseudo-header checksum flag
     },
 
     /// Membership Query (Relay → Gateway)
@@ -68,7 +66,7 @@ pub enum AmtMessage {
     MembershipQuery {
         request_nonce: u32,
         response_mac: [u8; 6],
-        query_data: Vec<u8>,  // IGMP/MLD Query
+        query_data: Vec<u8>, // IGMP/MLD Query
     },
 
     /// Membership Update (Gateway → Relay)
@@ -76,13 +74,13 @@ pub enum AmtMessage {
     MembershipUpdate {
         request_nonce: u32,
         response_mac: [u8; 6],
-        report_data: Vec<u8>,  // IGMPv3/MLDv2 Report
+        report_data: Vec<u8>, // IGMPv3/MLDv2 Report
     },
 
     /// Multicast Data (Relay → Gateway)
     /// Length: 2+ bytes
     MulticastData {
-        ip_packet: Vec<u8>,  // Encapsulated IP packet
+        ip_packet: Vec<u8>, // Encapsulated IP packet
     },
 
     /// Teardown (Gateway → Relay)
@@ -107,7 +105,10 @@ impl AmtMessage {
                 buf
             }
 
-            AmtMessage::RelayAdvertisement { nonce, relay_address } => {
+            AmtMessage::RelayAdvertisement {
+                nonce,
+                relay_address,
+            } => {
                 match relay_address {
                     IpAddr::V4(ipv4) => {
                         // Type (1) | Reserved (1) | Reserved (2) | Nonce (4) | IPv4 (4)
@@ -132,7 +133,10 @@ impl AmtMessage {
                 }
             }
 
-            AmtMessage::Request { request_nonce, p_flag } => {
+            AmtMessage::Request {
+                request_nonce,
+                p_flag,
+            } => {
                 // Type (1) | P-flag (1) | Reserved (2) | Request Nonce (4)
                 let mut buf = Vec::with_capacity(8);
                 buf.push(MessageType::Request as u8);
@@ -142,7 +146,11 @@ impl AmtMessage {
                 buf
             }
 
-            AmtMessage::MembershipQuery { request_nonce, response_mac, query_data } => {
+            AmtMessage::MembershipQuery {
+                request_nonce,
+                response_mac,
+                query_data,
+            } => {
                 // RFC 7450: Type (1) | Reserved (1) | Response MAC (6) | Request Nonce (4) | Query (...)
                 let mut buf = Vec::with_capacity(12 + query_data.len());
                 buf.push(MessageType::MembershipQuery as u8);
@@ -153,7 +161,11 @@ impl AmtMessage {
                 buf
             }
 
-            AmtMessage::MembershipUpdate { request_nonce, response_mac, report_data } => {
+            AmtMessage::MembershipUpdate {
+                request_nonce,
+                response_mac,
+                report_data,
+            } => {
                 // RFC 7450: Type (1) | Reserved (1) | Response MAC (6) | Request Nonce (4) | Report (...)
                 let mut buf = Vec::with_capacity(12 + report_data.len());
                 buf.push(MessageType::MembershipUpdate as u8);
@@ -173,7 +185,10 @@ impl AmtMessage {
                 buf
             }
 
-            AmtMessage::Teardown { request_nonce, response_mac } => {
+            AmtMessage::Teardown {
+                request_nonce,
+                response_mac,
+            } => {
                 // RFC 7450: Type (1) | Reserved (1) | Response MAC (6) | Request Nonce (4)
                 let mut buf = Vec::with_capacity(12);
                 buf.push(MessageType::Teardown as u8);
@@ -204,7 +219,9 @@ impl AmtMessage {
 
             MessageType::RelayAdvertisement => {
                 if buf.len() < 8 {
-                    return Err(AmtError::InvalidMessage("RelayAdvertisement too short".into()));
+                    return Err(AmtError::InvalidMessage(
+                        "RelayAdvertisement too short".into(),
+                    ));
                 }
 
                 let nonce = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -215,16 +232,21 @@ impl AmtMessage {
                     IpAddr::V4(Ipv4Addr::new(buf[8], buf[9], buf[10], buf[11]))
                 } else if buf.len() == 24 {
                     // IPv6
-                    let octets: [u8; 16] = buf[8..24].try_into()
+                    let octets: [u8; 16] = buf[8..24]
+                        .try_into()
                         .map_err(|_| AmtError::InvalidMessage("Invalid IPv6 address".into()))?;
                     IpAddr::V6(Ipv6Addr::from(octets))
                 } else {
-                    return Err(AmtError::InvalidMessage(
-                        format!("Invalid advertisement length: {}", buf.len())
-                    ));
+                    return Err(AmtError::InvalidMessage(format!(
+                        "Invalid advertisement length: {}",
+                        buf.len()
+                    )));
                 };
 
-                Ok(AmtMessage::RelayAdvertisement { nonce, relay_address })
+                Ok(AmtMessage::RelayAdvertisement {
+                    nonce,
+                    relay_address,
+                })
             }
 
             MessageType::Request => {
@@ -233,7 +255,10 @@ impl AmtMessage {
                 }
                 let p_flag = (buf[1] & 0x80) != 0;
                 let request_nonce = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-                Ok(AmtMessage::Request { request_nonce, p_flag })
+                Ok(AmtMessage::Request {
+                    request_nonce,
+                    p_flag,
+                })
             }
 
             MessageType::MembershipQuery => {
@@ -241,23 +266,35 @@ impl AmtMessage {
                     return Err(AmtError::InvalidMessage("MembershipQuery too short".into()));
                 }
                 // RFC 7450: Bytes 2-7 are Response MAC, bytes 8-11 are Request Nonce
-                let response_mac: [u8; 6] = buf[2..8].try_into()
+                let response_mac: [u8; 6] = buf[2..8]
+                    .try_into()
                     .map_err(|_| AmtError::InvalidMessage("Invalid MAC".into()))?;
                 let request_nonce = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
                 let query_data = buf[12..].to_vec();
-                Ok(AmtMessage::MembershipQuery { request_nonce, response_mac, query_data })
+                Ok(AmtMessage::MembershipQuery {
+                    request_nonce,
+                    response_mac,
+                    query_data,
+                })
             }
 
             MessageType::MembershipUpdate => {
                 if buf.len() < 12 {
-                    return Err(AmtError::InvalidMessage("MembershipUpdate too short".into()));
+                    return Err(AmtError::InvalidMessage(
+                        "MembershipUpdate too short".into(),
+                    ));
                 }
                 // RFC 7450: Bytes 2-7 are Response MAC, bytes 8-11 are Request Nonce
-                let response_mac: [u8; 6] = buf[2..8].try_into()
+                let response_mac: [u8; 6] = buf[2..8]
+                    .try_into()
                     .map_err(|_| AmtError::InvalidMessage("Invalid MAC".into()))?;
                 let request_nonce = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
                 let report_data = buf[12..].to_vec();
-                Ok(AmtMessage::MembershipUpdate { request_nonce, response_mac, report_data })
+                Ok(AmtMessage::MembershipUpdate {
+                    request_nonce,
+                    response_mac,
+                    report_data,
+                })
             }
 
             MessageType::MulticastData => {
@@ -273,9 +310,13 @@ impl AmtMessage {
                     return Err(AmtError::InvalidMessage("Teardown too short".into()));
                 }
                 let request_nonce = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-                let response_mac: [u8; 6] = buf[8..14].try_into()
+                let response_mac: [u8; 6] = buf[8..14]
+                    .try_into()
                     .map_err(|_| AmtError::InvalidMessage("Invalid MAC".into()))?;
-                Ok(AmtMessage::Teardown { request_nonce, response_mac })
+                Ok(AmtMessage::Teardown {
+                    request_nonce,
+                    response_mac,
+                })
             }
         }
     }
@@ -325,14 +366,17 @@ mod tests {
     #[test]
     fn test_relay_advertisement_ipv4_decode() {
         let data = vec![
-            0x02, 0x00, 0x00, 0x00,           // Type + Reserved
-            0x12, 0x34, 0x56, 0x78,           // Nonce
-            192, 0, 2, 1                      // IPv4
+            0x02, 0x00, 0x00, 0x00, // Type + Reserved
+            0x12, 0x34, 0x56, 0x78, // Nonce
+            192, 0, 2, 1, // IPv4
         ];
         let msg = AmtMessage::decode(&data).unwrap();
 
         match msg {
-            AmtMessage::RelayAdvertisement { nonce, relay_address } => {
+            AmtMessage::RelayAdvertisement {
+                nonce,
+                relay_address,
+            } => {
                 assert_eq!(nonce, 0x12345678);
                 assert_eq!(relay_address, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
             }
@@ -357,13 +401,16 @@ mod tests {
     #[test]
     fn test_request_decode() {
         let data = vec![
-            0x03, 0x80, 0x00, 0x00,           // Type + P-flag + Reserved
-            0xAB, 0xCD, 0xEF, 0x01            // Request Nonce
+            0x03, 0x80, 0x00, 0x00, // Type + P-flag + Reserved
+            0xAB, 0xCD, 0xEF, 0x01, // Request Nonce
         ];
         let msg = AmtMessage::decode(&data).unwrap();
 
         match msg {
-            AmtMessage::Request { request_nonce, p_flag } => {
+            AmtMessage::Request {
+                request_nonce,
+                p_flag,
+            } => {
                 assert_eq!(request_nonce, 0xABCDEF01);
                 assert!(p_flag);
             }
@@ -393,13 +440,17 @@ mod tests {
     #[test]
     fn test_multicast_data_roundtrip() {
         let ip_packet = vec![0x45, 0x00, 0x00, 0x20]; // IP header start
-        let msg = AmtMessage::MulticastData { ip_packet: ip_packet.clone() };
+        let msg = AmtMessage::MulticastData {
+            ip_packet: ip_packet.clone(),
+        };
 
         let encoded = msg.encode();
         let decoded = AmtMessage::decode(&encoded).unwrap();
 
         match decoded {
-            AmtMessage::MulticastData { ip_packet: decoded_packet } => {
+            AmtMessage::MulticastData {
+                ip_packet: decoded_packet,
+            } => {
                 assert_eq!(decoded_packet, ip_packet);
             }
             _ => panic!("Wrong message type"),

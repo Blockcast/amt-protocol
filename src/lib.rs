@@ -21,15 +21,15 @@
 //! - **FFI**: For native platforms via C ABI (CGO for Go, JNI for Android)
 //! - **UniFFI**: For iOS/macOS via uniffi
 
-pub mod constants;
 pub mod config;
+pub mod constants;
+pub mod driad;
 pub mod error;
-pub mod messages;
-pub mod platform;
 pub mod gateway;
 pub mod igmp;
+pub mod messages;
 pub mod mld;
-pub mod driad;
+pub mod platform;
 pub mod subscription;
 
 #[cfg(feature = "wasm")]
@@ -53,15 +53,15 @@ pub mod ffi;
 #[cfg(feature = "jni")]
 pub mod jni;
 
-pub use constants::*;
 pub use config::AmtConfig;
-pub use error::{AmtError, Result};
-pub use messages::{AmtMessage, MessageType};
-pub use platform::Platform;
-pub use gateway::{AmtGateway, GatewayState, GroupKey, GroupInfo};
-pub use igmp::{IgmpV3Report, IgmpRecord, RecordType};
-pub use mld::{MldV2Report, MldRecord};
+pub use constants::*;
 pub use driad::{DriadRelayAddress, DriadResolver};
+pub use error::{AmtError, Result};
+pub use gateway::{AmtGateway, GatewayState, GroupInfo, GroupKey};
+pub use igmp::{IgmpRecord, IgmpV3Report, RecordType};
+pub use messages::{AmtMessage, MessageType};
+pub use mld::{MldRecord, MldV2Report};
+pub use platform::Platform;
 pub use subscription::{Event, GroupState, SubscriptionManager};
 
 // Re-export platform implementations based on features

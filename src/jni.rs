@@ -11,17 +11,17 @@
 //! gateway.close()
 //! ```
 
+use jni::objects::{JByteArray, JClass, JObjectArray, JString};
+use jni::sys::{jboolean, jbyteArray, jint, jlong};
 use jni::JNIEnv;
-use jni::objects::{JClass, JString, JByteArray, JObjectArray};
-use jni::sys::{jlong, jint, jboolean, jbyteArray};
-use std::sync::Arc;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
-use crate::gateway::AmtGateway;
 use crate::config::AmtConfig;
+use crate::gateway::AmtGateway;
+use crate::igmp::{IgmpRecord, IgmpV3Report};
 use crate::messages::AmtMessage;
 use crate::platform::ffi_platform::FfiPlatform;
-use crate::igmp::{IgmpV3Report, IgmpRecord};
 
 /// Type alias for the gateway with FFI platform
 type GatewayHandle = AmtGateway<FfiPlatform>;
@@ -64,7 +64,11 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeCreate(
         Err(_) => return 0,
     };
 
-    let port = if relay_port <= 0 { None } else { Some(relay_port as u16) };
+    let port = if relay_port <= 0 {
+        None
+    } else {
+        Some(relay_port as u16)
+    };
 
     let config = if enable_driad != 0 {
         AmtConfig::with_driad(addr, port)
@@ -200,12 +204,13 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleAdverti
     };
 
     match msg {
-        AmtMessage::RelayAdvertisement { nonce, relay_address } => {
-            match gw.handle_advertisement(nonce, relay_address) {
-                Ok(()) => 0,
-                Err(_) => -4,
-            }
-        }
+        AmtMessage::RelayAdvertisement {
+            nonce,
+            relay_address,
+        } => match gw.handle_advertisement(nonce, relay_address) {
+            Ok(()) => 0,
+            Err(_) => -4,
+        },
         _ => -5,
     }
 }
@@ -267,17 +272,17 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleQuery<'
     };
 
     match msg {
-        AmtMessage::MembershipQuery { request_nonce, response_mac, query_data } => {
-            match gw.handle_query(request_nonce, response_mac, query_data) {
-                Ok(data) => {
-                    match env.byte_array_from_slice(&data) {
-                        Ok(arr) => arr.into_raw(),
-                        Err(_) => std::ptr::null_mut(),
-                    }
-                }
+        AmtMessage::MembershipQuery {
+            request_nonce,
+            response_mac,
+            query_data,
+        } => match gw.handle_query(request_nonce, response_mac, query_data) {
+            Ok(data) => match env.byte_array_from_slice(&data) {
+                Ok(arr) => arr.into_raw(),
                 Err(_) => std::ptr::null_mut(),
-            }
-        }
+            },
+            Err(_) => std::ptr::null_mut(),
+        },
         _ => std::ptr::null_mut(),
     }
 }
@@ -344,17 +349,13 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleData<'l
     };
 
     match msg {
-        AmtMessage::MulticastData { ip_packet } => {
-            match gw.handle_data(ip_packet) {
-                Ok(packet) => {
-                    match env.byte_array_from_slice(&packet) {
-                        Ok(arr) => arr.into_raw(),
-                        Err(_) => std::ptr::null_mut(),
-                    }
-                }
+        AmtMessage::MulticastData { ip_packet } => match gw.handle_data(ip_packet) {
+            Ok(packet) => match env.byte_array_from_slice(&packet) {
+                Ok(arr) => arr.into_raw(),
                 Err(_) => std::ptr::null_mut(),
-            }
-        }
+            },
+            Err(_) => std::ptr::null_mut(),
+        },
         _ => std::ptr::null_mut(),
     }
 }
