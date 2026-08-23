@@ -2,8 +2,8 @@
 //!
 //! Generates MLDv2 (Multicast Listener Discovery v2) reports for IPv6 multicast.
 
-use std::net::Ipv6Addr;
 use crate::constants::MLD_V2_LISTENER_REPORT;
+use std::net::Ipv6Addr;
 
 /// MLDv2 Multicast Address Record Type (RFC 3810 Section 5.2.12)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,10 +165,10 @@ impl MldV2Report {
         // RFC 2711: option type 0x05, opt-data-len 2, value 0x0000 (MLD).
         // PadN (0x01, 0x00) brings the HBH header to an 8-byte boundary.
         let hbh: [u8; 8] = [
-            58, 0,         // next_header=ICMPv6 (58), hdr_ext_len=0 (8 bytes total)
-            0x05, 0x02,    // opt_type=Router Alert, opt_data_len=2
-            0x00, 0x00,    // value=MLD (0)
-            0x01, 0x00,    // PadN (type=1, len=0) — single-byte pad after RA
+            58, 0, // next_header=ICMPv6 (58), hdr_ext_len=0 (8 bytes total)
+            0x05, 0x02, // opt_type=Router Alert, opt_data_len=2
+            0x00, 0x00, // value=MLD (0)
+            0x01, 0x00, // PadN (type=1, len=0) — single-byte pad after RA
         ];
 
         // IPv6 header: 40 bytes.

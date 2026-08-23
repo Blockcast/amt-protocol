@@ -2,16 +2,16 @@
 //!
 //! Exposes Rust AMT protocol implementation to JavaScript/TypeScript.
 
-use wasm_bindgen::prelude::*;
+use crate::config::AmtConfig;
+use crate::driad::DriadResolver;
+use crate::gateway::{AmtGateway, GatewayState};
+use crate::igmp::{IgmpRecord, IgmpV3Report};
+use crate::messages::AmtMessage;
+use crate::mld::{MldRecord, MldV2Report};
+use crate::platform::wasm_platform::WasmPlatform;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use crate::gateway::{AmtGateway, GatewayState};
-use crate::config::AmtConfig;
-use crate::messages::AmtMessage;
-use crate::igmp::{IgmpV3Report, IgmpRecord};
-use crate::mld::{MldV2Report, MldRecord};
-use crate::driad::DriadResolver;
-use crate::platform::wasm_platform::WasmPlatform;
+use wasm_bindgen::prelude::*;
 
 /// Gateway state exposed to JavaScript
 #[wasm_bindgen]
@@ -57,7 +57,7 @@ impl JsAmtGateway {
         relay_address: &str,
         relay_port: Option<u16>,
         enable_driad: bool,
-        keepalive_interval_secs: Option<u32>
+        keepalive_interval_secs: Option<u32>,
     ) -> Result<JsAmtGateway, JsValue> {
         let addr: IpAddr = relay_address
             .parse()
@@ -120,7 +120,8 @@ impl JsAmtGateway {
     /// Returns encoded RelayDiscovery message as Uint8Array
     #[wasm_bindgen(js_name = startDiscovery)]
     pub fn start_discovery(&mut self) -> Result<Vec<u8>, JsValue> {
-        let msg = self.inner
+        let msg = self
+            .inner
             .start_discovery()
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
@@ -132,11 +133,13 @@ impl JsAmtGateway {
     /// @param data - Raw message bytes
     #[wasm_bindgen(js_name = handleAdvertisement)]
     pub fn handle_advertisement(&mut self, data: &[u8]) -> Result<(), JsValue> {
-        let msg = AmtMessage::decode(data)
-            .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
+        let msg = AmtMessage::decode(data).map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
         match msg {
-            AmtMessage::RelayAdvertisement { nonce, relay_address } => {
+            AmtMessage::RelayAdvertisement {
+                nonce,
+                relay_address,
+            } => {
                 self.inner
                     .handle_advertisement(nonce, relay_address)
                     .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
@@ -152,7 +155,8 @@ impl JsAmtGateway {
     /// Returns encoded Request message as Uint8Array
     #[wasm_bindgen(js_name = requestMembership)]
     pub fn request_membership(&mut self, p_flag: bool) -> Result<Vec<u8>, JsValue> {
-        let msg = self.inner
+        let msg = self
+            .inner
             .request_membership(p_flag)
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
@@ -165,13 +169,22 @@ impl JsAmtGateway {
     /// Returns query data (IGMP/MLD query) as Uint8Array
     #[wasm_bindgen(js_name = handleQuery)]
     pub fn handle_query(&mut self, data: &[u8]) -> Result<Vec<u8>, JsValue> {
-        let msg = AmtMessage::decode(data)
-            .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
+        let msg = AmtMessage::decode(data).map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
         match msg {
-            AmtMessage::MembershipQuery { request_nonce, response_mac, query_data } => {
+            AmtMessage::MembershipQuery {
+                request_nonce,
+                response_mac,
+                query_data,
+            } => {
                 // Debug logging via platform
-                web_sys::console::log_1(&format!("[WASM handleQuery] Parsed nonce from packet: 0x{:08x}", request_nonce).into());
+                web_sys::console::log_1(
+                    &format!(
+                        "[WASM handleQuery] Parsed nonce from packet: 0x{:08x}",
+                        request_nonce
+                    )
+                    .into(),
+                );
 
                 self.inner
                     .handle_query(request_nonce, response_mac, query_data)
@@ -187,7 +200,8 @@ impl JsAmtGateway {
     /// Returns encoded MembershipUpdate message as Uint8Array
     #[wasm_bindgen(js_name = sendUpdate)]
     pub fn send_update(&mut self, report_data: &[u8]) -> Result<Vec<u8>, JsValue> {
-        let msg = self.inner
+        let msg = self
+            .inner
             .send_update(report_data.to_vec())
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
@@ -200,15 +214,13 @@ impl JsAmtGateway {
     /// Returns IP packet payload as Uint8Array
     #[wasm_bindgen(js_name = handleData)]
     pub fn handle_data(&self, data: &[u8]) -> Result<Vec<u8>, JsValue> {
-        let msg = AmtMessage::decode(data)
-            .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
+        let msg = AmtMessage::decode(data).map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
         match msg {
-            AmtMessage::MulticastData { ip_packet } => {
-                self.inner
-                    .handle_data(ip_packet)
-                    .map_err(|e| JsValue::from_str(&format!("{:?}", e)))
-            }
+            AmtMessage::MulticastData { ip_packet } => self
+                .inner
+                .handle_data(ip_packet)
+                .map_err(|e| JsValue::from_str(&format!("{:?}", e))),
             _ => Err(JsValue::from_str("Expected MulticastData message")),
         }
     }
@@ -219,19 +231,27 @@ impl JsAmtGateway {
     /// @param source - Optional source address for SSM (null for ASM)
     /// @param timestamp - Unix timestamp in milliseconds
     #[wasm_bindgen(js_name = addGroup)]
-    pub fn add_group(&mut self, group: &str, source: Option<String>, timestamp: f64) -> Result<(), JsValue> {
+    pub fn add_group(
+        &mut self,
+        group: &str,
+        source: Option<String>,
+        timestamp: f64,
+    ) -> Result<(), JsValue> {
         let group_addr: IpAddr = group
             .parse()
             .map_err(|e| JsValue::from_str(&format!("Invalid group address: {}", e)))?;
 
         let source_addr = if let Some(s) = source {
-            Some(s.parse()
-                .map_err(|e| JsValue::from_str(&format!("Invalid source address: {}", e)))?)
+            Some(
+                s.parse()
+                    .map_err(|e| JsValue::from_str(&format!("Invalid source address: {}", e)))?,
+            )
         } else {
             None
         };
 
-        self.inner.add_group(group_addr, source_addr, timestamp as u64);
+        self.inner
+            .add_group(group_addr, source_addr, timestamp as u64);
         Ok(())
     }
 
@@ -240,7 +260,8 @@ impl JsAmtGateway {
     /// Returns encoded Teardown message as Uint8Array
     #[wasm_bindgen(js_name = sendTeardown)]
     pub fn send_teardown(&mut self) -> Result<Vec<u8>, JsValue> {
-        let msg = self.inner
+        let msg = self
+            .inner
             .send_teardown()
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
@@ -284,7 +305,8 @@ impl JsIgmpReport {
             .parse()
             .map_err(|e| JsValue::from_str(&format!("Invalid source address: {}", e)))?;
 
-        self.inner.add_record(IgmpRecord::ssm_join(group_addr, source_addr));
+        self.inner
+            .add_record(IgmpRecord::ssm_join(group_addr, source_addr));
         Ok(())
     }
 
@@ -322,13 +344,19 @@ impl JsIgmpReport {
     /// @param multicast_group - The multicast group address
     /// @returns Uint8Array containing IPv4 header + IGMP report
     #[wasm_bindgen(js_name = encodeWithIp)]
-    pub fn encode_with_ip(&self, multicast_source: &str, multicast_group: &str) -> Result<Vec<u8>, JsValue> {
+    pub fn encode_with_ip(
+        &self,
+        multicast_source: &str,
+        multicast_group: &str,
+    ) -> Result<Vec<u8>, JsValue> {
         use std::net::Ipv4Addr;
 
-        let src_addr: Ipv4Addr = multicast_source.parse()
+        let src_addr: Ipv4Addr = multicast_source
+            .parse()
             .map_err(|e| JsValue::from_str(&format!("Invalid multicast source: {}", e)))?;
 
-        let dst_addr: Ipv4Addr = multicast_group.parse()
+        let dst_addr: Ipv4Addr = multicast_group
+            .parse()
             .map_err(|e| JsValue::from_str(&format!("Invalid multicast group: {}", e)))?;
 
         Ok(self.inner.encode_with_ip(src_addr, dst_addr))
@@ -365,7 +393,8 @@ impl JsMldReport {
             .parse()
             .map_err(|e| JsValue::from_str(&format!("Invalid source address: {}", e)))?;
 
-        self.inner.add_record(MldRecord::ssm_join(group_addr, source_addr));
+        self.inner
+            .add_record(MldRecord::ssm_join(group_addr, source_addr));
         Ok(())
     }
 
@@ -507,8 +536,7 @@ impl JsDriad {
 /// @returns Message type as string ("RelayDiscovery", "RelayAdvertisement", etc.)
 #[wasm_bindgen(js_name = decodeAmtMessage)]
 pub fn decode_amt_message(data: &[u8]) -> Result<String, JsValue> {
-    let msg = AmtMessage::decode(data)
-        .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
+    let msg = AmtMessage::decode(data).map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
     let msg_type = match msg {
         AmtMessage::RelayDiscovery { .. } => "RelayDiscovery",

@@ -4,9 +4,9 @@
 
 mod common;
 
-use std::time::Duration;
 use amt_protocol::native::AsyncAmtGateway;
 use common::fake_relay::{synth_v4_udp, synth_v6_udp, FakeRelay};
+use std::time::Duration;
 
 #[tokio::test(flavor = "current_thread")]
 async fn oneshot_happy_path_v4() {
@@ -58,8 +58,10 @@ async fn oneshot_happy_path_v6() {
     let relay = FakeRelay::bind("v6").await;
     // v6 inner that matches the v6 (S,G) we subscribe to below.
     // src = 2001:db8::1 octets, dst = ff3e::1234 octets.
-    let src: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0,0,0,0, 0,0,0,0, 0,0,0,0x01];
-    let dst: [u8; 16] = [0xff, 0x3e, 0,0,0,0,0,0, 0,0,0,0, 0,0,0x12,0x34];
+    let src: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ];
+    let dst: [u8; 16] = [0xff, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34];
     let inner = synth_v6_udp(src, dst, 5004, 5005, b"hello");
     relay.spawn(inner);
 
@@ -107,8 +109,14 @@ async fn subscribe_data_multi_consumer() {
     .await
     .unwrap();
 
-    let a = tokio::time::timeout(Duration::from_secs(5), rx_a.recv()).await.unwrap().unwrap();
-    let b = tokio::time::timeout(Duration::from_secs(5), rx_b.recv()).await.unwrap().unwrap();
+    let a = tokio::time::timeout(Duration::from_secs(5), rx_a.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let b = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(&a.payload[..], b"x");
     assert_eq!(&b.payload[..], b"x");
 
@@ -124,12 +132,13 @@ async fn subscribe_v4_relay_rejects_v6_group() {
         .await
         .unwrap();
 
-    let err = gw.subscribe(
-        "ff3e::1234".parse().unwrap(),
-        Some("2001:db8::1".parse().unwrap()),
-    )
-    .await
-    .unwrap_err();
+    let err = gw
+        .subscribe(
+            "ff3e::1234".parse().unwrap(),
+            Some("2001:db8::1".parse().unwrap()),
+        )
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("family"), "got: {err}");
 
     gw.shutdown().await.unwrap();

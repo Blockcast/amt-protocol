@@ -4,8 +4,8 @@
 //! 1. Discovered via DRIAD (RFC 8777) - DNS-based relay discovery
 //! 2. Manually configured by the user
 
-use std::net::IpAddr;
 use crate::constants::DEFAULT_AMT_PORT;
+use std::net::IpAddr;
 
 /// AMT Gateway Configuration
 #[derive(Debug, Clone)]

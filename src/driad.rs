@@ -337,10 +337,7 @@ impl DriadResolver {
             // Owner/class must match the question. An in-bailiwick reply can
             // otherwise smuggle a record for an unrelated name (or a bogus
             // class) into the answer section and have it read as ours.
-            if rtype == record_type
-                && rclass == qclass
-                && DnsName::eq(data, &owner, data, &qname)
-            {
+            if rtype == record_type && rclass == qclass && DnsName::eq(data, &owner, data, &qname) {
                 visit(&data[offset..offset + rdlength]);
             }
 
@@ -567,10 +564,7 @@ impl DnsName {
             }
         }
 
-        Some(Self {
-            labels,
-            end: end?,
-        })
+        Some(Self { labels, end: end? })
     }
 
     /// Compare two decoded names case-insensitively (DNS names are ASCII-case
@@ -653,39 +647,55 @@ mod tests {
         assert_eq!(packet[1], 0x34); // Transaction ID low
         assert_eq!(packet[2], 0x01); // Flags: RD=1
         assert_eq!(packet[3], 0x00);
-        assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), 1);  // QDCOUNT
-        assert_eq!(u16::from_be_bytes([packet[6], packet[7]]), 0);  // ANCOUNT
-        assert_eq!(u16::from_be_bytes([packet[8], packet[9]]), 0);  // NSCOUNT
+        assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), 1); // QDCOUNT
+        assert_eq!(u16::from_be_bytes([packet[6], packet[7]]), 0); // ANCOUNT
+        assert_eq!(u16::from_be_bytes([packet[8], packet[9]]), 0); // NSCOUNT
         assert_eq!(u16::from_be_bytes([packet[10], packet[11]]), 0); // ARCOUNT
 
         // QNAME for 128.95.25.69.in-addr.arpa
         let mut offset = 12;
         // "128"
-        assert_eq!(packet[offset], 3); offset += 1;
-        assert_eq!(&packet[offset..offset+3], b"128"); offset += 3;
+        assert_eq!(packet[offset], 3);
+        offset += 1;
+        assert_eq!(&packet[offset..offset + 3], b"128");
+        offset += 3;
         // "95"
-        assert_eq!(packet[offset], 2); offset += 1;
-        assert_eq!(&packet[offset..offset+2], b"95"); offset += 2;
+        assert_eq!(packet[offset], 2);
+        offset += 1;
+        assert_eq!(&packet[offset..offset + 2], b"95");
+        offset += 2;
         // "25"
-        assert_eq!(packet[offset], 2); offset += 1;
-        assert_eq!(&packet[offset..offset+2], b"25"); offset += 2;
+        assert_eq!(packet[offset], 2);
+        offset += 1;
+        assert_eq!(&packet[offset..offset + 2], b"25");
+        offset += 2;
         // "69"
-        assert_eq!(packet[offset], 2); offset += 1;
-        assert_eq!(&packet[offset..offset+2], b"69"); offset += 2;
+        assert_eq!(packet[offset], 2);
+        offset += 1;
+        assert_eq!(&packet[offset..offset + 2], b"69");
+        offset += 2;
         // "in-addr"
-        assert_eq!(packet[offset], 7); offset += 1;
-        assert_eq!(&packet[offset..offset+7], b"in-addr"); offset += 7;
+        assert_eq!(packet[offset], 7);
+        offset += 1;
+        assert_eq!(&packet[offset..offset + 7], b"in-addr");
+        offset += 7;
         // "arpa"
-        assert_eq!(packet[offset], 4); offset += 1;
-        assert_eq!(&packet[offset..offset+4], b"arpa"); offset += 4;
+        assert_eq!(packet[offset], 4);
+        offset += 1;
+        assert_eq!(&packet[offset..offset + 4], b"arpa");
+        offset += 4;
         // Root label
-        assert_eq!(packet[offset], 0); offset += 1;
+        assert_eq!(packet[offset], 0);
+        offset += 1;
 
         // QTYPE = 260
-        assert_eq!(u16::from_be_bytes([packet[offset], packet[offset+1]]), 260);
+        assert_eq!(
+            u16::from_be_bytes([packet[offset], packet[offset + 1]]),
+            260
+        );
         offset += 2;
         // QCLASS = 1 (IN)
-        assert_eq!(u16::from_be_bytes([packet[offset], packet[offset+1]]), 1);
+        assert_eq!(u16::from_be_bytes([packet[offset], packet[offset + 1]]), 1);
     }
 
     #[test]
@@ -699,7 +709,7 @@ mod tests {
         // Set QR=1 (response) in flags
         response[2] = 0x81; // QR=1, RD=1
         response[3] = 0x80; // RA=1
-        // ANCOUNT = 1
+                            // ANCOUNT = 1
         response[6] = 0x00;
         response[7] = 0x01;
 
@@ -716,14 +726,16 @@ mod tests {
         // RDLENGTH = 6 (precedence:1 + D+type:1 + IPv4:4)
         response.extend_from_slice(&6u16.to_be_bytes());
         // RDATA
-        response.push(10);  // precedence
+        response.push(10); // precedence
         response.push(0x01); // D=0, type=1 (IPv4)
         response.extend_from_slice(&[192, 0, 2, 1]); // relay: 192.0.2.1
 
         let relay = DriadResolver::parse_dns_response(&response);
         assert_eq!(
             relay,
-            Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))))
+            Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+                192, 0, 2, 1
+            ))))
         );
     }
 
@@ -745,15 +757,17 @@ mod tests {
         response.extend_from_slice(&300u32.to_be_bytes());
         // RDLENGTH = 18 (precedence:1 + D+type:1 + IPv6:16)
         response.extend_from_slice(&18u16.to_be_bytes());
-        response.push(10);   // precedence
+        response.push(10); // precedence
         response.push(0x02); // D=0, type=2 (IPv6)
-        // 2001:db8::1
+                             // 2001:db8::1
         response.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
 
         let relay = DriadResolver::parse_dns_response(&response);
         assert_eq!(
             relay,
-            Some(DriadRelayAddress::Ip(IpAddr::V6("2001:db8::1".parse().unwrap())))
+            Some(DriadRelayAddress::Ip(IpAddr::V6(
+                "2001:db8::1".parse().unwrap()
+            )))
         );
     }
 
@@ -794,7 +808,9 @@ mod tests {
         let result = DriadResolver::parse_amtrelay_rdata(&rdata);
         assert_eq!(
             result,
-            Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))))
+            Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+                192, 0, 2, 1
+            ))))
         );
     }
 
@@ -807,8 +823,8 @@ mod tests {
             0x03, // D=0, type=3 (DNS name)
             5, b's', b'f', b'o', b'1', b'2', // label "sfo12"
             5, b'b', b'c', b'a', b's', b't', // label "bcast"
-            2, b'i', b'd',                    // label "id"
-            0,                                // root label
+            2, b'i', b'd', // label "id"
+            0,    // root label
         ];
         let result = DriadResolver::parse_amtrelay_rdata(&rdata);
         assert_eq!(
@@ -821,9 +837,8 @@ mod tests {
     fn test_parse_amtrelay_rdata_type3_real_wire_data() {
         // Real RDATA from production: 0A 03 05 73 66 6F 31 32 05 62 63 61 73 74 02 69 64 00
         let rdata = [
-            0x0A, 0x03, 0x05, 0x73, 0x66, 0x6F, 0x31, 0x32,
-            0x05, 0x62, 0x63, 0x61, 0x73, 0x74, 0x02, 0x69,
-            0x64, 0x00,
+            0x0A, 0x03, 0x05, 0x73, 0x66, 0x6F, 0x31, 0x32, 0x05, 0x62, 0x63, 0x61, 0x73, 0x74,
+            0x02, 0x69, 0x64, 0x00,
         ];
         let result = DriadResolver::parse_amtrelay_rdata(&rdata);
         assert_eq!(
@@ -851,14 +866,11 @@ mod tests {
         response.extend_from_slice(&300u32.to_be_bytes());
         // RDATA: precedence(1) + D+type(1) + DNS name for "sfo12.bcast.id"
         let dns_name_wire = [
-            5, b's', b'f', b'o', b'1', b'2',
-            5, b'b', b'c', b'a', b's', b't',
-            2, b'i', b'd',
-            0,
+            5, b's', b'f', b'o', b'1', b'2', 5, b'b', b'c', b'a', b's', b't', 2, b'i', b'd', 0,
         ];
         let rdlength = (2 + dns_name_wire.len()) as u16;
         response.extend_from_slice(&rdlength.to_be_bytes());
-        response.push(10);   // precedence
+        response.push(10); // precedence
         response.push(0x03); // D=0, type=3 (DNS name)
         response.extend_from_slice(&dns_name_wire);
 
@@ -913,7 +925,10 @@ mod tests {
         // Find QTYPE at end of QNAME
         // sfo12(6) + bcast(6) + id(3) + root(1) = 16 bytes for QNAME
         let qtype_offset = 12 + 16;
-        assert_eq!(u16::from_be_bytes([packet[qtype_offset], packet[qtype_offset + 1]]), 1); // TYPE A
+        assert_eq!(
+            u16::from_be_bytes([packet[qtype_offset], packet[qtype_offset + 1]]),
+            1
+        ); // TYPE A
     }
 
     #[test]
@@ -929,11 +944,11 @@ mod tests {
         // Answer: pointer to QNAME
         response.push(0xC0);
         response.push(0x0C);
-        response.extend_from_slice(&1u16.to_be_bytes());    // TYPE A
-        response.extend_from_slice(&1u16.to_be_bytes());    // CLASS IN
-        response.extend_from_slice(&300u32.to_be_bytes());  // TTL
-        response.extend_from_slice(&4u16.to_be_bytes());    // RDLENGTH = 4
-        response.extend_from_slice(&[69, 25, 95, 128]);     // 69.25.95.128
+        response.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+        response.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+        response.extend_from_slice(&300u32.to_be_bytes()); // TTL
+        response.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH = 4
+        response.extend_from_slice(&[69, 25, 95, 128]); // 69.25.95.128
 
         let ip = DriadResolver::parse_dns_a_response(&response);
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(69, 25, 95, 128))));

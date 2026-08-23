@@ -18,8 +18,7 @@ const MAX_ATTEMPTS: usize = 3;
 /// Reads /etc/resolv.conf, sends an AMTRELAY query to each nameserver until
 /// one answers (max 3 total attempts across the nameserver list).
 pub async fn resolve_amt_relay(source: IpAddr) -> Result<IpAddr> {
-    let resolv =
-        std::fs::read_to_string("/etc/resolv.conf").context("reading /etc/resolv.conf")?;
+    let resolv = std::fs::read_to_string("/etc/resolv.conf").context("reading /etc/resolv.conf")?;
     let nameservers = parse_resolv_conf(&resolv);
     if nameservers.is_empty() {
         return Err(anyhow!("no nameserver entries in /etc/resolv.conf"));
@@ -138,8 +137,13 @@ async fn try_one_at_port(ns: IpAddr, port: u16, query: &[u8]) -> Result<DriadRel
     let (n, _) = timeout(QUERY_TIMEOUT, sock.recv_from(&mut buf))
         .await
         .map_err(|_| anyhow!("DNS query to {}:{} timed out", ns, port))??;
-    DriadResolver::parse_dns_response_validated(query, &buf[..n])
-        .ok_or_else(|| anyhow!("DNS reply from {}:{} had no valid AMTRELAY answer", ns, port))
+    DriadResolver::parse_dns_response_validated(query, &buf[..n]).ok_or_else(|| {
+        anyhow!(
+            "DNS reply from {}:{} had no valid AMTRELAY answer",
+            ns,
+            port
+        )
+    })
 }
 
 #[cfg(test)]
@@ -243,9 +247,7 @@ nameserver 2606:4700:4700::1111
         let source: IpAddr = "10.0.0.1".parse().unwrap();
         let ns: IpAddr = live_addr.ip();
         let port = live_addr.port();
-        let relay = resolve_v4_oneshot_for_test(source, ns, port)
-            .await
-            .unwrap();
+        let relay = resolve_v4_oneshot_for_test(source, ns, port).await.unwrap();
         assert_eq!(relay, "192.0.2.96".parse::<IpAddr>().unwrap());
     }
 

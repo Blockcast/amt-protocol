@@ -1,11 +1,15 @@
 //! Output events emitted by SubscriptionManager.
 
-use std::net::IpAddr;
 use crate::error::AmtError;
+use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    Transmit { dst: IpAddr, port: u16, payload: Vec<u8> },
+    Transmit {
+        dst: IpAddr,
+        port: u16,
+        payload: Vec<u8>,
+    },
     Data {
         src: IpAddr,
         group: IpAddr,

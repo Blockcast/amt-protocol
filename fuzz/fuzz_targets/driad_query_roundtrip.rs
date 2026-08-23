@@ -34,9 +34,7 @@ fuzz_target!(|data: &[u8]| {
     // Real queries built by the crate must also survive being validated against
     // arbitrary response bytes.
     if data.len() >= 6 {
-        let src = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-            data[0], data[1], data[2], data[3],
-        ));
+        let src = std::net::IpAddr::V4(std::net::Ipv4Addr::new(data[0], data[1], data[2], data[3]));
         let txid = u16::from_be_bytes([data[4], data[5]]);
         let built = DriadResolver::build_dns_query(src, txid);
         let _ = DriadResolver::parse_dns_response_validated(&built, response);

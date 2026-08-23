@@ -25,7 +25,7 @@ pub const MAX_GROUPS_PER_TUNNEL: usize = 64;
 
 /// Default timeouts (callers override via builder)
 pub const DISCOVERY_TIMEOUT_MS: u64 = 5_000;
-pub const REQUEST_TIMEOUT_MS:   u64 = 5_000;
+pub const REQUEST_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_DISCOVERY_RETRIES: u32 = 3;
 
 pub struct SubscriptionManager<P: Platform> {
@@ -64,10 +64,18 @@ impl<P: Platform> SubscriptionManager<P> {
         }
     }
 
-    pub fn state(&self) -> GatewayState { self.inner.state() }
-    pub fn relay_address(&self) -> Option<IpAddr> { self.inner.relay_address() }
-    pub fn relay_port(&self) -> u16 { self.inner.relay_port() }
-    pub fn groups(&self) -> &HashMap<GroupKey, GroupState> { &self.groups }
+    pub fn state(&self) -> GatewayState {
+        self.inner.state()
+    }
+    pub fn relay_address(&self) -> Option<IpAddr> {
+        self.inner.relay_address()
+    }
+    pub fn relay_port(&self) -> u16 {
+        self.inner.relay_port()
+    }
+    pub fn groups(&self) -> &HashMap<GroupKey, GroupState> {
+        &self.groups
+    }
 
     pub fn poll_event(&mut self) -> Option<Event> {
         self.out_queue.pop_front()
@@ -94,9 +102,8 @@ impl<P: Platform> SubscriptionManager<P> {
         }
         match self.inner.state() {
             GatewayState::Idle => self.start_discovery(now_ms)?,
-            GatewayState::Discovering
-            | GatewayState::Requesting
-            | GatewayState::Querying => { /* queued; handshake in flight */ }
+            GatewayState::Discovering | GatewayState::Requesting | GatewayState::Querying => { /* queued; handshake in flight */
+            }
             GatewayState::Active => {
                 // Move newly-queued group(s) from pending into groups + emit ALLOW Update.
                 while let Some(key) = self.pending.pop_front() {
@@ -150,15 +157,23 @@ impl<P: Platform> SubscriptionManager<P> {
             }
         };
         match msg {
-            AmtMessage::RelayAdvertisement { nonce, relay_address } => {
+            AmtMessage::RelayAdvertisement {
+                nonce,
+                relay_address,
+            } => {
                 self.handle_advertisement(nonce, relay_address, now_ms)?;
             }
-            AmtMessage::MembershipQuery { request_nonce, response_mac, query_data } => {
+            AmtMessage::MembershipQuery {
+                request_nonce,
+                response_mac,
+                query_data,
+            } => {
                 self.handle_query(request_nonce, response_mac, query_data, now_ms)?;
             }
             AmtMessage::MulticastData { ip_packet } => {
                 if self.inner.state() != GatewayState::Active {
-                    self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
+                    self.out_queue
+                        .push_back(Event::Warning(AmtError::UnexpectedMessage));
                     return Ok(());
                 }
                 match crate::subscription::inner_packet::parse_inner(&ip_packet) {
@@ -169,8 +184,14 @@ impl<P: Platform> SubscriptionManager<P> {
                         // gateway sharing the tunnel, ASM noise, or a
                         // misconfigured relay). Drop silently if not subscribed
                         // — the manager's groups map is the source of truth.
-                        let asm_key = GroupKey { group: p.dst, source: None };
-                        let ssm_key = GroupKey { group: p.dst, source: Some(p.src) };
+                        let asm_key = GroupKey {
+                            group: p.dst,
+                            source: None,
+                        };
+                        let ssm_key = GroupKey {
+                            group: p.dst,
+                            source: Some(p.src),
+                        };
                         if !self.groups.contains_key(&ssm_key)
                             && !self.groups.contains_key(&asm_key)
                         {
@@ -186,12 +207,14 @@ impl<P: Platform> SubscriptionManager<P> {
                         });
                     }
                     Err(_) => {
-                        self.out_queue.push_back(Event::Warning(AmtError::MalformedInner));
+                        self.out_queue
+                            .push_back(Event::Warning(AmtError::MalformedInner));
                     }
                 }
             }
             _ => {
-                self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
+                self.out_queue
+                    .push_back(Event::Warning(AmtError::UnexpectedMessage));
             }
         }
         Ok(())
@@ -204,7 +227,8 @@ impl<P: Platform> SubscriptionManager<P> {
         now_ms: u64,
     ) -> Result<()> {
         if self.inner.state() != GatewayState::Discovering {
-            self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
+            self.out_queue
+                .push_back(Event::Warning(AmtError::UnexpectedMessage));
             return Ok(());
         }
         match self.inner.handle_advertisement(nonce, relay_address) {
@@ -254,7 +278,8 @@ impl<P: Platform> SubscriptionManager<P> {
             GatewayState::Requesting => true,
             GatewayState::Active => false,
             _ => {
-                self.out_queue.push_back(Event::Warning(AmtError::UnexpectedMessage));
+                self.out_queue
+                    .push_back(Event::Warning(AmtError::UnexpectedMessage));
                 return Ok(());
             }
         };
@@ -265,7 +290,8 @@ impl<P: Platform> SubscriptionManager<P> {
         if initial_handshake {
             // Flush pending into groups map only when the tunnel first becomes active.
             while let Some(key) = self.pending.pop_front() {
-                self.groups.insert(key.clone(), GroupState::new(key, now_ms));
+                self.groups
+                    .insert(key.clone(), GroupState::new(key, now_ms));
             }
         }
         // Event-emit ORDER is part of the public contract: Transmit(Update)
@@ -286,8 +312,12 @@ impl<P: Platform> SubscriptionManager<P> {
         let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
         let port = self.inner.relay_port();
         let report = match relay {
-            IpAddr::V4(_) => crate::subscription::report::build_current_state_v4(self.groups.keys())?,
-            IpAddr::V6(_) => crate::subscription::report::build_current_state_v6(self.groups.keys())?,
+            IpAddr::V4(_) => {
+                crate::subscription::report::build_current_state_v4(self.groups.keys())?
+            }
+            IpAddr::V6(_) => {
+                crate::subscription::report::build_current_state_v6(self.groups.keys())?
+            }
         };
         let msg = self.inner.send_update(report)?;
         for g in self.groups.values_mut() {
@@ -311,7 +341,11 @@ impl<P: Platform> SubscriptionManager<P> {
         }
         // Drop from pending first (covers pre-handshake removal).
         self.pending.retain(|k| k != key);
-        let was_announced = self.groups.remove(key).map(|g| g.announced).unwrap_or(false);
+        let was_announced = self
+            .groups
+            .remove(key)
+            .map(|g| g.announced)
+            .unwrap_or(false);
         if !was_announced || self.inner.state() != GatewayState::Active {
             return Ok(());
         }
@@ -365,7 +399,8 @@ impl<P: Platform> SubscriptionManager<P> {
                         self.inner.reset();
                         self.discovery_retries = 0;
                         self.last_discovery_at_ms = None;
-                        self.out_queue.push_back(Event::Warning(AmtError::DiscoveryFailed));
+                        self.out_queue
+                            .push_back(Event::Warning(AmtError::DiscoveryFailed));
                         return Ok(());
                     }
                 }
@@ -378,7 +413,8 @@ impl<P: Platform> SubscriptionManager<P> {
                 if now_ms.saturating_sub(t) >= REQUEST_TIMEOUT_MS {
                     self.inner.reset();
                     self.last_request_at_ms = None;
-                    self.out_queue.push_back(Event::Warning(AmtError::QueryFailed));
+                    self.out_queue
+                        .push_back(Event::Warning(AmtError::QueryFailed));
                 }
             }
             return Ok(());
@@ -386,7 +422,9 @@ impl<P: Platform> SubscriptionManager<P> {
         // 3. Active keep-alive.
         if self.inner.state() == GatewayState::Active && !self.groups.is_empty() {
             let interval_ms = (self.cfg.keepalive_interval_secs as u64) * 1000;
-            if interval_ms == 0 { return Ok(()); }
+            if interval_ms == 0 {
+                return Ok(());
+            }
             let due = match self.last_update_at_ms {
                 Some(t) => now_ms.saturating_sub(t) >= interval_ms,
                 None => false,
@@ -457,7 +495,9 @@ impl<P: Platform> SubscriptionManager<P> {
 
     // Test helpers (only compiled into the test binary).
     #[cfg(test)]
-    pub(crate) fn pending_len(&self) -> usize { self.pending.len() }
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 #[cfg(test)]
@@ -476,7 +516,10 @@ mod tests {
         let m = mgr();
         assert_eq!(m.state(), GatewayState::Idle);
         assert!(m.groups().is_empty());
-        assert_eq!(m.relay_address(), Some("192.0.2.96".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            m.relay_address(),
+            Some("192.0.2.96".parse::<IpAddr>().unwrap())
+        );
         assert_eq!(m.relay_port(), 2268);
     }
 
@@ -491,7 +534,14 @@ mod tests {
         let mut m = mgr();
         let group: IpAddr = "232.0.0.1".parse().unwrap();
         let source: IpAddr = "10.0.0.1".parse().unwrap();
-        m.subscribe(GroupKey { group, source: Some(source) }, 1000).unwrap();
+        m.subscribe(
+            GroupKey {
+                group,
+                source: Some(source),
+            },
+            1000,
+        )
+        .unwrap();
 
         assert_eq!(m.state(), GatewayState::Discovering);
         assert_eq!(m.groups().len(), 0, "group not announced yet");
@@ -515,10 +565,15 @@ mod tests {
         let mut m = mgr();
         let v6_group: IpAddr = "ff0e::1".parse().unwrap();
         let v4_source: IpAddr = "10.0.0.1".parse().unwrap();
-        let err = m.subscribe(
-            GroupKey { group: v6_group, source: Some(v4_source) },
-            1000,
-        ).unwrap_err();
+        let err = m
+            .subscribe(
+                GroupKey {
+                    group: v6_group,
+                    source: Some(v4_source),
+                },
+                1000,
+            )
+            .unwrap_err();
         assert_eq!(err, AmtError::FamilyMismatch);
     }
 
@@ -527,10 +582,15 @@ mod tests {
         let mut m = mgr(); // v4 relay
         let v6_group: IpAddr = "ff3e::1234".parse().unwrap();
         let v6_source: IpAddr = "2001:db8::1".parse().unwrap();
-        let err = m.subscribe(
-            GroupKey { group: v6_group, source: Some(v6_source) },
-            1000,
-        ).unwrap_err();
+        let err = m
+            .subscribe(
+                GroupKey {
+                    group: v6_group,
+                    source: Some(v6_source),
+                },
+                1000,
+            )
+            .unwrap_err();
         assert_eq!(err, AmtError::FamilyMismatch);
     }
 
@@ -540,15 +600,24 @@ mod tests {
         for i in 0..MAX_GROUPS_PER_TUNNEL {
             let group: IpAddr = format!("232.0.0.{}", i + 1).parse().unwrap();
             m.subscribe(
-                GroupKey { group, source: Some("10.0.0.1".parse().unwrap()) },
+                GroupKey {
+                    group,
+                    source: Some("10.0.0.1".parse().unwrap()),
+                },
                 1000,
-            ).unwrap();
+            )
+            .unwrap();
         }
         let group: IpAddr = "232.0.1.1".parse().unwrap();
-        let err = m.subscribe(
-            GroupKey { group, source: Some("10.0.0.1".parse().unwrap()) },
-            1000,
-        ).unwrap_err();
+        let err = m
+            .subscribe(
+                GroupKey {
+                    group,
+                    source: Some("10.0.0.1".parse().unwrap()),
+                },
+                1000,
+            )
+            .unwrap_err();
         assert_eq!(err, AmtError::TunnelFull);
     }
 
@@ -565,31 +634,40 @@ mod tests {
         for i in 1..MAX_GROUPS_PER_TUNNEL {
             let group: IpAddr = format!("232.0.0.{}", i + 1).parse().unwrap();
             m.subscribe(
-                GroupKey { group, source: Some("10.0.0.1".parse().unwrap()) },
+                GroupKey {
+                    group,
+                    source: Some("10.0.0.1".parse().unwrap()),
+                },
                 1000,
-            ).unwrap();
+            )
+            .unwrap();
         }
         // At cap. Re-sub of an existing key must be Ok and a no-op.
-        m.subscribe(first_key, 2000).expect("idempotent re-sub at cap must succeed");
+        m.subscribe(first_key, 2000)
+            .expect("idempotent re-sub at cap must succeed");
     }
 
     #[test]
     fn subscribe_after_shutdown_rejected() {
         let mut m = mgr();
         m.shutdown(1000).unwrap();
-        let err = m.subscribe(
-            GroupKey {
-                group: "232.0.0.1".parse().unwrap(),
-                source: Some("10.0.0.1".parse().unwrap()),
-            },
-            1100,
-        ).unwrap_err();
+        let err = m
+            .subscribe(
+                GroupKey {
+                    group: "232.0.0.1".parse().unwrap(),
+                    source: Some("10.0.0.1".parse().unwrap()),
+                },
+                1100,
+            )
+            .unwrap_err();
         assert_eq!(err, AmtError::ShutdownInProgress);
     }
 
     fn drain(m: &mut SubscriptionManager<TestPlatform>) -> Vec<Event> {
         let mut v = Vec::new();
-        while let Some(ev) = m.poll_event() { v.push(ev); }
+        while let Some(ev) = m.poll_event() {
+            v.push(ev);
+        }
         v
     }
 
@@ -623,10 +701,13 @@ mod tests {
 
         assert_eq!(m.state(), GatewayState::Requesting);
         let events = drain(&mut m);
-        let req = events.iter().find_map(|ev| match ev {
-            Event::Transmit { payload, .. } if payload[0] == 0x03 => Some(payload.clone()),
-            _ => None,
-        }).expect("expected a Request transmit");
+        let req = events
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x03 => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("expected a Request transmit");
         // Relay address is IPv4 (192.0.2.96) → P-flag MUST be 0 per RFC 7450
         // §5.1.3.1 so the relay returns an IGMPv3 General Query, not MLDv2.
         assert_eq!(req[1] & 0x80, 0x00, "P-flag MUST be 0 for IPv4 relay");
@@ -647,7 +728,11 @@ mod tests {
             relay_address: "192.0.2.96".parse::<IpAddr>().unwrap(),
         };
         m.handle_datagram(&advert.encode(), 1100).unwrap();
-        assert_eq!(m.state(), GatewayState::Discovering, "state must not advance on bad nonce");
+        assert_eq!(
+            m.state(),
+            GatewayState::Discovering,
+            "state must not advance on bad nonce"
+        );
         let events = drain(&mut m);
         assert!(events.iter().any(|ev| matches!(ev, Event::Warning(_))));
     }
@@ -682,10 +767,16 @@ mod tests {
         };
         m.handle_datagram(&bad_query.encode(), 1200).unwrap();
 
-        assert_eq!(m.state(), GatewayState::Requesting, "state must not advance");
+        assert_eq!(
+            m.state(),
+            GatewayState::Requesting,
+            "state must not advance"
+        );
         let events = drain(&mut m);
         assert!(events.iter().any(|ev| matches!(ev, Event::Warning(_))));
-        assert!(!events.iter().any(|ev| matches!(ev, Event::HandshakeComplete)));
+        assert!(!events
+            .iter()
+            .any(|ev| matches!(ev, Event::HandshakeComplete)));
     }
 
     #[test]
@@ -710,12 +801,17 @@ mod tests {
         };
         m.handle_datagram(&advert.encode(), 1100).unwrap();
         let after_advert = drain(&mut m);
-        let req_nonce = after_advert.iter().find_map(|ev| match ev {
-            Event::Transmit { payload, .. } if payload[0] == 0x03 => {
-                Some(u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]))
-            }
-            _ => None,
-        }).expect("expected Request transmit");
+        let req_nonce = after_advert
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x03 => {
+                    Some(u32::from_be_bytes([
+                        payload[4], payload[5], payload[6], payload[7],
+                    ]))
+                }
+                _ => None,
+            })
+            .expect("expected Request transmit");
 
         // Synthesize a MembershipQuery and feed it in.
         let query = AmtMessage::MembershipQuery {
@@ -730,17 +826,22 @@ mod tests {
         assert_eq!(m.pending_len(), 0);
 
         let events = drain(&mut m);
-        let update = events.iter().find_map(|ev| match ev {
-            Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
-            _ => None,
-        }).expect("expected MembershipUpdate transmit");
+        let update = events
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("expected MembershipUpdate transmit");
         // Update layout: 12B AMT header + 24B IPv4(RA) envelope + IGMPv3 body.
         // Skip AMT + IPv4 to land on the IGMPv3 report.
         let report = &update[12 + 24..];
         assert_eq!(report[0], 0x22, "IGMPv3 report type");
         assert_eq!(u16::from_be_bytes([report[6], report[7]]), 2);
 
-        assert!(events.iter().any(|ev| matches!(ev, Event::HandshakeComplete)));
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, Event::HandshakeComplete)));
     }
 
     fn drive_to_active(m: &mut SubscriptionManager<TestPlatform>, key: GroupKey) -> u32 {
@@ -753,12 +854,17 @@ mod tests {
         };
         m.handle_datagram(&advert.encode(), 1100).unwrap();
         let after_advert = drain(m);
-        let req_nonce = after_advert.iter().find_map(|ev| match ev {
-            Event::Transmit { payload, .. } if payload[0] == 0x03 => {
-                Some(u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]))
-            }
-            _ => None,
-        }).unwrap();
+        let req_nonce = after_advert
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x03 => {
+                    Some(u32::from_be_bytes([
+                        payload[4], payload[5], payload[6], payload[7],
+                    ]))
+                }
+                _ => None,
+            })
+            .unwrap();
         let query = AmtMessage::MembershipQuery {
             request_nonce: req_nonce,
             response_mac: [0; 6],
@@ -788,13 +894,18 @@ mod tests {
 
         assert_eq!(m.state(), GatewayState::Active);
         let events = drain(&mut m);
-        assert!(!events.iter().any(|event| matches!(event, Event::HandshakeComplete)));
-        let update = events.iter().find_map(|event| match event {
-            Event::Transmit { payload, .. } if payload[0] == 0x05 => {
-                Some(AmtMessage::decode(payload).unwrap())
-            }
-            _ => None,
-        }).expect("expected active MembershipUpdate transmit");
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::HandshakeComplete)));
+        let update = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Transmit { payload, .. } if payload[0] == 0x05 => {
+                    Some(AmtMessage::decode(payload).unwrap())
+                }
+                _ => None,
+            })
+            .expect("expected active MembershipUpdate transmit");
         match update {
             AmtMessage::MembershipUpdate {
                 request_nonce: nonce,
@@ -808,7 +919,13 @@ mod tests {
         }
     }
 
-    fn synth_v4_udp_packet(src: [u8; 4], dst: [u8; 4], sp: u16, dp: u16, payload: &[u8]) -> Vec<u8> {
+    fn synth_v4_udp_packet(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sp: u16,
+        dp: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let total_len = (20 + 8 + payload.len()) as u16;
         let mut buf = vec![0x45, 0x00];
         buf.extend_from_slice(&total_len.to_be_bytes());
@@ -838,11 +955,19 @@ mod tests {
         m.handle_datagram(&data_msg.encode(), 1300).unwrap();
 
         let events = drain(&mut m);
-        let data = events.iter().find_map(|ev| match ev {
-            Event::Data { src, group, src_port, dst_port, payload } =>
-                Some((*src, *group, *src_port, *dst_port, payload.clone())),
-            _ => None,
-        }).expect("expected Event::Data");
+        let data = events
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Data {
+                    src,
+                    group,
+                    src_port,
+                    dst_port,
+                    payload,
+                } => Some((*src, *group, *src_port, *dst_port, payload.clone())),
+                _ => None,
+            })
+            .expect("expected Event::Data");
         assert_eq!(data.0, "10.0.0.1".parse::<IpAddr>().unwrap());
         assert_eq!(data.1, "232.0.0.1".parse::<IpAddr>().unwrap());
         assert_eq!(data.2, 5004);
@@ -859,11 +984,15 @@ mod tests {
         };
         drive_to_active(&mut m, key);
 
-        let data_msg = AmtMessage::MulticastData { ip_packet: vec![0x45, 0x00] };
+        let data_msg = AmtMessage::MulticastData {
+            ip_packet: vec![0x45, 0x00],
+        };
         m.handle_datagram(&data_msg.encode(), 1300).unwrap();
         assert_eq!(m.state(), GatewayState::Active);
         let events = drain(&mut m);
-        assert!(events.iter().any(|ev| matches!(ev, Event::Warning(AmtError::MalformedInner))));
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, Event::Warning(AmtError::MalformedInner))));
         assert!(!events.iter().any(|ev| matches!(ev, Event::Data { .. })));
     }
 
@@ -927,14 +1056,21 @@ mod tests {
         assert_eq!(m.pending_len(), 0);
 
         let events = drain(&mut m);
-        let update = events.iter().find_map(|ev| match ev {
-            Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
-            _ => None,
-        }).expect("expected MembershipUpdate transmit");
+        let update = events
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("expected MembershipUpdate transmit");
         // Skip AMT (12B) + IPv4(RA) (24B) to reach the IGMPv3 body.
         let report = &update[12 + 24..];
         assert_eq!(report[0], 0x22, "IGMPv3 report type");
-        assert_eq!(u16::from_be_bytes([report[6], report[7]]), 1, "single ALLOW record");
+        assert_eq!(
+            u16::from_be_bytes([report[6], report[7]]),
+            1,
+            "single ALLOW record"
+        );
         assert_eq!(report[8], 5, "record type = ALLOW_NEW_SOURCES");
     }
 
@@ -951,10 +1087,13 @@ mod tests {
         assert_eq!(m.groups().len(), 0);
 
         let events = drain(&mut m);
-        let update = events.iter().find_map(|ev| match ev {
-            Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
-            _ => None,
-        }).expect("expected MembershipUpdate transmit");
+        let update = events
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("expected MembershipUpdate transmit");
         // Skip AMT (12B) + IPv4(RA) (24B) to reach the IGMPv3 body.
         let report = &update[12 + 24..];
         assert_eq!(report[8], 6, "record type = BLOCK_OLD_SOURCES");
@@ -988,10 +1127,13 @@ mod tests {
         m.tick(1200 + ka_ms + 1).unwrap();
 
         let events = drain(&mut m);
-        let update = events.iter().find_map(|ev| match ev {
-            Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
-            _ => None,
-        }).expect("expected keep-alive Update");
+        let update = events
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("expected keep-alive Update");
         // Skip AMT (12B) + IPv4(RA) (24B) to reach the IGMPv3 body.
         let report = &update[12 + 24..];
         assert_eq!(report[0], 0x22);
@@ -1066,9 +1208,14 @@ mod tests {
         // One more tick: should give up.
         m.tick(t).unwrap();
         let events = drain(&mut m);
-        assert!(events.iter().any(|ev|
-            matches!(ev, Event::Warning(AmtError::DiscoveryFailed))));
-        assert_eq!(m.state(), GatewayState::Idle, "manager parks in Idle on give-up");
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, Event::Warning(AmtError::DiscoveryFailed))));
+        assert_eq!(
+            m.state(),
+            GatewayState::Idle,
+            "manager parks in Idle on give-up"
+        );
     }
 
     #[test]
@@ -1084,10 +1231,13 @@ mod tests {
         m.shutdown(1500).unwrap();
         assert_eq!(m.state(), GatewayState::Closed);
         let events = drain(&mut m);
-        let teardown = events.iter().find_map(|ev| match ev {
-            Event::Transmit { payload, .. } if payload[0] == 0x07 => Some(payload.clone()),
-            _ => None,
-        }).expect("expected Teardown transmit");
+        let teardown = events
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x07 => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("expected Teardown transmit");
         assert_eq!(teardown.len(), 12, "Teardown is 12 bytes");
     }
 

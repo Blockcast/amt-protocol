@@ -4,8 +4,8 @@
 //! via select! over: command channel, socket recv, sleep timer, shutdown.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -15,10 +15,10 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use super::platform::NativePlatform;
 use crate::config::AmtConfig;
 use crate::gateway::{GatewayState, GroupKey};
 use crate::subscription::{Event, SubscriptionManager};
-use super::platform::NativePlatform;
 
 /// Public data event: one demultiplexed inner UDP packet.
 #[derive(Debug, Clone)]
@@ -32,9 +32,17 @@ pub struct DataEvent {
 
 #[derive(Debug)]
 pub(crate) enum Cmd {
-    Subscribe { key: GroupKey, ack: oneshot::Sender<Result<()>> },
-    Unsubscribe { key: GroupKey, ack: oneshot::Sender<Result<()>> },
-    Shutdown { ack: oneshot::Sender<Result<()>> },
+    Subscribe {
+        key: GroupKey,
+        ack: oneshot::Sender<Result<()>>,
+    },
+    Unsubscribe {
+        key: GroupKey,
+        ack: oneshot::Sender<Result<()>>,
+    },
+    Shutdown {
+        ack: oneshot::Sender<Result<()>>,
+    },
 }
 
 pub struct AsyncAmtGateway {
@@ -130,9 +138,18 @@ impl AsyncAmtGateway {
 }
 
 impl AsyncAmtGatewayBuilder {
-    pub fn relay_port(mut self, port: u16) -> Self { self.relay_port = port; self }
-    pub fn keepalive(mut self, d: Duration) -> Self { self.keepalive = d; self }
-    pub fn log_target(mut self, t: &'static str) -> Self { self.log_target = t; self }
+    pub fn relay_port(mut self, port: u16) -> Self {
+        self.relay_port = port;
+        self
+    }
+    pub fn keepalive(mut self, d: Duration) -> Self {
+        self.keepalive = d;
+        self
+    }
+    pub fn log_target(mut self, t: &'static str) -> Self {
+        self.log_target = t;
+        self
+    }
 
     /// Build and spawn the runtime task.
     pub async fn build(self) -> Result<AsyncAmtGateway> {
@@ -197,7 +214,8 @@ async fn run_task(
 
     loop {
         // Compute next wake. If no timer is armed, sleep a long time.
-        let next_wake = mgr.next_wakeup_ms()
+        let next_wake = mgr
+            .next_wakeup_ms()
             .map(|ms| Instant::now() + duration_until(ms, now_ms_local()))
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
 
@@ -237,7 +255,13 @@ async fn run_task(
                         *fatal.lock().await = Some(anyhow!("socket send: {e}"));
                     }
                 }
-                Event::Data { src, group, src_port, dst_port, payload } => {
+                Event::Data {
+                    src,
+                    group,
+                    src_port,
+                    dst_port,
+                    payload,
+                } => {
                     let _ = data_tx.send(DataEvent {
                         src,
                         group,
@@ -326,10 +350,16 @@ impl AsyncAmtGatewayBuilderForSource {
 
 fn now_ms_local() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("time before epoch").as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time before epoch")
+        .as_millis() as u64
 }
 
 fn duration_until(deadline_ms: u64, now_ms: u64) -> Duration {
-    if deadline_ms <= now_ms { Duration::from_millis(1) }
-    else { Duration::from_millis(deadline_ms - now_ms) }
+    if deadline_ms <= now_ms {
+        Duration::from_millis(1)
+    } else {
+        Duration::from_millis(deadline_ms - now_ms)
+    }
 }

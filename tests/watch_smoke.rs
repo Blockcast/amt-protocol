@@ -2,9 +2,9 @@
 
 mod common;
 
-use std::time::Duration;
 use amt_protocol::native::AsyncAmtGateway;
 use common::fake_relay::{synth_v4_udp, FakeRelay};
+use std::time::Duration;
 
 #[tokio::test(flavor = "current_thread")]
 async fn watch_mode_emits_periodic_stats() {
