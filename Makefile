@@ -107,7 +107,7 @@ jni-build:
 		-o $(ANDROID_JNI_DIR) \
 		-- build --release --features jni --no-default-features
 	@echo "JNI output: $(ANDROID_JNI_DIR)"
-	@find $(ANDROID_JNI_DIR) -name "*.so" -exec ls -la {} \;
+	@find $(ANDROID_JNI_DIR) -name "*.so" -exec ls -la {} \
 
 # ============================================================================
 # Testing
@@ -135,6 +135,7 @@ check:
 	@echo "Checking all features..."
 	cargo check --features wasm
 	cargo check --features ffi --no-default-features
+	cargo check --features jni --no-default-features
 	@echo "All checks passed!"
 
 fmt:
