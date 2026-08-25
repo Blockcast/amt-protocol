@@ -31,6 +31,37 @@ env:
   # why that is deferred rather than landed here.
 
 jobs:
+  lint:
+    name: lint (${{ matrix.id }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: default-wasm
+            flags: ""
+          - id: ffi
+            flags: --no-default-features --features ffi
+          - id: native
+            flags: --no-default-features --features native
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint-${{ matrix.id }}
+
+      - name: cargo fmt --check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.flags }} --locked -- -D warnings
+
   test:
     # Keep these job names stable — they are the required-check names in branch
     # protection, and renaming a leg silently drops its gate.

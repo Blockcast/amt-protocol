@@ -29,12 +29,7 @@ pub async fn resolve_amt_relay(source: IpAddr) -> Result<IpAddr> {
 pub async fn resolve_with_nameservers(source: IpAddr, nameservers: &[IpAddr]) -> Result<IpAddr> {
     let query = DriadResolver::build_dns_query(source, rand_id());
     let mut last_err: Option<anyhow::Error> = None;
-    let mut attempts = 0;
-    for ns in nameservers {
-        if attempts >= MAX_ATTEMPTS {
-            break;
-        }
-        attempts += 1;
+    for ns in nameservers.iter().take(MAX_ATTEMPTS) {
         match try_one(*ns, &query).await {
             Ok(rdata) => match rdata {
                 DriadRelayAddress::Ip(ip) => return Ok(ip),
