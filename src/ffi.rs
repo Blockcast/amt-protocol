@@ -197,8 +197,13 @@ pub unsafe extern "C" fn amt_gateway_new(
 ///
 /// # Arguments
 /// - `handle`: Gateway handle from `amt_gateway_new`
+///
+/// # Safety
+/// `handle` must be null or a live handle previously returned by
+/// `amt_gateway_new` that has not already been freed. No other operation may
+/// access the gateway while it is being freed.
 #[no_mangle]
-pub extern "C" fn amt_gateway_free(handle: AmtGatewayHandle) {
+pub unsafe extern "C" fn amt_gateway_free(handle: AmtGatewayHandle) {
     if !handle.is_null() {
         unsafe {
             drop(Box::from_raw(handle as *mut AmtGateway<FfiPlatform>));
@@ -210,8 +215,14 @@ pub extern "C" fn amt_gateway_free(handle: AmtGatewayHandle) {
 ///
 /// # Arguments
 /// - `buffer`: Buffer to free
+///
+/// # Safety
+/// If `buffer.data` is non-null, `buffer` must be a buffer previously returned
+/// by this library, with its `data`, `len`, and `capacity` fields unchanged and
+/// not already freed. No other operation may access the buffer while it is
+/// being freed.
 #[no_mangle]
-pub extern "C" fn amt_buffer_free(buffer: AmtBuffer) {
+pub unsafe extern "C" fn amt_buffer_free(buffer: AmtBuffer) {
     if !buffer.data.is_null() {
         unsafe {
             drop(Vec::from_raw_parts(
@@ -234,8 +245,13 @@ pub extern "C" fn amt_buffer_free(buffer: AmtBuffer) {
 ///
 /// # Returns
 /// Current state as AmtGatewayState
+///
+/// # Safety
+/// `handle` must be null or a live handle previously returned by
+/// `amt_gateway_new`. No other operation may mutate or free the gateway while
+/// its state is being read.
 #[no_mangle]
-pub extern "C" fn amt_gateway_state(handle: AmtGatewayHandle) -> AmtGatewayState {
+pub unsafe extern "C" fn amt_gateway_state(handle: AmtGatewayHandle) -> AmtGatewayState {
     if handle.is_null() {
         return AmtGatewayState::Idle;
     }
@@ -251,8 +267,13 @@ pub extern "C" fn amt_gateway_state(handle: AmtGatewayHandle) -> AmtGatewayState
 ///
 /// # Returns
 /// Current relay port
+///
+/// # Safety
+/// `handle` must be null or a live handle previously returned by
+/// `amt_gateway_new`. No other operation may mutate or free the gateway while
+/// its relay port is being read.
 #[no_mangle]
-pub extern "C" fn amt_gateway_relay_port(handle: AmtGatewayHandle) -> u16 {
+pub unsafe extern "C" fn amt_gateway_relay_port(handle: AmtGatewayHandle) -> u16 {
     if handle.is_null() {
         return 0;
     }
@@ -597,8 +618,13 @@ pub unsafe extern "C" fn amt_gateway_send_teardown(
 ///
 /// # Arguments
 /// - `handle`: Gateway handle
+///
+/// # Safety
+/// `handle` must be null or a live handle previously returned by
+/// `amt_gateway_new`. No other operation may access the gateway concurrently
+/// while it is being reset.
 #[no_mangle]
-pub extern "C" fn amt_gateway_reset(handle: AmtGatewayHandle) {
+pub unsafe extern "C" fn amt_gateway_reset(handle: AmtGatewayHandle) {
     if !handle.is_null() {
         let gateway = unsafe { &mut *(handle as *mut AmtGateway<FfiPlatform>) };
         gateway.reset();
