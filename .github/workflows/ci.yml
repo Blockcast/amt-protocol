@@ -183,3 +183,10 @@ jobs:
             test -f "$lib" || { echo "::error::$lib missing — CGO consumers link this."; exit 1; }
             ls -l "$lib"
           done
+
+      # The JNI module is gated by a feature that the ffi selection does not
+      # imply. Check it here so gateway API changes cannot leave src/jni.rs
+      # uncompiled until an Android NDK build.
+      - name: cargo check (JNI selection)
+        if: matrix.id == 'ffi'
+        run: cargo check --no-default-features --features jni

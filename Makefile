@@ -135,6 +135,7 @@ check:
 	@echo "Checking all features..."
 	cargo check --features wasm
 	cargo check --features ffi --no-default-features
+	cargo check --features jni --no-default-features
 	@echo "All checks passed!"
 
 fmt:
