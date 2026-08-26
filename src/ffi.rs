@@ -143,8 +143,12 @@ impl AmtBuffer {
 ///
 /// # Returns
 /// AmtResult indicating success or failure
+///
+/// # Safety
+/// `relay_address` must point to a valid NUL-terminated string and `out_handle`
+/// must be valid for writing one handle.
 #[no_mangle]
-pub extern "C" fn amt_gateway_new(
+pub unsafe extern "C" fn amt_gateway_new(
     relay_address: *const c_char,
     relay_port: u16,
     enable_driad: bool,
@@ -193,8 +197,13 @@ pub extern "C" fn amt_gateway_new(
 ///
 /// # Arguments
 /// - `handle`: Gateway handle from `amt_gateway_new`
+///
+/// # Safety
+/// `handle` must be null or a live handle previously returned by
+/// `amt_gateway_new` that has not already been freed. No other operation may
+/// access the gateway while it is being freed.
 #[no_mangle]
-pub extern "C" fn amt_gateway_free(handle: AmtGatewayHandle) {
+pub unsafe extern "C" fn amt_gateway_free(handle: AmtGatewayHandle) {
     if !handle.is_null() {
         unsafe {
             drop(Box::from_raw(handle as *mut AmtGateway<FfiPlatform>));
@@ -206,8 +215,14 @@ pub extern "C" fn amt_gateway_free(handle: AmtGatewayHandle) {
 ///
 /// # Arguments
 /// - `buffer`: Buffer to free
+///
+/// # Safety
+/// If `buffer.data` is non-null, `buffer` must be a buffer previously returned
+/// by this library, with its `data`, `len`, and `capacity` fields unchanged and
+/// not already freed. No other operation may access the buffer while it is
+/// being freed.
 #[no_mangle]
-pub extern "C" fn amt_buffer_free(buffer: AmtBuffer) {
+pub unsafe extern "C" fn amt_buffer_free(buffer: AmtBuffer) {
     if !buffer.data.is_null() {
         unsafe {
             drop(Vec::from_raw_parts(
@@ -230,8 +245,13 @@ pub extern "C" fn amt_buffer_free(buffer: AmtBuffer) {
 ///
 /// # Returns
 /// Current state as AmtGatewayState
+///
+/// # Safety
+/// `handle` must be null or a live handle previously returned by
+/// `amt_gateway_new`. No other operation may mutate or free the gateway while
+/// its state is being read.
 #[no_mangle]
-pub extern "C" fn amt_gateway_state(handle: AmtGatewayHandle) -> AmtGatewayState {
+pub unsafe extern "C" fn amt_gateway_state(handle: AmtGatewayHandle) -> AmtGatewayState {
     if handle.is_null() {
         return AmtGatewayState::Idle;
     }
@@ -247,8 +267,13 @@ pub extern "C" fn amt_gateway_state(handle: AmtGatewayHandle) -> AmtGatewayState
 ///
 /// # Returns
 /// Current relay port
+///
+/// # Safety
+/// `handle` must be null or a live handle previously returned by
+/// `amt_gateway_new`. No other operation may mutate or free the gateway while
+/// its relay port is being read.
 #[no_mangle]
-pub extern "C" fn amt_gateway_relay_port(handle: AmtGatewayHandle) -> u16 {
+pub unsafe extern "C" fn amt_gateway_relay_port(handle: AmtGatewayHandle) -> u16 {
     if handle.is_null() {
         return 0;
     }
@@ -269,8 +294,12 @@ pub extern "C" fn amt_gateway_relay_port(handle: AmtGatewayHandle) -> u16 {
 ///
 /// # Returns
 /// AmtResult indicating success or failure
+///
+/// # Safety
+/// `handle` must be a valid handle returned by this library, and `out_message`
+/// must be valid for writing one buffer.
 #[no_mangle]
-pub extern "C" fn amt_gateway_start_discovery(
+pub unsafe extern "C" fn amt_gateway_start_discovery(
     handle: AmtGatewayHandle,
     out_message: *mut AmtBuffer,
 ) -> AmtResult {
@@ -306,8 +335,12 @@ pub extern "C" fn amt_gateway_start_discovery(
 ///
 /// # Returns
 /// AmtResult indicating success or failure
+///
+/// # Safety
+/// `handle` must be a valid handle returned by this library. `data` must point
+/// to `len` readable bytes.
 #[no_mangle]
-pub extern "C" fn amt_gateway_handle_advertisement(
+pub unsafe extern "C" fn amt_gateway_handle_advertisement(
     handle: AmtGatewayHandle,
     data: *const u8,
     len: usize,
@@ -345,8 +378,12 @@ pub extern "C" fn amt_gateway_handle_advertisement(
 ///
 /// # Returns
 /// AmtResult indicating success or failure
+///
+/// # Safety
+/// `handle` must be a valid handle returned by this library, and `out_message`
+/// must be valid for writing one buffer.
 #[no_mangle]
-pub extern "C" fn amt_gateway_request_membership(
+pub unsafe extern "C" fn amt_gateway_request_membership(
     handle: AmtGatewayHandle,
     p_flag: bool,
     out_message: *mut AmtBuffer,
@@ -384,8 +421,12 @@ pub extern "C" fn amt_gateway_request_membership(
 ///
 /// # Returns
 /// AmtResult indicating success or failure
+///
+/// # Safety
+/// `handle` must be a valid handle returned by this library; `data` must point
+/// to `len` readable bytes; and `out_query_data` must be valid for writing one buffer.
 #[no_mangle]
-pub extern "C" fn amt_gateway_handle_query(
+pub unsafe extern "C" fn amt_gateway_handle_query(
     handle: AmtGatewayHandle,
     data: *const u8,
     len: usize,
@@ -441,8 +482,12 @@ pub extern "C" fn amt_gateway_handle_query(
 ///
 /// # Returns
 /// AmtResult indicating success or failure
+///
+/// # Safety
+/// `handle` must be a valid handle returned by this library; `report_data` must
+/// point to `report_len` readable bytes; and `out_message` must be valid for writing.
 #[no_mangle]
-pub extern "C" fn amt_gateway_send_update(
+pub unsafe extern "C" fn amt_gateway_send_update(
     handle: AmtGatewayHandle,
     report_data: *const u8,
     report_len: usize,
@@ -482,8 +527,12 @@ pub extern "C" fn amt_gateway_send_update(
 ///
 /// # Returns
 /// AmtResult indicating success or failure
+///
+/// # Safety
+/// `handle` must be a valid handle returned by this library; `data` must point
+/// to `len` readable bytes; and `out_packet` must be valid for writing.
 #[no_mangle]
-pub extern "C" fn amt_gateway_handle_data(
+pub unsafe extern "C" fn amt_gateway_handle_data(
     handle: AmtGatewayHandle,
     data: *const u8,
     len: usize,
@@ -533,8 +582,12 @@ pub extern "C" fn amt_gateway_handle_data(
 ///
 /// # Returns
 /// AmtResult indicating success or failure
+///
+/// # Safety
+/// `handle` must be a valid handle returned by this library, and `out_message`
+/// must be valid for writing one buffer.
 #[no_mangle]
-pub extern "C" fn amt_gateway_send_teardown(
+pub unsafe extern "C" fn amt_gateway_send_teardown(
     handle: AmtGatewayHandle,
     out_message: *mut AmtBuffer,
 ) -> AmtResult {
@@ -565,8 +618,13 @@ pub extern "C" fn amt_gateway_send_teardown(
 ///
 /// # Arguments
 /// - `handle`: Gateway handle
+///
+/// # Safety
+/// `handle` must be null or a live handle previously returned by
+/// `amt_gateway_new`. No other operation may access the gateway concurrently
+/// while it is being reset.
 #[no_mangle]
-pub extern "C" fn amt_gateway_reset(handle: AmtGatewayHandle) {
+pub unsafe extern "C" fn amt_gateway_reset(handle: AmtGatewayHandle) {
     if !handle.is_null() {
         let gateway = unsafe { &mut *(handle as *mut AmtGateway<FfiPlatform>) };
         gateway.reset();
@@ -586,10 +644,14 @@ pub extern "C" fn amt_gateway_reset(handle: AmtGatewayHandle) {
 /// # Returns
 /// AmtResult indicating success or failure
 ///
+/// # Safety
+/// `source_address` must point to a valid NUL-terminated string and `out_query`
+/// must be valid for writing one string pointer.
+///
 /// # Note
 /// Caller must free the returned string with `amt_string_free`
 #[no_mangle]
-pub extern "C" fn amt_driad_build_query(
+pub unsafe extern "C" fn amt_driad_build_query(
     source_address: *const c_char,
     out_query: *mut *mut c_char,
 ) -> AmtResult {
@@ -626,8 +688,11 @@ pub extern "C" fn amt_driad_build_query(
 ///
 /// # Arguments
 /// - `s`: String to free
+///
+/// # Safety
+/// `s` must be a string pointer previously returned by this library, or null.
 #[no_mangle]
-pub extern "C" fn amt_string_free(s: *mut c_char) {
+pub unsafe extern "C" fn amt_string_free(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
             drop(CString::from_raw(s));
@@ -651,8 +716,12 @@ pub extern "C" fn amt_string_free(s: *mut c_char) {
 ///
 /// # Returns
 /// AmtResult indicating success or failure
+///
+/// # Safety
+/// Both address pointers must point to valid NUL-terminated strings and
+/// `out_report` must be valid for writing one buffer.
 #[no_mangle]
-pub extern "C" fn amt_igmp_ssm_join(
+pub unsafe extern "C" fn amt_igmp_ssm_join(
     source_address: *const c_char,
     group_address: *const c_char,
     out_report: *mut AmtBuffer,
@@ -712,8 +781,12 @@ pub extern "C" fn amt_igmp_ssm_join(
 ///
 /// # Returns
 /// AmtResult indicating success or failure
+///
+/// # Safety
+/// The address pointers must point to valid NUL-terminated strings, the group
+/// array must contain `num_groups` valid pointers, and `out_report` must be valid for writing.
 #[no_mangle]
-pub extern "C" fn amt_igmp_ssm_join_multi(
+pub unsafe extern "C" fn amt_igmp_ssm_join_multi(
     source_address: *const c_char,
     group_addresses: *const *const c_char,
     num_groups: usize,

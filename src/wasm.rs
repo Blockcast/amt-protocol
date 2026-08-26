@@ -281,6 +281,12 @@ pub struct JsIgmpReport {
     inner: IgmpV3Report,
 }
 
+impl Default for JsIgmpReport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[wasm_bindgen]
 impl JsIgmpReport {
     /// Create new IGMP report
@@ -367,6 +373,12 @@ impl JsIgmpReport {
 #[wasm_bindgen]
 pub struct JsMldReport {
     inner: MldV2Report,
+}
+
+impl Default for JsMldReport {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[wasm_bindgen]

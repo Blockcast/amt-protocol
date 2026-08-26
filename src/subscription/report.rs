@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn current_state_v4_wraps_in_ip_with_records() {
-        let keys = vec![
+        let keys = [
             k("232.0.0.1", Some("10.0.0.1")),
             k("232.0.0.2", Some("10.0.0.1")),
         ];

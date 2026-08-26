@@ -103,6 +103,7 @@ impl FakeRelay {
 }
 
 /// Build a synthetic IPv6+UDP inner packet for fake MulticastData (v6 tests).
+#[allow(dead_code)]
 pub fn synth_v6_udp(src: [u8; 16], dst: [u8; 16], sp: u16, dp: u16, payload: &[u8]) -> Vec<u8> {
     let mut buf = vec![0x60, 0x00, 0x00, 0x00]; // version=6, traffic class+flow label=0
     let payload_len: u16 = 8 + payload.len() as u16;
