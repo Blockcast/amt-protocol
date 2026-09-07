@@ -6,8 +6,8 @@
 //! multicast group. The source network operator configures DNS records for their
 //! source IPs to advertise which AMT relay(s) can tunnel their traffic.
 //!
-//! Example: For source 69.25.95.10 sending to group 232.0.0.1:
-//!   Query: 10.95.25.69.in-addr.arpa (source-based, NOT group-based)
+//! Example: For source 192.0.2.10 sending to group 232.0.0.1:
+//!   Query: 10.2.0.192.in-addr.arpa (source-based, NOT group-based)
 //!
 //! This module provides:
 //! - DNS query name construction (for DoH or text display)
@@ -55,7 +55,7 @@ impl DriadResolver {
     /// Build DRIAD query name for IPv4 source address (RFC 8777)
     ///
     /// Format: <reverse-source-ip>.in-addr.arpa
-    /// Example: 10.95.25.69.in-addr.arpa for source 69.25.95.10
+    /// Example: 10.2.0.192.in-addr.arpa for source 192.0.2.10
     pub fn build_query_ipv4(source: Ipv4Addr) -> String {
         let octets = source.octets();
         format!(

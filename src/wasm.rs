@@ -300,7 +300,7 @@ impl JsIgmpReport {
     /// Add SSM (source-specific) join record
     ///
     /// @param group - Multicast group address (e.g., "232.0.0.1")
-    /// @param source - Source address (e.g., "69.25.95.10")
+    /// @param source - Source address (e.g., "192.0.2.10")
     #[wasm_bindgen(js_name = addSsmJoin)]
     pub fn add_ssm_join(&mut self, group: &str, source: &str) -> Result<(), JsValue> {
         let group_addr: Ipv4Addr = group
@@ -447,7 +447,7 @@ impl JsDriad {
     /// Build DRIAD query name for multicast source address (RFC 8777)
     ///
     /// @param source - Multicast source address (IPv4 or IPv6) - NOT the group!
-    /// @returns DNS query name (e.g., "10.95.25.69.in-addr.arpa" for source 69.25.95.10)
+    /// @returns DNS query name (e.g., "10.2.0.192.in-addr.arpa" for source 192.0.2.10)
     #[wasm_bindgen(js_name = buildQuery)]
     pub fn build_query(source: &str) -> Result<String, JsValue> {
         let addr: IpAddr = source
