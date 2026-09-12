@@ -554,7 +554,11 @@ struct TunnelsReport {
     /// here ("Too many open files") — those are the INSTRUMENT's ceiling, not
     /// the relay's, and must not be recorded as a state knee.
     establish_errors: BTreeMap<String, u32>,
-    /// Post-hold survival failures grouped by reason.
+    /// Post-hold survival failures grouped by reason. As with
+    /// `establish_errors`, separate the INSTRUMENT from the relay:
+    /// `fatal_runtime_error` is this process's socket dying and must not be
+    /// recorded as a state knee, whereas `state_left_active` /
+    /// `no_keepalive_sent` are the tunnel genuinely failing to survive.
     not_alive: BTreeMap<String, u32>,
     caveat: &'static str,
 }
@@ -749,7 +753,15 @@ async fn run_tunnels(
     for (gw, establish_ms) in &up {
         let keepalives = gw.keepalives_sent();
         let rx = gw.rx_datagrams();
-        outcomes.push(if gw.state() != GatewayState::Active {
+        outcomes.push(if gw.has_fatal().await {
+            // Unrecoverable socket error in this gateway's runtime. Attributed
+            // separately from `state_left_active` because it is the INSTRUMENT
+            // failing, not the relay evicting state — reading a host-side send
+            // failure as a relay knee is how a ramp under-reports the ceiling.
+            TunnelOutcome::NotAlive {
+                reason: "fatal_runtime_error",
+            }
+        } else if gw.state() != GatewayState::Active {
             TunnelOutcome::NotAlive {
                 reason: "state_left_active",
             }

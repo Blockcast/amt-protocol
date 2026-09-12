@@ -54,8 +54,10 @@ pub struct AsyncAmtGateway {
     /// the spawned task exited because of one. `shutdown()` checks this and
     /// returns Err(...) instead of Ok(()) when set.
     pub(crate) fatal: Arc<Mutex<Option<anyhow::Error>>>,
-    /// Membership Updates transmitted AFTER the handshake completed, i.e.
-    /// keep-alives. The initial current-state Update is excluded: the runtime
+    /// Membership Updates SUCCESSFULLY transmitted after the handshake
+    /// completed, i.e. keep-alives. Incremented only once `send_to` has
+    /// returned Ok, so a keep-alive that failed to leave the process is not
+    /// counted. The initial current-state Update is excluded: the runtime
     /// drains `Transmit` before the `HandshakeComplete` that stores `Active`,
     /// so at that point `state` still reads the pre-handshake value.
     ///
@@ -127,6 +129,17 @@ impl AsyncAmtGateway {
     /// Datagrams received from the relay on this tunnel's socket.
     pub fn rx_datagrams(&self) -> u64 {
         self.rx_datagrams.load(Ordering::Relaxed)
+    }
+
+    /// True once the runtime task has recorded an unrecoverable socket error.
+    ///
+    /// This is the INSTRUMENT failing, not the relay withdrawing state, and the
+    /// distinction matters to anything measuring a ceiling: a host-side send
+    /// failure at high tunnel counts must not be recorded as a relay-side knee
+    /// (BLO-33457). `state()` alone is not a sufficient liveness test — prefer
+    /// checking this first when classifying a tunnel.
+    pub async fn has_fatal(&self) -> bool {
+        self.fatal.lock().await.is_some()
     }
 
     pub async fn subscribe(&self, group: IpAddr, source: Option<IpAddr>) -> Result<()> {
@@ -316,16 +329,21 @@ async fn run_task(
         while let Some(ev) = mgr.poll_event() {
             match ev {
                 Event::Transmit { dst, port, payload } => {
-                    // Counted BEFORE the HandshakeComplete arm below stores
+                    // Sampled BEFORE the HandshakeComplete arm below stores
                     // `Active`, so the initial current-state Update is excluded
                     // and this counts keep-alives only. See field docs.
-                    if state.load(Ordering::SeqCst) == state_to_u8(GatewayState::Active) {
-                        keepalives.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let is_keepalive =
+                        state.load(Ordering::SeqCst) == state_to_u8(GatewayState::Active);
                     let target = SocketAddr::new(dst, port);
                     if let Err(e) = sock.send_to(&payload, target).await {
                         tracing::error!(target: "amt", error=?e, "socket send error (fatal)");
                         *fatal.lock().await = Some(anyhow!("socket send: {e}"));
+                    } else if is_keepalive {
+                        // Only after the datagram has actually left the process.
+                        // Counting before the send let a FAILED keep-alive leave
+                        // `state == Active && keepalives_sent >= 1`, which is the
+                        // exact shape a caller reads as a surviving tunnel.
+                        keepalives.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Event::Data {
@@ -362,6 +380,15 @@ async fn run_task(
             break;
         }
     }
+
+    // Every exit above means this task is gone: graceful close, dropped command
+    // channel, or a fatal socket error. `mgr` does not observe socket failures,
+    // so after a fatal send/recv it still reports `Active` — and the store above
+    // would publish that as the final public state, leaving a DEAD tunnel
+    // readable as a live one. The recv-error arm also breaks past that store
+    // entirely. Publishing Closed here is what makes `state()` honest on every
+    // path, so no caller can count a dead gateway as occupancy (BLO-33457).
+    state.store(state_to_u8(GatewayState::Closed), Ordering::SeqCst);
 }
 
 fn handle_cmd(
