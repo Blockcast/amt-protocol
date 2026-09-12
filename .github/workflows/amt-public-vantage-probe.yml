@@ -188,13 +188,38 @@ jobs:
           echo "tunnels_requested=$TUNNELS"
           echo "ulimit_n_soft=$(ulimit -Sn) ulimit_n_hard=$(ulimit -Hn)"
           echo "nproc=$(nproc)"
-          i=0; status=0; ok=0
+          # BLO-26574 Amendment 12g, Finding 1. The relay keys tunnel state on
+          # the outer source ADDRESS only -- `amt_request_handler` compares
+          # `tunnel->addr.ip4 == iph->saddr` with no port term (amt.c:3692),
+          # `amt_update_handler` matches the same way (amt.c:3330), and on a
+          # match `send:` OVERWRITES tunnel->source_port and tunnel->nonce
+          # (amt.c:3759-3766). So a later Request from the same address steals
+          # the one tunnel, and the earlier gateway's Membership Updates are
+          # then dropped as `Invalid MAC` (amt.c:3333-3341). N processes in one
+          # `--network host` netns therefore produce ONE tunnel, not N.
+          # k is how many distinct source addresses this rig can present;
+          # N_established can never exceed it. Recorded so that a clean-looking
+          # receipt cannot be read as fan-out it never generated.
+          echo "distinct_source_ips=1"
+          if [ "$TUNNELS" -gt 1 ]; then
+            echo "fanout_capable=no (k=1 < TUNNELS=$TUNNELS; void as a relay result)"
+          else
+            echo "fanout_capable=yes (k=1 >= TUNNELS=$TUNNELS)"
+          fi
+          i=0; ok=0
           for p in $pids; do
             i=$((i+1))
             wait "$p"; s=$?
-            [ "$i" = 1 ] && status=$s
-            [ "$s" = 0 ] && ok=$((ok+1))
-            echo "tunnel_exit[$i]=$s"
+            # BLO-26574 (CTO ruling item 5). amt-verify exits 1 on
+            # `outcome: timeout`, which is the NORMAL end of a bounded sample --
+            # so the exit code alone cannot separate a healthy 90s probe from a
+            # tunnel that received nothing. packet_count is the verdict: >0 is a
+            # successful sample whatever the outcome, ==0 is a failure. Fails
+            # closed -- a missing, empty or unparseable receipt lands on 0.
+            pc=$(jq -r '.packet_count // 0' "report-$i.json" 2>/dev/null || echo 0)
+            case "$pc" in ''|*[!0-9]*) pc=0 ;; esac
+            [ "$pc" -gt 0 ] && ok=$((ok+1))
+            echo "tunnel_exit[$i]=$s packet_count[$i]=$pc"
           done
           t1=$(date +%s%3N)
           udp_after=$(udp_counters)
@@ -231,8 +256,7 @@ jobs:
               for (i = 2; i <= nh; i++) out = out sprintf(" %s=%d", H[i], A[i] - B[i])
               printf "udp_delta%s\n", out
             }'
-          echo "tunnels_exit_zero=$ok/$TUNNELS"
-          echo "amt_verify_exit=$status"
+          echo "tunnels_receiving=$ok/$TUNNELS"
           # BLO-27413: receiver-side saturation witness. The relay fans one
           # multicast stream into N unicast tunnels, so the receiving vantage
           # absorbs N x stream_bitrate. Without a per-tunnel bitrate there is no
@@ -254,7 +278,16 @@ jobs:
           # `if`, not `[ ] && { }` — the latter returns 1 when TUNNELS != 1 and
           # GitHub runs this under `bash -e`, so it would abort every ramp step.
           if [ "$TUNNELS" = 1 ]; then echo '--- verbose-1.log ---'; cat verbose-1.log || true; fi
-          sha256sum report-*.json verbose-*.log
+          # Ally review (head ada02515): TUNNELS=1 must stay artifact-compatible
+          # with the single `docker run` this step replaced -- downstream
+          # consumers fetch `report.json` and `verbose.log` BY NAME, and the
+          # indexed rename would have made them silently miss the receipt.
+          # Keep the indexed files as the uniform internal contract and add the
+          # legacy names as aliases for the one-tunnel case, so both shapes
+          # resolve. Globs below are `report*` / `verbose*` (no dash) to cover
+          # the aliases as well as the indexed files.
+          if [ "$TUNNELS" = 1 ]; then cp report-1.json report.json; cp verbose-1.log verbose.log; fi
+          sha256sum report*.json verbose*.log
           # BLO-26574: the (S,G) GUARD. The dispatch defaults are cast
           # (69.25.95.192, 232.1.1.60); a caller who omits inputs silently
           # measures a different stream than intended, and until now the `sg=`
@@ -273,11 +306,29 @@ jobs:
           echo "sg_guard=ok ($SOURCE,$GROUP) on $TUNNELS receipt(s)"
           # A probe that cannot fail is not a probe: surface the client's verdict
           # as the job's verdict. Receipts still upload via `if: always()`.
-          exit "$status"
+          #
+          # Ally review (head ada02515): this used to `exit "$status"`, which
+          # carried TUNNEL 1's exit code -- so a healthy first tunnel made the
+          # whole N-tunnel step green even when every later tunnel failed, and
+          # `tunnels_exit_zero` was printed but never consulted. The verdict is
+          # now the aggregate over packet_count, not tunnel 1's exit status.
+          #
+          # Deliberate divergence from that review, flagged rather than taken
+          # quietly: it asked to "keep the single-tunnel exit code unchanged",
+          # but the CTO ruling (item 5) is that the single-tunnel code is itself
+          # the defect -- `outcome: timeout` with packet_count > 0 is a
+          # SUCCESSFUL bounded sample and must exit 0. Both cases are therefore
+          # decided by packet_count. Consumers should still parse packet_count
+          # rather than the run conclusion.
+          if [ "$ok" -ne "$TUNNELS" ]; then
+            echo "::error::$((TUNNELS - ok)) of $TUNNELS tunnel(s) received no data (packet_count=0)"
+            exit 1
+          fi
+          exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: amt-verify-receipt
           path: |
-            report-*.json
-            verbose-*.log
+            report*.json
+            verbose*.log
