@@ -40,7 +40,15 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_driad: bool,
 
-    /// Wait at most this many seconds for first data
+    /// OVERALL deadline for the one-shot data phase, in seconds — not a
+    /// first-data timeout and not a per-packet idle timeout. The clock starts
+    /// at `subscribe()` and covers all `--packet-count` packets, so a run
+    /// cannot exceed it however the stream behaves.
+    ///
+    /// On expiry the run still emits its report with `outcome: "timeout"` and
+    /// the PARTIAL `packet_count` / `byte_count` observed so far; the exit code
+    /// is unchanged (1). That partial count is the datum a saturation probe
+    /// needs — see BLO-33456.
     #[arg(long, default_value = "30")]
     timeout: u64,
 
@@ -150,21 +158,43 @@ impl ExitCategory {
 
 #[derive(serde::Serialize)]
 struct OneshotReport {
+    /// "ok" — `--packet-count` packets observed. "timeout" — the `--timeout`
+    /// deadline expired first. "closed" — the tunnel's data broadcast ended
+    /// first, which is a TRANSPORT failure and not a deadline observation; do
+    /// not feed a "closed" run into a rate or loss calculation. In both failure
+    /// cases `packet_count`/`byte_count` are PARTIAL (and may be 0) but are
+    /// still real observations, not placeholders.
     outcome: &'static str,
     packet_count: u64,
     byte_count: u64,
-    first_data: u64,
+    /// Wall time from the completion of `subscribe()` to the last packet
+    /// counted, measured in-process. It deliberately EXCLUDES the handshake, as
+    /// well as container and process startup, so `packet_count / elapsed_ms` is
+    /// a receiver rate that needs no two-run solve for the startup constant.
+    /// (`first_data` is the field that still includes join latency.) `null` if
+    /// no packet arrived.
+    elapsed_ms: Option<u64>,
+    /// Packets the receiver's broadcast channel dropped before this process
+    /// dequeued them. NOT included in `packet_count`. Non-zero means the
+    /// receiver could not keep up, so any shortfall against the source is a
+    /// RECEIVER artifact and must not be attributed to relay loss.
+    lagged_count: u64,
+    /// Time from process start to the first matching packet, INCLUDING the
+    /// subscribe/handshake join latency — i.e. "how long until data flowed",
+    /// which is the pre-existing meaning of this field. Use `elapsed_ms`, not
+    /// this, as a rate denominator. `null` if no packet arrived.
+    first_data: Option<u64>,
     relay: String,
     family: &'static str,
     group: String,
     source: Option<String>,
     timings_ms: Timings,
-    first_packet: FirstPacket,
+    first_packet: Option<FirstPacket>,
 }
 
 #[derive(serde::Serialize)]
 struct Timings {
-    first_data: u64,
+    first_data: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -263,43 +293,68 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
 
     let mut data_rx = gw.subscribe_data();
 
+    // Two clocks, deliberately. `started` runs from before subscribe() and
+    // feeds `first_data`, whose pre-existing meaning is "time from invocation
+    // to first data" and so legitimately includes join latency. `data_started`
+    // runs from AFTER the handshake and feeds `elapsed_ms`, which exists to be
+    // a rate denominator — folding a variable handshake into it is exactly the
+    // startup constant the field was added to eliminate (BLO-33456).
     let started = Instant::now();
     gw.subscribe(args.group, Some(args.source))
         .await
         .map_err(ExitCategory::HandshakeFail)?;
+    let data_started = Instant::now();
 
-    let first_evt = match recv_first_matching(
-        &mut data_rx,
-        args.group,
-        args.source,
-        Duration::from_secs(args.timeout),
-    )
-    .await
-    {
-        Ok(e) => e,
-        Err(e) => return Err(ExitCategory::HandshakeFail(e)),
-    };
-    let first_data_ms = started.elapsed().as_millis() as u64;
-    let mut packet_count = 1;
-    let mut byte_count = first_evt.payload.len() as u64;
+    // One overall deadline for the whole data phase, established before the
+    // first recv and shared by every packet. Previously each packet got a fresh
+    // `--timeout`, so an N-packet run could run for N x timeout.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
+
+    let mut packet_count: u64 = 0;
+    let mut byte_count: u64 = 0;
+    let mut first_evt = None;
+    let mut first_data_ms = None;
+    let mut elapsed_ms = None;
+    // Held, not returned, until the report has been emitted: the partial counts
+    // are the point of the probe and must survive the failure path.
+    let mut stopped: Option<RecvStop> = None;
+    let mut lagged_count: u64 = 0;
+
     while packet_count < args.packet_count {
-        let evt = recv_first_matching(
+        match recv_first_matching(
             &mut data_rx,
             args.group,
             args.source,
-            Duration::from_secs(args.timeout),
+            deadline,
+            &mut lagged_count,
         )
         .await
-        .map_err(ExitCategory::HandshakeFail)?;
-        packet_count += 1;
-        byte_count += evt.payload.len() as u64;
+        {
+            Ok(evt) => {
+                packet_count += 1;
+                byte_count += evt.payload.len() as u64;
+                elapsed_ms = Some(data_started.elapsed().as_millis() as u64);
+                if first_evt.is_none() {
+                    first_data_ms = Some(started.elapsed().as_millis() as u64);
+                    first_evt = Some(evt);
+                }
+            }
+            Err(stop) => {
+                stopped = Some(stop);
+                break;
+            }
+        }
     }
+
+    let outcome = stopped.map_or("ok", RecvStop::outcome);
 
     if args.json {
         let report = OneshotReport {
-            outcome: "ok",
+            outcome,
             packet_count,
             byte_count,
+            elapsed_ms,
+            lagged_count,
             first_data: first_data_ms,
             relay: resolved_relay.to_string(),
             family: family_str,
@@ -308,30 +363,43 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             timings_ms: Timings {
                 first_data: first_data_ms,
             },
-            first_packet: FirstPacket {
-                src: format!("{}:{}", first_evt.src, first_evt.src_port),
-                dst_port: first_evt.dst_port,
-                len: first_evt.payload.len(),
-            },
+            first_packet: first_evt.as_ref().map(|e| FirstPacket {
+                src: format!("{}:{}", e.src, e.src_port),
+                dst_port: e.dst_port,
+                len: e.payload.len(),
+            }),
         };
         println!(
             "{}",
             serde_json::to_string(&report).map_err(|e| ExitCategory::Fatal(e.into()))?
         );
     } else {
+        let first = first_evt
+            .as_ref()
+            .map(|e| format!("{}:{} len={}", e.src, e.src_port, e.payload.len()))
+            .unwrap_or_else(|| "none".to_string());
         println!(
-            "ok — relay={} family={} group={} source={} packets={} bytes={} first_data={}ms first_pkt={}:{} len={}",
+            "{} — relay={} family={} group={} source={} packets={} bytes={} lagged={} elapsed={}ms first_data={}ms first_pkt={}",
+            outcome,
             resolved_relay,
             family_str,
             args.group,
             args.source,
             packet_count,
             byte_count,
-            first_data_ms,
-            first_evt.src,
-            first_evt.src_port,
-            first_evt.payload.len()
+            lagged_count,
+            elapsed_ms.map_or(-1i64, |v| v as i64),
+            first_data_ms.map_or(-1i64, |v| v as i64),
+            first,
         );
+    }
+
+    // Exit-code semantics unchanged: any early stop is still HandshakeFail
+    // (exit 1). The only change is that the report is on stdout first.
+    if let Some(stop) = stopped {
+        return Err(ExitCategory::HandshakeFail(
+            stop.into_err(args.group, args.source),
+        ));
     }
 
     if args.watch {
@@ -346,44 +414,72 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     Ok(())
 }
 
+/// Receive the next packet matching (group, source), bounded by a caller-owned
+/// OVERALL `deadline` rather than a per-call duration — so successive calls
+/// share one budget instead of each getting a fresh one.
+///
+/// `lagged` accumulates packets the broadcast channel dropped before this
+/// process could dequeue them. They are NOT counted in `packet_count`, so a
+/// non-zero value means the reported rate understates what the relay delivered
+/// — a receiver-side artifact that must not be read as relay loss.
 async fn recv_first_matching(
     rx: &mut tokio::sync::broadcast::Receiver<amt_protocol::native::DataEvent>,
     group: IpAddr,
     source: IpAddr,
-    timeout: Duration,
-) -> Result<amt_protocol::native::DataEvent> {
+    deadline: tokio::time::Instant,
+    lagged: &mut u64,
+) -> std::result::Result<amt_protocol::native::DataEvent, RecvStop> {
     use tokio::sync::broadcast::error::RecvError;
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
-            .ok_or_else(|| {
-                anyhow!(
-                    "timed out after {}s waiting for first data matching ({}, {})",
-                    timeout.as_secs(),
-                    group,
-                    source
-                )
-            })?;
+            .ok_or(RecvStop::Deadline)?;
         let recv = tokio::time::timeout(remaining, rx.recv())
             .await
-            .map_err(|_| {
-                anyhow!(
-                    "timed out after {}s waiting for first data matching ({}, {})",
-                    timeout.as_secs(),
-                    group,
-                    source
-                )
-            })?;
+            .map_err(|_| RecvStop::Deadline)?;
         match recv {
             Ok(evt) if evt.group == group && evt.src == source => return Ok(evt),
             Ok(_skip) => continue,
-            Err(RecvError::Lagged(_)) => continue,
-            Err(RecvError::Closed) => {
-                return Err(anyhow!(
-                    "data broadcast closed before first matching packet"
-                ));
+            Err(RecvError::Lagged(skipped)) => {
+                *lagged += skipped;
+                continue;
             }
+            Err(RecvError::Closed) => return Err(RecvStop::Closed),
+        }
+    }
+}
+
+fn timed_out_err(group: IpAddr, source: IpAddr) -> anyhow::Error {
+    anyhow!("--timeout deadline expired waiting for data matching ({group}, {source})")
+}
+
+/// Why the data phase stopped early. These are NOT interchangeable: only
+/// `Deadline` is a `--timeout` expiry, i.e. a valid observation that the stream
+/// was slower than the budget. `Closed` means the tunnel's data broadcast went
+/// away, so the partial counts stop for a transport reason and reporting them
+/// as `outcome: "timeout"` would fabricate a deadline observation that never
+/// happened. Both still emit a report — the counts banked before the stop are
+/// real either way (BLO-33456) — but under distinct `outcome` values.
+#[derive(Copy, Clone, Debug)]
+enum RecvStop {
+    Deadline,
+    Closed,
+}
+
+impl RecvStop {
+    fn outcome(self) -> &'static str {
+        match self {
+            RecvStop::Deadline => "timeout",
+            RecvStop::Closed => "closed",
+        }
+    }
+
+    fn into_err(self, group: IpAddr, source: IpAddr) -> anyhow::Error {
+        match self {
+            RecvStop::Deadline => timed_out_err(group, source),
+            RecvStop::Closed => anyhow!(
+                "data broadcast closed before the requested packet count was reached ({group}, {source})"
+            ),
         }
     }
 }
@@ -855,4 +951,79 @@ async fn run_tunnels(
 enum TunnelSlot {
     Up(AsyncAmtGateway, u64),
     Failed(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use amt_protocol::native::DataEvent;
+    use bytes::Bytes;
+
+    fn evt(src: [u8; 4], group: [u8; 4]) -> DataEvent {
+        DataEvent {
+            src: IpAddr::from(src),
+            group: IpAddr::from(group),
+            src_port: 5004,
+            dst_port: 5005,
+            payload: Bytes::from_static(b"x"),
+        }
+    }
+
+    const SRC: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+    const GROUP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(232, 0, 0, 1));
+
+    // BLO-33456 review follow-up. A closed data broadcast and an expired
+    // deadline both ended the data phase via the same `anyhow::Error`, so a
+    // transport failure was reported as `outcome: "timeout"` — a deadline
+    // observation that never happened. These two cases must stay distinct.
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_broadcast_is_not_reported_as_a_deadline_expiry() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<DataEvent>(8);
+        drop(tx);
+
+        let mut lagged = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let stop = recv_first_matching(&mut rx, GROUP, SRC, deadline, &mut lagged)
+            .await
+            .expect_err("closed channel must stop the data phase");
+
+        assert!(matches!(stop, RecvStop::Closed), "{stop:?}");
+        assert_eq!(stop.outcome(), "closed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_deadline_is_reported_as_a_timeout() {
+        // Sender held open, so the only thing that can end the wait is the
+        // deadline — the control for the test above.
+        let (_tx, mut rx) = tokio::sync::broadcast::channel::<DataEvent>(8);
+
+        let mut lagged = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let stop = recv_first_matching(&mut rx, GROUP, SRC, deadline, &mut lagged)
+            .await
+            .expect_err("expired deadline must stop the data phase");
+
+        assert!(matches!(stop, RecvStop::Deadline), "{stop:?}");
+        assert_eq!(stop.outcome(), "timeout");
+    }
+
+    // Non-matching traffic must not consume the budget as a match, and lagged
+    // packets must be counted but not returned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_matching_packets_are_skipped_and_matching_one_returned() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<DataEvent>(8);
+        tx.send(evt([10, 0, 0, 9], [232, 0, 0, 1])).unwrap(); // wrong source
+        tx.send(evt([10, 0, 0, 1], [232, 0, 0, 9])).unwrap(); // wrong group
+        tx.send(evt([10, 0, 0, 1], [232, 0, 0, 1])).unwrap(); // match
+
+        let mut lagged = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let got = recv_first_matching(&mut rx, GROUP, SRC, deadline, &mut lagged)
+            .await
+            .expect("matching packet");
+
+        assert_eq!(got.src, SRC);
+        assert_eq!(got.group, GROUP);
+        assert_eq!(lagged, 0);
+    }
 }
