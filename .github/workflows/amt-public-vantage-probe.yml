@@ -50,6 +50,8 @@ jobs:
         run: |
           docker pull -q ghcr.io/blockcast/amt-verify:main
           echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/blockcast/amt-verify:main)"
+          # BLO-21823 AC#3 wants the client commit alongside the artifact hash.
+          echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/blockcast/amt-verify:main)"
           set +e
           docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
             --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
