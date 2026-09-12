@@ -310,6 +310,21 @@ async fn run_task(
                 match r {
                     Ok((n, _)) => {
                         rx_datagrams.fetch_add(1, Ordering::Relaxed);
+                        // A datagram that exactly fills the buffer was almost
+                        // certainly truncated by recv_from — the kernel gives us
+                        // no way to tell those apart, and the excess is simply
+                        // discarded. Silent truncation is the real hazard of the
+                        // `recv_buf_bytes` knob (a lowered control-plane buffer
+                        // corrupts inner packets rather than erroring), so make
+                        // it audible instead of letting it corrupt quietly.
+                        if n == buf.len() {
+                            tracing::warn!(
+                                target: "amt",
+                                bytes = n,
+                                "datagram filled the receive buffer and was probably \
+                                 TRUNCATED; raise recv_buf_bytes if this tunnel carries data"
+                            );
+                        }
                         let _ = mgr.handle_datagram(&buf[..n], now_ms_local());
                     }
                     Err(e) => {
