@@ -41,8 +41,16 @@ on:
         description: >-
           tunnels-ramp only. Comma-separated N values, ascending. The cap is
           AMT_MAX_TUNNELS=10000 on production-amt-relay-linux (read live from
-          amt_relay_tunnel_limit, 2026-09-12).
-        default: "1,8,64,256,1024,4096,8192,10000"
+          amt_relay_tunnel_limit, 2026-09-12), but the DEFAULT stops at 1024:
+          4096/8192/10000 are withheld pending a working relay-side occupancy
+          instrument (CTO ruling 2026-09-12). 1024 against a 10000 cap cannot
+          displace a live subscriber even if the table is occupied, which is why
+          it is safe without one; the larger steps rested on "the table is
+          empty", and the only evidence for that was amt_relay_active_tunnels,
+          which is the gauge the same ruling declared dead. Raise this only with
+          an occupancy reading that has been shown capable of returning a
+          positive.
+        default: "1,8,64,256,1024"
       hold:
         description: >-
           tunnels-ramp only. Seconds to hold tunnels open after the last one is
@@ -60,6 +68,22 @@ on:
 permissions:
   contents: read
   packages: read
+
+# THE IMAGE IS PINNED TO THE CHECKOUT, and that is the whole point.
+#
+# This was `:main` in all eight places. `:main` is whatever was last pushed to
+# main, which is NOT the ref this run checked out -- so a run dispatched from a
+# branch executes main's client while every string the job emits (the ramp
+# contract, CONTROL_PLANE_CAVEAT, the receiver-side witness classify_held_tunnel)
+# comes from the branch. The witness under test is then not the witness that
+# runs, and the artifact reports the branch's caveat over main's measurement.
+#
+# publish-amt-verify.yml already pushes ghcr.io/blockcast/amt-verify:<sha> on
+# every main build, so pinning to github.sha costs nothing and cannot go stale:
+# the tag IS the commit. If no image exists for this ref the pull fails loudly,
+# which is correct -- a ramp against code that was never built is void.
+env:
+  IMAGE: ghcr.io/blockcast/amt-verify:${{ github.sha }}
 
 jobs:
   probe:
@@ -84,13 +108,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: amt-verify (real client, public vantage)
         run: |
-          docker pull -q ghcr.io/blockcast/amt-verify:main
-          echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/blockcast/amt-verify:main)"
+          docker pull -q $IMAGE
+          echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE)"
           # BLO-21823 AC#3 wants the client commit alongside the artifact hash.
-          echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/blockcast/amt-verify:main)"
+          echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"
           set +e
           t0=$(date +%s%3N)
-          docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
+          docker run --rm --network host $IMAGE \
             --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
             --timeout "$TIMEOUT" --packet-count "$PACKETS" --json --verbose \
             >report.json 2>verbose.log
@@ -289,13 +313,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The tag pins by construction; this ASSERTS it. A receipt that is recorded
+      # and never compared is the same record-but-don't-enforce shape as the ramp
+      # contract and the host ceilings -- it reads as a guard in the artifact and
+      # guards nothing. Two lines, and it also catches the one case the tag alone
+      # cannot: a build that published under this sha with a different revision
+      # label.
       - name: Image receipt
         run: |
-          docker pull -q ghcr.io/blockcast/amt-verify:main
+          docker pull -q $IMAGE
           {
-            echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/blockcast/amt-verify:main)"
-            echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/blockcast/amt-verify:main)"
+            echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE)"
+            echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"
+            echo "workflow_sha=${{ github.sha }}"
           } | tee image-receipt.txt
+          cc=$(sed -n 's/^client_commit=//p' image-receipt.txt)
+          [ "$cc" = "${{ github.sha }}" ] || {
+            echo "::error::image revision ($cc) != checkout (${{ github.sha }}) -- the client under test is not the client that would run"; exit 1; }
+
+      # BASELINE OCCUPANCY, before the ramp adds anything.
+      #
+      # The withheld cap steps rested on "the linux relay has served zero tunnels
+      # for a week, so there is no live subscriber to displace". That read
+      # amt_relay_active_tunnels=0 as a fact about the relay when it is a fact
+      # about the gauge -- the same gauge a two-tunnel control had already shown
+      # stays flat at 0 while two tunnels were held. This records what the relay
+      # says about ITSELF instead, before the ramp perturbs it. Non-fatal: it is
+      # evidence for sizing the NEXT run, not a gate on this one.
+      - name: Baseline relay occupancy (_astats, pre-ramp)
+        run: |
+          curl -fsS -m 5 "http://$RELAY:8080/_astats" | tee astats-baseline.json || \
+            echo "::warning::_astats unreachable from this public vantage -- baseline unknown, and the candidate occupancy instrument cannot be qualified from here"
 
       # POSITIVE CONTROL, and it gates the ramp.
       #
@@ -311,7 +359,7 @@ jobs:
           set +e
           docker run --rm --network host \
             --ulimit "nofile=$CONTAINER_NOFILE:$CONTAINER_NOFILE" \
-            ghcr.io/blockcast/amt-verify:main \
+            $IMAGE \
             --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
             --tunnels 1 --keepalive "$KEEPALIVE" --hold "$HOLD" --json \
             >control.json 2>control.log
@@ -330,6 +378,31 @@ jobs:
       # but they stay: they are what lets a step be correlated with the relay
       # pod's own CPU/memory series, with LB behaviour, or with anything else
       # measured later. Unrecordable after the fact, cheap now.
+      #
+      # CANDIDATE OCCUPANCY INSTRUMENT, SAMPLED UNDER QUALIFICATION.
+      #
+      # The relay serves its own stats as JSON on :8080/_astats, and that
+      # surface is NOT the dead gauge. Measured in-cluster 2026-09-12, same pod,
+      # seconds apart: _astats "amt.relay.active_tunnels"=29 while the Prometheus
+      # exporter's amt_relay_active_tunnels=0. So this one demonstrably returns a
+      # positive, which is exactly the property the gauge lacks.
+      #
+      # It is sampled here as an OBSERVATION and deliberately does NOT gate the
+      # step -- enforcing an instrument on the same run that is meant to qualify
+      # it is circular, and a 0 here would then void a ramp for the instrument's
+      # fault rather than the relay's. Qualification criterion, applied by hand
+      # to the artifact afterwards: does peak occupancy TRACK the requested N?
+      # If it moves to ~1024 while 1024 tunnels are held, it is qualified and it
+      # licenses the withheld cap steps. If it reads 0, it is a seventh dead dial.
+      #
+      # Both counters are kept because they are DIFFERENT FIELDS and were not
+      # equal when measured (relay.active_tunnels=29, interface.amtr.tunnels=47).
+      # Which of them tracks N is part of what this run establishes; assuming
+      # they are the same number is how a wrong one gets adopted.
+      #
+      # Public reachability of :8080 is unverified -- the pre-run read was via
+      # the LB IP from in-cluster, which kube-proxy may short-circuit. An
+      # unreachable endpoint records {} and costs the run nothing.
       - name: Ramp
         run: |
           echo '[]' > ramp-index.json
@@ -339,17 +412,34 @@ jobs:
             set +e
             docker run --rm --network host \
               --ulimit "nofile=$CONTAINER_NOFILE:$CONTAINER_NOFILE" \
-              ghcr.io/blockcast/amt-verify:main \
+              $IMAGE \
               --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
               --tunnels "$n" --keepalive "$KEEPALIVE" --hold "$HOLD" --json \
-              >"step-$n.json" 2>"step-$n.log"
+              >"step-$n.json" 2>"step-$n.log" &
+            pid=$!
+            # Sample for the whole step rather than at one guessed instant: with
+            # establishment time unknown a single sample can land before the
+            # tunnels are up and read a false 0.
+            : > "astats-$n.ndjson"
+            while kill -0 $pid 2>/dev/null; do
+              curl -fsS -m 3 "http://$RELAY:8080/_astats" >> "astats-$n.ndjson" 2>/dev/null
+              echo >> "astats-$n.ndjson"
+              sleep 2
+            done
+            wait $pid
             rc=$?
             set -e
             t1=$(date -u +%FT%TZ)
-            echo "N=$n exit=$rc end=$t1"; cat "step-$n.json" || true
+            peak_relay=$(jq -s 'map(.ats."amt.relay.active_tunnels"//empty)|max//null' "astats-$n.ndjson" 2>/dev/null || echo null)
+            peak_iface=$(jq -s 'map(.ats."amt.interface.amtr.tunnels"//empty)|max//null' "astats-$n.ndjson" 2>/dev/null || echo null)
+            echo "N=$n exit=$rc end=$t1 astats_peak_relay_active_tunnels=$peak_relay astats_peak_iface_tunnels=$peak_iface"
+            cat "step-$n.json" || true
             jq --argjson n "$n" --arg t0 "$t0" --arg t1 "$t1" --argjson rc "$rc" \
+               --argjson pr "${peak_relay:-null}" --argjson pi "${peak_iface:-null}" \
                --slurpfile r "step-$n.json" \
                '. + [{requested:$n, started_utc:$t0, ended_utc:$t1, exit:$rc,
+                      astats_peak_relay_active_tunnels:$pr,
+                      astats_peak_iface_tunnels:$pi,
                       report:($r[0] // null)}]' \
                ramp-index.json > tmp.json && mv tmp.json ramp-index.json
             # A degraded step IS the measurement -- it is where the knee is --
@@ -393,6 +483,16 @@ jobs:
                  |{requested, establish_errors:.report.establish_errors, not_alive:.report.not_alive}]' \
              ramp-index.json | tee -a verdict.txt
           echo "NOTE: control-plane tunnel-table ceiling, not a loaded-state ceiling. Witness is RECEIVER-SIDE (client 'alive'); relay-side amt_relay_active_tunnels is dead and was deliberately not used. Every step report carries the caveat inline." | tee -a verdict.txt
+          # Occupancy-instrument QUALIFICATION, reported next to the verdict so
+          # the two are read together. This does not corroborate THIS ramp -- an
+          # unqualified instrument cannot corroborate anything -- it says whether
+          # _astats earned the right to corroborate the NEXT one.
+          {
+            echo "--- candidate occupancy instrument (_astats :8080), qualification ---"
+            echo "baseline_pre_ramp=$(jq -c '.ats|{relay:."amt.relay.active_tunnels",iface:."amt.interface.amtr.tunnels",limit:."amt.relay.tunnel_limit"}' astats-baseline.json 2>/dev/null || echo unreachable)"
+            jq -r '.[]|"requested=\(.requested) peak_relay_active_tunnels=\(.astats_peak_relay_active_tunnels) peak_iface_tunnels=\(.astats_peak_iface_tunnels) alive=\(.report.alive // "n/a")"' ramp-index.json
+            echo "QUALIFIED if a peak column rises with requested N; DEAD DIAL if it stays flat (that is the amt_relay_active_tunnels failure, and it would be the seventh). Read the two peak columns separately: they were NOT equal pre-ramp (relay=29, iface=47), so whichever tracks N is the occupancy counter and the other is something else."
+          } | tee -a verdict.txt
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -401,6 +501,8 @@ jobs:
           path: |
             host-ceilings.txt
             image-receipt.txt
+            astats-baseline.json
+            astats-*.ndjson
             control.json
             control.log
             ramp-index.json
