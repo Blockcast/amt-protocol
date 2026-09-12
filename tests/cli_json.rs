@@ -149,6 +149,8 @@ async fn timeout_emits_partial_counts_not_an_empty_report() {
     assert!(v["elapsed_ms"].is_u64(), "{v}");
     assert!(v["first_data"].is_u64(), "{v}");
     assert_eq!(v["first_packet"]["src"], "10.0.0.1:5004");
+    // A clean partial: the shortfall is the deadline, not receiver lag.
+    assert_eq!(v["lagged_count"], 0, "{v}");
 }
 
 // Deadline expiry with nothing received at all: still a well-formed report,

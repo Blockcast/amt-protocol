@@ -137,6 +137,11 @@ struct OneshotReport {
     /// needs no two-run solve for the startup constant. `null` if no packet
     /// arrived.
     elapsed_ms: Option<u64>,
+    /// Packets the receiver's broadcast channel dropped before this process
+    /// dequeued them. NOT included in `packet_count`. Non-zero means the
+    /// receiver could not keep up, so any shortfall against the source is a
+    /// RECEIVER artifact and must not be attributed to relay loss.
+    lagged_count: u64,
     first_data: Option<u64>,
     relay: String,
     family: &'static str,
@@ -291,9 +296,18 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     // Held, not returned, until the report has been emitted: the partial counts
     // are the point of the probe and must survive the failure path.
     let mut timed_out: Option<anyhow::Error> = None;
+    let mut lagged_count: u64 = 0;
 
     while packet_count < args.packet_count {
-        match recv_first_matching(&mut data_rx, args.group, args.source, deadline).await {
+        match recv_first_matching(
+            &mut data_rx,
+            args.group,
+            args.source,
+            deadline,
+            &mut lagged_count,
+        )
+        .await
+        {
             Ok(evt) => {
                 packet_count += 1;
                 byte_count += evt.payload.len() as u64;
@@ -318,6 +332,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             packet_count,
             byte_count,
             elapsed_ms,
+            lagged_count,
             first_data: first_data_ms,
             relay: resolved_relay.to_string(),
             family: family_str,
@@ -342,7 +357,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             .map(|e| format!("{}:{} len={}", e.src, e.src_port, e.payload.len()))
             .unwrap_or_else(|| "none".to_string());
         println!(
-            "{} — relay={} family={} group={} source={} packets={} bytes={} elapsed={}ms first_data={}ms first_pkt={}",
+            "{} — relay={} family={} group={} source={} packets={} bytes={} lagged={} elapsed={}ms first_data={}ms first_pkt={}",
             outcome,
             resolved_relay,
             family_str,
@@ -350,6 +365,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             args.source,
             packet_count,
             byte_count,
+            lagged_count,
             elapsed_ms.map_or(-1i64, |v| v as i64),
             first_data_ms.map_or(-1i64, |v| v as i64),
             first,
@@ -377,11 +393,17 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
 /// Receive the next packet matching (group, source), bounded by a caller-owned
 /// OVERALL `deadline` rather than a per-call duration — so successive calls
 /// share one budget instead of each getting a fresh one.
+///
+/// `lagged` accumulates packets the broadcast channel dropped before this
+/// process could dequeue them. They are NOT counted in `packet_count`, so a
+/// non-zero value means the reported rate understates what the relay delivered
+/// — a receiver-side artifact that must not be read as relay loss.
 async fn recv_first_matching(
     rx: &mut tokio::sync::broadcast::Receiver<amt_protocol::native::DataEvent>,
     group: IpAddr,
     source: IpAddr,
     deadline: tokio::time::Instant,
+    lagged: &mut u64,
 ) -> Result<amt_protocol::native::DataEvent> {
     use tokio::sync::broadcast::error::RecvError;
     loop {
@@ -394,7 +416,10 @@ async fn recv_first_matching(
         match recv {
             Ok(evt) if evt.group == group && evt.src == source => return Ok(evt),
             Ok(_skip) => continue,
-            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Lagged(skipped)) => {
+                *lagged += skipped;
+                continue;
+            }
             Err(RecvError::Closed) => {
                 return Err(anyhow!(
                     "data broadcast closed before first matching packet"
