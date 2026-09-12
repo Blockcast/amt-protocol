@@ -55,7 +55,13 @@ jobs:
           dev=$(ip -j route get 1.1.1.1 2>/dev/null | jq -r '.[0].dev // empty' || true)
           speed=$(cat "/sys/class/net/$dev/speed" 2>/dev/null || true)
           case "$speed" in ''|*[!0-9]*|0) speed=unknown ;; esac
-          echo "egress_dev=${dev:-unknown} nic_speed_mbps=$speed"
+          # The driver travels too: a paravirtual NIC (hv_netvsc, virtio_net)
+          # reports the SYNTHETIC link speed, not provisioned bandwidth, so a
+          # well-formed number there is not a line rate. Reading 50000 as
+          # headroom-for-578-tunnels is the same spec-sheet substitution the
+          # `unknown` branch exists to prevent -- just sourced from the kernel.
+          drv=$(ethtool -i "$dev" 2>/dev/null | awk '/^driver:/{print $2}' || true)
+          echo "egress_dev=${dev:-unknown} nic_speed_mbps=$speed nic_driver=${drv:-unknown}"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
