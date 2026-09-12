@@ -1,6 +1,6 @@
 [package]
 name = "amt-protocol"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Blockcast"]
 description = "AMT (Automatic Multicast Tunneling) protocol implementation for multiple platforms"

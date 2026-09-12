@@ -6,6 +6,15 @@ use std::net::IpAddr;
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Event {
+    /// `#[non_exhaustive]` on the *variant* (not just the enum) is what makes a
+    /// future field addition here a non-breaking change. The enum-level
+    /// attribute only forces a `_` arm for unknown *variants*; it does nothing
+    /// for the fields of a struct variant, so without this a downstream
+    /// `Event::Transmit { dst, port, payload }` pattern or literal would break
+    /// on every field added. `Event` is emitted by `SubscriptionManager` and
+    /// only ever consumed out-of-crate, so forbidding downstream construction
+    /// costs nothing and buys field-addition freedom.
+    #[non_exhaustive]
     Transmit {
         dst: IpAddr,
         port: u16,
