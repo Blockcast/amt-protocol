@@ -4,11 +4,22 @@ use crate::error::AmtError;
 use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Event {
     Transmit {
         dst: IpAddr,
         port: u16,
         payload: Vec<u8>,
+        /// True only for a *keep-alive* current-state Membership Update — one
+        /// emitted while the tunnel was already Active. False for everything
+        /// else the manager transmits, including the initial current-state
+        /// Update that completes the handshake, Discovery, Request,
+        /// incremental ALLOW/BLOCK and Teardown.
+        ///
+        /// The emitting side is the only place that knows this. A consumer
+        /// counting keep-alives reads this flag; it must NOT infer the answer
+        /// from where `HandshakeComplete` sits in the drain order.
+        keepalive: bool,
     },
     Data {
         src: IpAddr,
@@ -31,6 +42,7 @@ mod tests {
             dst: "192.0.2.1".parse().unwrap(),
             port: 2268,
             payload: vec![1, 2, 3],
+            keepalive: false,
         };
         let _ = Event::Data {
             src: "10.0.0.1".parse().unwrap(),

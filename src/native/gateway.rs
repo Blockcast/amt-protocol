@@ -57,9 +57,10 @@ pub struct AsyncAmtGateway {
     /// Membership Updates SUCCESSFULLY transmitted after the handshake
     /// completed, i.e. keep-alives. Incremented only once `send_to` has
     /// returned Ok, so a keep-alive that failed to leave the process is not
-    /// counted. The initial current-state Update is excluded: the runtime
-    /// drains `Transmit` before the `HandshakeComplete` that stores `Active`,
-    /// so at that point `state` still reads the pre-handshake value.
+    /// counted. The initial current-state Update is excluded because the
+    /// manager labels it `keepalive: false` on the event itself — this does
+    /// not depend on the drain position of `HandshakeComplete`, nor on
+    /// sampling `state`.
     ///
     /// A tunnel is only demonstrably held across a keep-alive interval if this
     /// is >= 1. Note what it does NOT prove: it is client-side emission, not
@@ -343,17 +344,17 @@ async fn run_task(
         // Drain events emitted this turn.
         while let Some(ev) = mgr.poll_event() {
             match ev {
-                Event::Transmit { dst, port, payload } => {
-                    // Sampled BEFORE the HandshakeComplete arm below stores
-                    // `Active`, so the initial current-state Update is excluded
-                    // and this counts keep-alives only. See field docs.
-                    let is_keepalive =
-                        state.load(Ordering::SeqCst) == state_to_u8(GatewayState::Active);
+                Event::Transmit {
+                    dst,
+                    port,
+                    payload,
+                    keepalive,
+                } => {
                     let target = SocketAddr::new(dst, port);
                     if let Err(e) = sock.send_to(&payload, target).await {
                         tracing::error!(target: "amt", error=?e, "socket send error (fatal)");
                         *fatal.lock().await = Some(anyhow!("socket send: {e}"));
-                    } else if is_keepalive {
+                    } else if keepalive {
                         // Only after the datagram has actually left the process.
                         // Counting before the send let a FAILED keep-alive leave
                         // `state == Active && keepalives_sent >= 1`, which is the

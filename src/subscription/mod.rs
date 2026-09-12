@@ -141,6 +141,7 @@ impl<P: Platform> SubscriptionManager<P> {
             dst: relay,
             port: self.inner.relay_port(),
             payload: msg.encode(),
+            keepalive: false,
         });
         self.last_discovery_at_ms = Some(now_ms);
         Ok(())
@@ -262,6 +263,7 @@ impl<P: Platform> SubscriptionManager<P> {
             dst: relay,
             port: self.inner.relay_port(),
             payload: msg.encode(),
+            keepalive: false,
         });
         self.last_request_at_ms = Some(now_ms);
         Ok(())
@@ -301,14 +303,21 @@ impl<P: Platform> SubscriptionManager<P> {
         // the signal. Consumers that want "tunnel is up AND Update sent"
         // semantics get exactly that. Flipping this order would let a consumer
         // gate on HandshakeComplete and then drop the Update.
-        self.send_current_state_update(now_ms)?;
+        //
+        // Nothing else depends on this order. In particular the keep-alive
+        // witness does not: the Update carries its own `keepalive` label.
+        self.send_current_state_update(now_ms, !initial_handshake)?;
         if initial_handshake {
             self.out_queue.push_back(Event::HandshakeComplete);
         }
         Ok(())
     }
 
-    fn send_current_state_update(&mut self, now_ms: u64) -> Result<()> {
+    /// Emit a current-state Membership Update. `keepalive` labels the event for
+    /// consumers that count keep-alives: false for the initial Update that
+    /// completes the handshake, true for every later one (periodic tick, or a
+    /// re-Query arriving while already Active).
+    fn send_current_state_update(&mut self, now_ms: u64, keepalive: bool) -> Result<()> {
         let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
         let port = self.inner.relay_port();
         let report = match relay {
@@ -327,6 +336,7 @@ impl<P: Platform> SubscriptionManager<P> {
             dst: relay,
             port,
             payload: msg.encode(),
+            keepalive,
         });
         self.last_update_at_ms = Some(now_ms);
         Ok(())
@@ -359,6 +369,7 @@ impl<P: Platform> SubscriptionManager<P> {
             dst: relay,
             port: self.inner.relay_port(),
             payload: msg.encode(),
+            keepalive: false,
         });
         self.last_update_at_ms = Some(now_ms);
         Ok(())
@@ -375,6 +386,7 @@ impl<P: Platform> SubscriptionManager<P> {
             dst: relay,
             port: self.inner.relay_port(),
             payload: msg.encode(),
+            keepalive: false,
         });
         self.last_update_at_ms = Some(now_ms);
         Ok(())
@@ -430,7 +442,7 @@ impl<P: Platform> SubscriptionManager<P> {
                 None => false,
             };
             if due {
-                self.send_current_state_update(now_ms)?;
+                self.send_current_state_update(now_ms, true)?;
             }
         }
         Ok(())
@@ -475,6 +487,7 @@ impl<P: Platform> SubscriptionManager<P> {
                 dst: relay,
                 port: self.inner.relay_port(),
                 payload: msg.encode(),
+                keepalive: false,
             });
             // inner.send_teardown() already advanced inner state to Closed.
         } else {
@@ -551,10 +564,16 @@ mod tests {
         // First event must be a Transmit of RelayDiscovery to the relay.
         let ev = m.poll_event().expect("expected one Transmit event");
         match ev {
-            Event::Transmit { dst, port, payload } => {
+            Event::Transmit {
+                dst,
+                port,
+                payload,
+                keepalive,
+            } => {
                 assert_eq!(dst, "192.0.2.96".parse::<IpAddr>().unwrap());
                 assert_eq!(port, 2268);
                 assert_eq!(payload[0], 0x01, "expected RelayDiscovery message type");
+                assert!(!keepalive, "Discovery is not a keep-alive");
             }
             other => panic!("unexpected event: {:?}", other),
         }
@@ -1056,6 +1075,9 @@ mod tests {
         assert_eq!(m.pending_len(), 0);
 
         let events = drain(&mut m);
+        // An incremental ALLOW is an Update sent while Active, but it is NOT a
+        // keep-alive — only a current-state Update after the handshake is.
+        assert_eq!(keepalive_labels_of_updates(&events), vec![false]);
         let update = events
             .iter()
             .find_map(|ev| match ev {
@@ -1138,6 +1160,78 @@ mod tests {
         let report = &update[12 + 24..];
         assert_eq!(report[0], 0x22);
         assert_eq!(u16::from_be_bytes([report[6], report[7]]), 1);
+    }
+
+    fn keepalive_labels_of_updates(events: &[Event]) -> Vec<bool> {
+        events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Transmit {
+                    payload, keepalive, ..
+                } if payload[0] == 0x05 => Some(*keepalive),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The keep-alive witness must be readable off the event itself. This test
+    /// deliberately selects Updates by message type and asserts on their
+    /// `keepalive` label — it never looks at where `HandshakeComplete` sits in
+    /// the queue, so it still holds if the documented drain order changes.
+    #[test]
+    fn initial_current_state_update_is_not_labelled_keepalive() {
+        // Hand-driven handshake: drive_to_active() swallows the final drain,
+        // and that drain is exactly what this test needs to inspect.
+        let mut m = mgr();
+        m.subscribe(
+            GroupKey {
+                group: "232.0.0.1".parse().unwrap(),
+                source: Some("10.0.0.1".parse().unwrap()),
+            },
+            1000,
+        )
+        .unwrap();
+        let initial = drain(&mut m);
+        let advert = AmtMessage::RelayAdvertisement {
+            nonce: discovery_nonce_from(&initial),
+            relay_address: "192.0.2.96".parse::<IpAddr>().unwrap(),
+        };
+        m.handle_datagram(&advert.encode(), 1100).unwrap();
+        let req_nonce = drain(&mut m)
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x03 => {
+                    Some(u32::from_be_bytes([
+                        payload[4], payload[5], payload[6], payload[7],
+                    ]))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let query = AmtMessage::MembershipQuery {
+            request_nonce: req_nonce,
+            response_mac: [0; 6],
+            query_data: vec![0x11; 12],
+        };
+        m.handle_datagram(&query.encode(), 1200).unwrap();
+
+        // Every Membership Update (0x05) emitted by the handshake — wherever it
+        // landed relative to HandshakeComplete — is the initial current-state
+        // Update and must not be counted as a keep-alive.
+        assert_eq!(
+            keepalive_labels_of_updates(&drain(&mut m)),
+            vec![false],
+            "initial Update, not a keep-alive"
+        );
+
+        // The periodic one is.
+        let ka_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
+        m.tick(1200 + ka_ms + 1).unwrap();
+        assert_eq!(
+            keepalive_labels_of_updates(&drain(&mut m)),
+            vec![true],
+            "tick Update is a keep-alive"
+        );
     }
 
     #[test]
