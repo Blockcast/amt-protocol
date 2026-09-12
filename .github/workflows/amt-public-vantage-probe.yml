@@ -80,8 +80,17 @@ permissions:
 #
 # publish-amt-verify.yml already pushes ghcr.io/blockcast/amt-verify:<sha> on
 # every main build, so pinning to github.sha costs nothing and cannot go stale:
-# the tag IS the commit. If no image exists for this ref the pull fails loudly,
-# which is correct -- a ramp against code that was never built is void.
+# the tag IS the commit.
+#
+# But that publisher only fires on main, so on a BRANCH no such tag exists and
+# the pull fails -- which made this workflow undispatchable from the very PR it
+# is supposed to verify (Ally, 945d069). So: pull, and on a miss BUILD from the
+# checkout. Both paths yield the checkout's client, by tag identity on main and
+# by construction on a branch. On the build path the revision assertion below is
+# tautological -- provenance there rests on having built the checked-out tree,
+# not on the label -- and the receipt says `local-build` rather than a registry
+# digest, because there isn't one and an empty field would read as a missing
+# measurement rather than an absent one.
 env:
   IMAGE: ghcr.io/blockcast/amt-verify:${{ github.sha }}
 
@@ -101,6 +110,7 @@ jobs:
           echo "utc=$(date -u +%FT%TZ)"
           echo "public_ip=$(curl -fsS https://api.ipify.org)"
           echo "target=$RELAY:2268 sg=($SOURCE,$GROUP)"
+      - uses: actions/checkout@v4
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -108,8 +118,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: amt-verify (real client, public vantage)
         run: |
-          docker pull -q $IMAGE
-          echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE)"
+          docker pull -q $IMAGE || docker build -q -t $IMAGE \
+            --label org.opencontainers.image.revision=${{ github.sha }} .
+          echo "image_digest=$(docker inspect --format='{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}local-build{{end}}' $IMAGE)"
           # BLO-21823 AC#3 wants the client commit alongside the artifact hash.
           echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"
           set +e
@@ -177,7 +188,12 @@ jobs:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
       SOURCE: ${{ inputs.source || '69.25.95.192' }}
       GROUP: ${{ inputs.group || '232.1.1.60' }}
-      STEPS: ${{ inputs.ramp_steps || '1,8,64,256,1024,4096,8192,10000' }}
+      # Must MATCH the declared input default. It read
+      # `...,1024,4096,8192,10000` -- the pre-ruling list -- so a dispatch that
+      # supplied ramp_steps as an empty string (REST does; the UI cannot) would
+      # silently select the four steps the CTO withheld, via the one path that
+      # skips the input default entirely.
+      STEPS: ${{ inputs.ramp_steps || '1,8,64,256,1024' }}
       HOLD: ${{ inputs.hold || '25' }}
       KEEPALIVE: ${{ inputs.keepalive || '10' }}
       # Raised inside the container for every docker run below. Declared once so
@@ -307,6 +323,7 @@ jobs:
 
           [ "$fail" -eq 0 ] || exit 1
 
+      - uses: actions/checkout@v4
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -321,9 +338,10 @@ jobs:
       # label.
       - name: Image receipt
         run: |
-          docker pull -q $IMAGE
+          docker pull -q $IMAGE || docker build -q -t $IMAGE \
+            --label org.opencontainers.image.revision=${{ github.sha }} .
           {
-            echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE)"
+            echo "image_digest=$(docker inspect --format='{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}local-build{{end}}' $IMAGE)"
             echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"
             echo "workflow_sha=${{ github.sha }}"
           } | tee image-receipt.txt
