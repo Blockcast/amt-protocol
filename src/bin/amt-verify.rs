@@ -190,6 +190,9 @@ struct OneshotReport {
     source: Option<String>,
     timings_ms: Timings,
     first_packet: Option<FirstPacket>,
+    /// Receiver-intrinsic loss, read off the stream's own sequence numbers.
+    /// `null` when no packet arrived. See [`SeqTracker`].
+    mmtp: Option<MmtpLoss>,
 }
 
 #[derive(serde::Serialize)]
@@ -202,6 +205,115 @@ struct FirstPacket {
     src: String,
     dst_port: u16,
     len: usize,
+    /// First 16 bytes, hex. Present so the MMTP header layout that `mmtp` is
+    /// parsed against can be checked by hand from the same run that reports a
+    /// loss figure, rather than taken on faith.
+    head_hex: String,
+}
+
+/// Largest per-track sequence jump still read as loss rather than as evidence
+/// that the header layout assumed below is wrong. The observed stream runs
+/// ~1.3k pkt/s across 8 tracks, so this is minutes of outage on one track.
+const MAX_PLAUSIBLE_GAP: u32 = 10_000;
+
+/// Receiver-intrinsic loss accounting, parsed from the MMTP packet header
+/// (ISO/IEC 23008-1: `packet_id` at bytes 2..4 and `packet_sequence_number` at
+/// bytes 8..12, both big-endian; `version` is the top 2 bits of byte 0 and is 0
+/// for this draft). Sequence numbers are per-`packet_id`, so every track is
+/// tracked independently.
+///
+/// This exists because reconciling a receiver count against a source count
+/// requires a source-side counter, and the MMTP publisher for this stream
+/// exports none — no Prometheus series, no log counter (BLO-33456). A stream
+/// that numbers its own packets does not need one, and the resulting figure is
+/// immune to the two accountings naming different streams, which is how this
+/// reconciliation went wrong twice.
+#[derive(Default)]
+struct SeqTracker {
+    /// Per-track high-water sequence number.
+    last: std::collections::HashMap<u16, u32>,
+    observed: u64,
+    in_sequence: u64,
+    gaps: u64,
+    reordered: u64,
+    implausible: u64,
+}
+
+impl SeqTracker {
+    fn observe(&mut self, payload: &[u8]) {
+        self.observed += 1;
+        // Too short to hold a header, or a version this parser does not claim to
+        // understand. Either way the layout assumption does not hold here.
+        if payload.len() < 12 || payload[0] >> 6 != 0 {
+            self.implausible += 1;
+            return;
+        }
+        let pid = u16::from_be_bytes([payload[2], payload[3]]);
+        let seq = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+        let Some(&prev) = self.last.get(&pid) else {
+            self.last.insert(pid, seq);
+            return;
+        };
+        let delta = seq.wrapping_sub(prev);
+        if delta == 0 || delta > u32::MAX / 2 {
+            // Duplicate, or arrived behind the high-water mark. Not loss — and
+            // the mark must not move backwards, or the next in-order packet
+            // reads as a gap.
+            self.reordered += 1;
+            return;
+        }
+        if delta > MAX_PLAUSIBLE_GAP {
+            self.implausible += 1;
+        } else if delta == 1 {
+            self.in_sequence += 1;
+        } else {
+            self.gaps += u64::from(delta - 1);
+        }
+        self.last.insert(pid, seq);
+    }
+
+    fn finish(self) -> Option<MmtpLoss> {
+        if self.observed == 0 {
+            return None;
+        }
+        let denom = self.gaps + self.in_sequence;
+        // Withheld rather than approximated: a non-zero `implausible` is the
+        // signature of the layout assumption failing, and a ratio computed
+        // across it would look precise and be meaningless.
+        let loss_ratio =
+            (self.implausible == 0 && denom > 0).then(|| self.gaps as f64 / denom as f64);
+        Some(MmtpLoss {
+            tracks: self.last.len(),
+            in_sequence: self.in_sequence,
+            gaps: self.gaps,
+            reordered: self.reordered,
+            implausible: self.implausible,
+            loss_ratio,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+struct MmtpLoss {
+    /// Distinct `packet_id` values seen. The catalog this stream publishes
+    /// advertises 8: three video renditions plus audio, each with a RaptorQ
+    /// repair track.
+    tracks: usize,
+    /// Adjacent per-track arrivals whose sequence numbers differed by exactly 1.
+    in_sequence: u64,
+    /// Packets missing between adjacent arrivals, summed over tracks. This is
+    /// the loss figure; it needs no source-side counter.
+    gaps: u64,
+    /// Duplicates, or arrivals behind the per-track high-water mark. Not loss.
+    reordered: u64,
+    /// Packets too short, carrying a non-zero version, or jumping further than
+    /// [`MAX_PLAUSIBLE_GAP`]. **Non-zero invalidates `loss_ratio`**, which is
+    /// then `null`: it is what a wrong header-layout assumption looks like, and
+    /// failing loudly here is the whole point of the field.
+    implausible: u64,
+    /// `gaps / (gaps + in_sequence)`. `null` when there is nothing to divide, or
+    /// when `implausible` is non-zero.
+    loss_ratio: Option<f64>,
 }
 
 #[tokio::main]
@@ -319,6 +431,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     // are the point of the probe and must survive the failure path.
     let mut stopped: Option<RecvStop> = None;
     let mut lagged_count: u64 = 0;
+    let mut seq = SeqTracker::default();
 
     while packet_count < args.packet_count {
         match recv_first_matching(
@@ -333,6 +446,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             Ok(evt) => {
                 packet_count += 1;
                 byte_count += evt.payload.len() as u64;
+                seq.observe(&evt.payload);
                 elapsed_ms = Some(data_started.elapsed().as_millis() as u64);
                 if first_evt.is_none() {
                     first_data_ms = Some(started.elapsed().as_millis() as u64);
@@ -367,7 +481,14 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
                 src: format!("{}:{}", e.src, e.src_port),
                 dst_port: e.dst_port,
                 len: e.payload.len(),
+                head_hex: e
+                    .payload
+                    .iter()
+                    .take(16)
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
             }),
+            mmtp: seq.finish(),
         };
         println!(
             "{}",
@@ -1025,5 +1146,80 @@ mod tests {
         assert_eq!(got.src, SRC);
         assert_eq!(got.group, GROUP);
         assert_eq!(lagged, 0);
+    }
+
+    /// Minimal MMTP packet: version 0, `packet_id` at 2..4, sequence at 8..12.
+    fn mmtp(packet_id: u16, seq: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 32];
+        p[2..4].copy_from_slice(&packet_id.to_be_bytes());
+        p[8..12].copy_from_slice(&seq.to_be_bytes());
+        p
+    }
+
+    fn track(pkts: &[(u16, u32)]) -> MmtpLoss {
+        let mut t = SeqTracker::default();
+        for &(id, s) in pkts {
+            t.observe(&mmtp(id, s));
+        }
+        t.finish().expect("observed packets yield a report")
+    }
+
+    #[test]
+    fn contiguous_sequence_is_zero_loss() {
+        let got = track(&[(1, 10), (1, 11), (1, 12), (1, 13)]);
+        assert_eq!((got.gaps, got.in_sequence, got.implausible), (0, 3, 0));
+        assert_eq!(got.loss_ratio, Some(0.0));
+    }
+
+    /// The whole point of the field: loss is counted without any source-side
+    /// count to compare against.
+    #[test]
+    fn missing_packets_are_counted_as_gaps() {
+        let got = track(&[(1, 10), (1, 14)]);
+        assert_eq!(got.gaps, 3);
+        assert_eq!(got.loss_ratio, Some(3.0 / 3.0));
+    }
+
+    /// Sequence numbers are per-`packet_id`. Interleaving tracks must not read
+    /// as loss — with 8 tracks on this stream that would fabricate ~100%.
+    #[test]
+    fn tracks_are_counted_independently() {
+        let got = track(&[(1, 5), (2, 900), (1, 6), (2, 901), (4, 77), (4, 78)]);
+        assert_eq!((got.gaps, got.in_sequence, got.tracks), (0, 3, 3));
+        assert_eq!(got.loss_ratio, Some(0.0));
+    }
+
+    #[test]
+    fn reorders_and_duplicates_are_not_loss() {
+        // 12 arrives late, then 13 follows 12's predecessor: the high-water mark
+        // must not have moved backwards, or 13 reads as a gap.
+        let got = track(&[(1, 11), (1, 12), (1, 11), (1, 12), (1, 13)]);
+        assert_eq!((got.gaps, got.reordered, got.implausible), (0, 2, 0));
+    }
+
+    /// A wrong header-layout assumption must fail loudly, not produce a precise
+    /// looking number. Random payloads give huge deltas; `loss_ratio` withholds.
+    #[test]
+    fn implausible_jumps_withhold_the_ratio() {
+        let got = track(&[(1, 1), (1, 1 + MAX_PLAUSIBLE_GAP + 1)]);
+        assert_eq!(got.implausible, 1);
+        assert_eq!(got.loss_ratio, None);
+    }
+
+    #[test]
+    fn short_or_wrong_version_payloads_are_implausible() {
+        let mut t = SeqTracker::default();
+        t.observe(b"tiny");
+        let mut wrong_version = mmtp(1, 1);
+        wrong_version[0] = 0x40; // version 1
+        t.observe(&wrong_version);
+        let got = t.finish().expect("observed packets yield a report");
+        assert_eq!(got.implausible, 2);
+        assert_eq!(got.loss_ratio, None);
+    }
+
+    #[test]
+    fn no_packets_yields_no_report() {
+        assert!(SeqTracker::default().finish().is_none());
     }
 }
