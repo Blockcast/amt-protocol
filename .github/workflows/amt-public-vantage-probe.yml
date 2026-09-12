@@ -55,13 +55,26 @@ jobs:
           dev=$(ip -j route get 1.1.1.1 2>/dev/null | jq -r '.[0].dev // empty' || true)
           speed=$(cat "/sys/class/net/$dev/speed" 2>/dev/null || true)
           case "$speed" in ''|*[!0-9]*|0) speed=unknown ;; esac
-          # The driver travels too: a paravirtual NIC (hv_netvsc, virtio_net)
-          # reports the SYNTHETIC link speed, not provisioned bandwidth, so a
-          # well-formed number there is not a line rate. Reading 50000 as
-          # headroom-for-578-tunnels is the same spec-sheet substitution the
-          # `unknown` branch exists to prevent -- just sourced from the kernel.
+          # A paravirtual NIC (hv_netvsc, virtio_net) reports the SYNTHETIC link
+          # speed, not provisioned bandwidth, so a well-formed number there is
+          # not a line rate -- the same spec-sheet substitution the `unknown`
+          # branch exists to prevent, just sourced from the kernel. Allowlist
+          # PHYSICAL drivers rather than denylisting virtual ones: the miss
+          # directions are asymmetric. A denylist miss (ena, gve, a veth inside
+          # a container) ships a synthetic integer as authoritative; an
+          # allowlist miss emits `unknown` on a real NIC, which falls back to
+          # the empirical ceiling -- what the consumer does anyway.
           drv=$(ethtool -i "$dev" 2>/dev/null | awk '/^driver:/{print $2}' || true)
-          echo "egress_dev=${dev:-unknown} nic_speed_mbps=$speed nic_driver=${drv:-unknown}"
+          reported=$speed
+          case "${drv:-}" in
+            ixgbe|i40e|ice|igb|igc|e1000e|tg3|bnxt_en|mlx4_en|mlx5_core|atlantic) ;;
+            *) speed=unknown ;;
+          esac
+          # `nic_speed_mbps_reported` keeps the raw reading: it is what caught
+          # the synthetic value (50000 vs 100000 across two runs 2m23s apart)
+          # and it distinguishes "sysfs said nothing" from "sysfs said something
+          # synthetic". `nic_speed_mbps` is the only authoritative field.
+          echo "egress_dev=${dev:-unknown} nic_speed_mbps=$speed nic_driver=${drv:-unknown} nic_speed_mbps_reported=${reported}"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
