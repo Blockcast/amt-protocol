@@ -235,6 +235,10 @@ struct SeqTracker {
     observed: u64,
     in_sequence: u64,
     gaps: u64,
+    /// Valid packets admitted to sequence accounting: the first per track, plus
+    /// every later arrival that advanced its track's high-water mark. This is
+    /// the `received` term of the loss ratio — see [`SeqTracker::finish`].
+    received: u64,
     reordered: u64,
     implausible: u64,
 }
@@ -252,6 +256,10 @@ impl SeqTracker {
         let seq = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
         let Some(&prev) = self.last.get(&pid) else {
             self.last.insert(pid, seq);
+            // Nothing before it on this track, so it can neither be in-sequence
+            // nor terminate a gap — but it did arrive, and the ratio's
+            // denominator is every packet that arrived.
+            self.received += 1;
             return;
         };
         let delta = seq.wrapping_sub(prev);
@@ -266,8 +274,12 @@ impl SeqTracker {
             self.implausible += 1;
         } else if delta == 1 {
             self.in_sequence += 1;
+            self.received += 1;
         } else {
             self.gaps += u64::from(delta - 1);
+            // The arrival that ENDS the gap is itself received. Omitting it is
+            // what made the ratio overstate loss (Ally review, PR #23).
+            self.received += 1;
         }
         self.last.insert(pid, seq);
     }
@@ -276,7 +288,12 @@ impl SeqTracker {
         if self.observed == 0 {
             return None;
         }
-        let denom = self.gaps + self.in_sequence;
+        // lost / (lost + received) — the ordinary packet-loss ratio. `received`
+        // counts every valid arrival, including each track's first packet and
+        // the arrival that terminates a gap; `in_sequence` counts neither, so
+        // using it as the denominator overstated loss, worst exactly where gap
+        // events are densest.
+        let denom = self.gaps + self.received;
         // Withheld rather than approximated: a non-zero `implausible` is the
         // signature of the layout assumption failing, and a ratio computed
         // across it would look precise and be meaningless.
@@ -286,6 +303,7 @@ impl SeqTracker {
             tracks: self.last.len(),
             in_sequence: self.in_sequence,
             gaps: self.gaps,
+            received: self.received,
             reordered: self.reordered,
             implausible: self.implausible,
             loss_ratio,
@@ -304,14 +322,21 @@ struct MmtpLoss {
     /// Packets missing between adjacent arrivals, summed over tracks. This is
     /// the loss figure; it needs no source-side counter.
     gaps: u64,
-    /// Duplicates, or arrivals behind the per-track high-water mark. Not loss.
+    /// Valid packets that arrived: each track's first, plus every later arrival
+    /// that advanced the high-water mark. The `received` term of `loss_ratio`,
+    /// exported so the ratio can be re-derived from the receipt rather than
+    /// trusted.
+    received: u64,
+    /// Duplicates, or arrivals behind the per-track high-water mark. Not loss —
+    /// and deliberately NOT in `received`, since counting a duplicate as an
+    /// arrival would understate loss.
     reordered: u64,
     /// Packets too short, carrying a non-zero version, or jumping further than
     /// [`MAX_PLAUSIBLE_GAP`]. **Non-zero invalidates `loss_ratio`**, which is
     /// then `null`: it is what a wrong header-layout assumption looks like, and
     /// failing loudly here is the whole point of the field.
     implausible: u64,
-    /// `gaps / (gaps + in_sequence)`. `null` when there is nothing to divide, or
+    /// `gaps / (gaps + received)`. `null` when there is nothing to divide, or
     /// when `implausible` is non-zero.
     loss_ratio: Option<f64>,
 }
@@ -1173,11 +1198,33 @@ mod tests {
 
     /// The whole point of the field: loss is counted without any source-side
     /// count to compare against.
+    ///
+    /// Also the LEADING-gap case — the gap is the first thing that happens on
+    /// the track. Two packets arrived and three are missing, so the ratio is
+    /// 3/5, not the 3/3 an `in_sequence` denominator gave.
     #[test]
     fn missing_packets_are_counted_as_gaps() {
         let got = track(&[(1, 10), (1, 14)]);
-        assert_eq!(got.gaps, 3);
-        assert_eq!(got.loss_ratio, Some(3.0 / 3.0));
+        assert_eq!((got.gaps, got.in_sequence, got.received), (3, 0, 2));
+        assert_eq!(got.loss_ratio, Some(3.0 / 5.0));
+    }
+
+    /// INTERIOR gap: in-sequence runs on both sides of the loss. Expected span
+    /// 10..=14 is 5 packets, 4 arrived, 1 missing.
+    #[test]
+    fn interior_gap_counts_surrounding_arrivals() {
+        let got = track(&[(1, 10), (1, 11), (1, 13), (1, 14)]);
+        assert_eq!((got.gaps, got.in_sequence, got.received), (1, 2, 4));
+        assert_eq!(got.loss_ratio, Some(1.0 / 5.0));
+    }
+
+    /// A single drop must not read as total loss. This is the case Ally's
+    /// review named: the old denominator reported 1.0 where the answer is 1/3.
+    #[test]
+    fn one_drop_between_two_arrivals_is_not_total_loss() {
+        let got = track(&[(1, 10), (1, 12)]);
+        assert_eq!((got.gaps, got.received), (1, 2));
+        assert_eq!(got.loss_ratio, Some(1.0 / 3.0));
     }
 
     /// Sequence numbers are per-`packet_id`. Interleaving tracks must not read
@@ -1195,6 +1242,10 @@ mod tests {
         // must not have moved backwards, or 13 reads as a gap.
         let got = track(&[(1, 11), (1, 12), (1, 11), (1, 12), (1, 13)]);
         assert_eq!((got.gaps, got.reordered, got.implausible), (0, 2, 0));
+        // Three distinct packets arrived; the two replays must not inflate the
+        // denominator, or a duplicate-heavy path would understate loss.
+        assert_eq!(got.received, 3);
+        assert_eq!(got.loss_ratio, Some(0.0));
     }
 
     /// A wrong header-layout assumption must fail loudly, not produce a precise
