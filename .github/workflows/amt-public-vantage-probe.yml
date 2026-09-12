@@ -18,7 +18,10 @@ on:
         description: Multicast group
         default: "232.1.1.60"
       timeout:
-        description: Seconds to wait for first data
+        description: >-
+          OVERALL deadline in seconds for the whole data phase (NOT first-data,
+          NOT per-packet). On expiry amt-verify still writes report.json with
+          outcome=timeout and the partial packet_count/byte_count, and exits 1.
         default: "30"
       packet_count:
         description: Packets to receive before reporting ok
@@ -71,8 +74,13 @@ jobs:
           # absorbs N x stream_bitrate. Without a per-tunnel bitrate there is no
           # way to tell a relay knee from the receiver's own ceiling -- which is
           # the same class of error as the five weeks that measured probe vantage.
-          # elapsed_ms + byte_count + timings_ms.first_data size that ceiling.
-          echo "elapsed_ms=$((t1-t0))"
+          #
+          # BLO-33456: prefer report.json's `elapsed_ms` over this shell-measured
+          # one. This `t1-t0` includes `docker run` container startup (~459ms,
+          # solved for over two runs) and so overstates elapsed / understates
+          # rate on short samples; the in-process one starts at subscribe().
+          # Kept only as an outer bound and a cross-check on that constant.
+          echo "wallclock_elapsed_ms=$((t1-t0))"
           echo '--- report.json ---'; cat report.json || true
           echo '--- verbose.log ---'; cat verbose.log || true
           sha256sum report.json verbose.log

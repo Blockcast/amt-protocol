@@ -38,7 +38,15 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_driad: bool,
 
-    /// Wait at most this many seconds for first data
+    /// OVERALL deadline for the one-shot data phase, in seconds — not a
+    /// first-data timeout and not a per-packet idle timeout. The clock starts
+    /// at `subscribe()` and covers all `--packet-count` packets, so a run
+    /// cannot exceed it however the stream behaves.
+    ///
+    /// On expiry the run still emits its report with `outcome: "timeout"` and
+    /// the PARTIAL `packet_count` / `byte_count` observed so far; the exit code
+    /// is unchanged (1). That partial count is the datum a saturation probe
+    /// needs — see BLO-33456.
     #[arg(long, default_value = "30")]
     timeout: u64,
 
@@ -117,21 +125,30 @@ impl ExitCategory {
 
 #[derive(serde::Serialize)]
 struct OneshotReport {
+    /// "ok" — `--packet-count` packets observed. "timeout" — the `--timeout`
+    /// deadline expired first; `packet_count`/`byte_count` are PARTIAL (and may
+    /// be 0) but are still real observations, not placeholders.
     outcome: &'static str,
     packet_count: u64,
     byte_count: u64,
-    first_data: u64,
+    /// Wall time from `subscribe()` to the last packet counted, measured
+    /// in-process. Unlike a shell-measured elapsed it excludes container and
+    /// process startup, so `packet_count / elapsed_ms` is a receiver rate that
+    /// needs no two-run solve for the startup constant. `null` if no packet
+    /// arrived.
+    elapsed_ms: Option<u64>,
+    first_data: Option<u64>,
     relay: String,
     family: &'static str,
     group: String,
     source: Option<String>,
     timings_ms: Timings,
-    first_packet: FirstPacket,
+    first_packet: Option<FirstPacket>,
 }
 
 #[derive(serde::Serialize)]
 struct Timings {
-    first_data: u64,
+    first_data: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -261,38 +278,46 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
         .await
         .map_err(ExitCategory::HandshakeFail)?;
 
-    let first_evt = match recv_first_matching(
-        &mut data_rx,
-        args.group,
-        args.source,
-        Duration::from_secs(args.timeout),
-    )
-    .await
-    {
-        Ok(e) => e,
-        Err(e) => return Err(ExitCategory::HandshakeFail(e)),
-    };
-    let first_data_ms = started.elapsed().as_millis() as u64;
-    let mut packet_count = 1;
-    let mut byte_count = first_evt.payload.len() as u64;
+    // One overall deadline for the whole data phase, established before the
+    // first recv and shared by every packet. Previously each packet got a fresh
+    // `--timeout`, so an N-packet run could run for N x timeout.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
+
+    let mut packet_count: u64 = 0;
+    let mut byte_count: u64 = 0;
+    let mut first_evt = None;
+    let mut first_data_ms = None;
+    let mut elapsed_ms = None;
+    // Held, not returned, until the report has been emitted: the partial counts
+    // are the point of the probe and must survive the failure path.
+    let mut timed_out: Option<anyhow::Error> = None;
+
     while packet_count < args.packet_count {
-        let evt = recv_first_matching(
-            &mut data_rx,
-            args.group,
-            args.source,
-            Duration::from_secs(args.timeout),
-        )
-        .await
-        .map_err(ExitCategory::HandshakeFail)?;
-        packet_count += 1;
-        byte_count += evt.payload.len() as u64;
+        match recv_first_matching(&mut data_rx, args.group, args.source, deadline).await {
+            Ok(evt) => {
+                packet_count += 1;
+                byte_count += evt.payload.len() as u64;
+                elapsed_ms = Some(started.elapsed().as_millis() as u64);
+                if first_evt.is_none() {
+                    first_data_ms = elapsed_ms;
+                    first_evt = Some(evt);
+                }
+            }
+            Err(e) => {
+                timed_out = Some(e);
+                break;
+            }
+        }
     }
+
+    let outcome = if timed_out.is_some() { "timeout" } else { "ok" };
 
     if args.json {
         let report = OneshotReport {
-            outcome: "ok",
+            outcome,
             packet_count,
             byte_count,
+            elapsed_ms,
             first_data: first_data_ms,
             relay: resolved_relay.to_string(),
             family: family_str,
@@ -301,30 +326,40 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             timings_ms: Timings {
                 first_data: first_data_ms,
             },
-            first_packet: FirstPacket {
-                src: format!("{}:{}", first_evt.src, first_evt.src_port),
-                dst_port: first_evt.dst_port,
-                len: first_evt.payload.len(),
-            },
+            first_packet: first_evt.as_ref().map(|e| FirstPacket {
+                src: format!("{}:{}", e.src, e.src_port),
+                dst_port: e.dst_port,
+                len: e.payload.len(),
+            }),
         };
         println!(
             "{}",
             serde_json::to_string(&report).map_err(|e| ExitCategory::Fatal(e.into()))?
         );
     } else {
+        let first = first_evt
+            .as_ref()
+            .map(|e| format!("{}:{} len={}", e.src, e.src_port, e.payload.len()))
+            .unwrap_or_else(|| "none".to_string());
         println!(
-            "ok — relay={} family={} group={} source={} packets={} bytes={} first_data={}ms first_pkt={}:{} len={}",
+            "{} — relay={} family={} group={} source={} packets={} bytes={} elapsed={}ms first_data={}ms first_pkt={}",
+            outcome,
             resolved_relay,
             family_str,
             args.group,
             args.source,
             packet_count,
             byte_count,
-            first_data_ms,
-            first_evt.src,
-            first_evt.src_port,
-            first_evt.payload.len()
+            elapsed_ms.map_or(-1i64, |v| v as i64),
+            first_data_ms.map_or(-1i64, |v| v as i64),
+            first,
         );
+    }
+
+    // Exit-code semantics unchanged: a deadline expiry is still HandshakeFail
+    // (exit 1). The only change is that the report is on stdout first.
+    if let Some(e) = timed_out {
+        return Err(ExitCategory::HandshakeFail(e));
     }
 
     if args.watch {
@@ -339,35 +374,23 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     Ok(())
 }
 
+/// Receive the next packet matching (group, source), bounded by a caller-owned
+/// OVERALL `deadline` rather than a per-call duration — so successive calls
+/// share one budget instead of each getting a fresh one.
 async fn recv_first_matching(
     rx: &mut tokio::sync::broadcast::Receiver<amt_protocol::native::DataEvent>,
     group: IpAddr,
     source: IpAddr,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<amt_protocol::native::DataEvent> {
     use tokio::sync::broadcast::error::RecvError;
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
-            .ok_or_else(|| {
-                anyhow!(
-                    "timed out after {}s waiting for first data matching ({}, {})",
-                    timeout.as_secs(),
-                    group,
-                    source
-                )
-            })?;
+            .ok_or_else(|| timed_out_err(group, source))?;
         let recv = tokio::time::timeout(remaining, rx.recv())
             .await
-            .map_err(|_| {
-                anyhow!(
-                    "timed out after {}s waiting for first data matching ({}, {})",
-                    timeout.as_secs(),
-                    group,
-                    source
-                )
-            })?;
+            .map_err(|_| timed_out_err(group, source))?;
         match recv {
             Ok(evt) if evt.group == group && evt.src == source => return Ok(evt),
             Ok(_skip) => continue,
@@ -379,6 +402,10 @@ async fn recv_first_matching(
             }
         }
     }
+}
+
+fn timed_out_err(group: IpAddr, source: IpAddr) -> anyhow::Error {
+    anyhow!("--timeout deadline expired waiting for data matching ({group}, {source})")
 }
 
 async fn run_watch(

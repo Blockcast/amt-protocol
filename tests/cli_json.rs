@@ -126,6 +126,110 @@ async fn non_graceful_modes_are_mutually_exclusive() {
     assert!(stderr.contains("mutually exclusive"), "{stderr}");
 }
 
+// BLO-33456. The fake relay emits exactly ONE MulticastData per Membership
+// Update, so asking for more than one packet is a deterministic deadline
+// expiry with real partial counts already banked. Before the fix the process
+// exited 1 having printed nothing, and the workflow's `>report.json` left an
+// empty file (sha256 e3b0c442...) -- discarding exactly the datum a saturation
+// probe exists to collect.
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_emits_partial_counts_not_an_empty_report() {
+    let relay = FakeRelay::bind("v4").await;
+    let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"xyz");
+    relay.spawn(inner);
+
+    let (stdout, status) = run_json(&relay, "232.0.0.1", &["--packet-count", "3"]).await;
+
+    assert_eq!(status.code(), Some(1), "exit semantics must be unchanged");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+    assert_eq!(v["outcome"], "timeout");
+    // The partial count is the whole point: 1 of the 3 requested.
+    assert_eq!(v["packet_count"], 1);
+    assert_eq!(v["byte_count"], 3);
+    assert!(v["elapsed_ms"].is_u64(), "{v}");
+    assert!(v["first_data"].is_u64(), "{v}");
+    assert_eq!(v["first_packet"]["src"], "10.0.0.1:5004");
+}
+
+// Deadline expiry with nothing received at all: still a well-formed report,
+// with the absent first packet explicitly null rather than a fabricated zero.
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_before_any_packet_still_emits_a_report() {
+    let relay = FakeRelay::bind("v4").await;
+    // Data is emitted for (10.0.0.1, 232.0.0.1); subscribing to a different
+    // group means every packet is filtered out and nothing ever matches.
+    let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
+    relay.spawn(inner);
+
+    let (stdout, status) = run_json(&relay, "232.0.0.9", &[]).await;
+
+    assert_eq!(status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+    assert_eq!(v["outcome"], "timeout");
+    assert_eq!(v["packet_count"], 0);
+    assert_eq!(v["byte_count"], 0);
+    assert!(v["elapsed_ms"].is_null(), "{v}");
+    assert!(v["first_packet"].is_null(), "{v}");
+}
+
+// The overall-deadline guarantee: N packets share ONE budget, so a run that
+// never completes cannot exceed --timeout. Previously each packet got a fresh
+// --timeout, so this would have taken ~3x as long.
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_is_an_overall_deadline_not_per_packet() {
+    let relay = FakeRelay::bind("v4").await;
+    let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
+    relay.spawn(inner);
+
+    let start = std::time::Instant::now();
+    let (_stdout, status) = run_json(&relay, "232.0.0.1", &["--packet-count", "4"]).await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(status.code(), Some(1));
+    // 4 packets x 2s per-packet would be ~8s. Generous ceiling to stay stable
+    // on a loaded CI runner while still failing the per-packet behaviour.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "expected one shared 2s budget, took {elapsed:?}"
+    );
+}
+
+/// Run amt-verify against `relay` in --json mode subscribed to `group`,
+/// returning (stdout, status). `--timeout 2` unless `extra_args` overrides it.
+async fn run_json(
+    relay: &FakeRelay,
+    group: &str,
+    extra_args: &[&str],
+) -> (String, std::process::ExitStatus) {
+    let bin = env!("CARGO_BIN_EXE_amt-verify");
+    let mut args = vec![
+        "--relay".to_string(),
+        relay.addr.ip().to_string(),
+        "--port".to_string(),
+        relay.addr.port().to_string(),
+        "--group".to_string(),
+        group.to_string(),
+        "--source".to_string(),
+        "10.0.0.1".to_string(),
+        "--timeout".to_string(),
+        "2".to_string(),
+        "--json".to_string(),
+    ];
+    args.extend(extra_args.iter().map(|a| a.to_string()));
+
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn amt-verify");
+    let mut out = child.stdout.take().unwrap();
+    let mut buf = String::new();
+    out.read_to_string(&mut buf).await.unwrap();
+    let status = child.wait().await.unwrap();
+    (buf, status)
+}
+
 async fn run_verify(extra_args: &[&str]) -> FakeRelay {
     let relay = FakeRelay::bind("v4").await;
     let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
