@@ -22,6 +22,10 @@ on:
           OVERALL deadline in seconds for the whole data phase (NOT first-data,
           NOT per-packet). On expiry amt-verify still writes report.json with
           outcome=timeout and the partial packet_count/byte_count, and exits 1.
+          A third outcome, `closed`, means the data broadcast ended rather than
+          the deadline expiring — partial counts are still real, but it is a
+          transport failure, not a deadline observation, so do not read a rate
+          off it.
         default: "30"
       packet_count:
         description: Packets to receive before reporting ok
@@ -78,7 +82,8 @@ jobs:
           # BLO-33456: prefer report.json's `elapsed_ms` over this shell-measured
           # one. This `t1-t0` includes `docker run` container startup (~459ms,
           # solved for over two runs) and so overstates elapsed / understates
-          # rate on short samples; the in-process one starts at subscribe().
+          # rate on short samples; the in-process one starts once subscribe()
+          # has completed, so it excludes the handshake too.
           # Kept only as an outer bound and a cross-check on that constant.
           echo "wallclock_elapsed_ms=$((t1-t0))"
           echo '--- report.json ---'; cat report.json || true

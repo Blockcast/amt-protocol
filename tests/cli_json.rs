@@ -148,6 +148,14 @@ async fn timeout_emits_partial_counts_not_an_empty_report() {
     assert_eq!(v["byte_count"], 3);
     assert!(v["elapsed_ms"].is_u64(), "{v}");
     assert!(v["first_data"].is_u64(), "{v}");
+    // The two clocks have different origins on purpose: `first_data` runs from
+    // process start and includes the subscribe/handshake join latency, while
+    // `elapsed_ms` starts only once the handshake is done so it can serve as a
+    // rate denominator. Swapping them back to one clock breaks this.
+    assert!(
+        v["elapsed_ms"].as_u64() <= v["first_data"].as_u64(),
+        "elapsed_ms must exclude the handshake first_data includes: {v}"
+    );
     assert_eq!(v["first_packet"]["src"], "10.0.0.1:5004");
     // A clean partial: the shortfall is the deadline, not receiver lag.
     assert_eq!(v["lagged_count"], 0, "{v}");
