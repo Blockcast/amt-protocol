@@ -1,0 +1,69 @@
+name: AMT public-vantage probe
+
+# BLO-21823. Runs the real amt-verify from a GitHub-HOSTED runner (public egress,
+# arbitrary outbound UDP). Deliberately NOT a self-hosted ARC runner: those are
+# in-cluster, so the relay sees an RFC1918 source and its reply is unroutable.
+# That vantage artifact is what five weeks of in-cluster probes actually measured.
+
+on:
+  workflow_dispatch:
+    inputs:
+      relay:
+        description: Relay IPv4
+        default: "69.25.95.128"
+      source:
+        description: SSM source
+        default: "69.25.95.192"
+      group:
+        description: Multicast group
+        default: "232.1.1.60"
+      timeout:
+        description: Seconds to wait for first data
+        default: "30"
+  push:
+    branches: [blo-21823-public-amt-probe]
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      RELAY: ${{ inputs.relay || '69.25.95.128' }}
+      SOURCE: ${{ inputs.source || '69.25.95.192' }}
+      GROUP: ${{ inputs.group || '232.1.1.60' }}
+      TIMEOUT: ${{ inputs.timeout || '30' }}
+    steps:
+      - name: Vantage receipt
+        run: |
+          echo "utc=$(date -u +%FT%TZ)"
+          echo "public_ip=$(curl -fsS https://api.ipify.org)"
+          echo "target=$RELAY:2268 sg=($SOURCE,$GROUP)"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: amt-verify (real client, public vantage)
+        run: |
+          docker pull -q ghcr.io/blockcast/amt-verify:main
+          echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/blockcast/amt-verify:main)"
+          set +e
+          docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
+            --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
+            --timeout "$TIMEOUT" --packet-count 3 --json --verbose \
+            >report.json 2>verbose.log
+          echo "amt_verify_exit=$?"
+          set -e
+          echo '--- report.json ---'; cat report.json || true
+          echo '--- verbose.log ---'; cat verbose.log || true
+          sha256sum report.json verbose.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: amt-verify-receipt
+          path: |
+            report.json
+            verbose.log
