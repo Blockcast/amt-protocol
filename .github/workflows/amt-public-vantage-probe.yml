@@ -45,6 +45,17 @@ jobs:
           echo "utc=$(date -u +%FT%TZ)"
           echo "public_ip=$(curl -fsS https://api.ipify.org)"
           echo "target=$RELAY:2268 sg=($SOURCE,$GROUP)"
+          # BLO-33455. The fan-out ramp's stop rule is RECEIVER headroom: the
+          # relay fans one stream into N unicast tunnels and this NIC absorbs
+          # N x per-tunnel bitrate. At 1 GbE the knee is the runner; at 10 GbE
+          # it is plausibly the relay. Same ramp, opposite attributions -- so
+          # the line rate travels with every receipt rather than being re-derived.
+          # Virtualised NICs report -1 or nothing: that is `unknown`, never a
+          # spec-sheet guess. `unknown` means fall back to an empirical ceiling.
+          dev=$(ip -j route get 1.1.1.1 2>/dev/null | jq -r '.[0].dev // empty' || true)
+          speed=$(cat "/sys/class/net/$dev/speed" 2>/dev/null || true)
+          case "$speed" in ''|*[!0-9]*|0) speed=unknown ;; esac
+          echo "egress_dev=${dev:-unknown} nic_speed_mbps=$speed"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
