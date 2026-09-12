@@ -30,6 +30,19 @@ on:
       packet_count:
         description: Packets to receive before reporting ok
         default: "3"
+      tunnels:
+        description: >-
+          BLO-26574 step 1: number of CONCURRENT data-receiving tunnels to run
+          from this one runner, to find the HARNESS ceiling. Each is a separate
+          amt-verify process (one tunnel per process) sharing the runner netns
+          via --network host, so fds and NAT source ports are host-scoped —
+          which is what makes the ceiling measurable at all. Ramp this until
+          one of the four candidate binders gives (process/container count,
+          `ulimit -n`, NAT source-port exhaustion, 4-vCPU decap) and name which.
+          NOT the same knob as `amt-verify --tunnels N`, which holds N IDLE
+          gateways to measure control-plane tunnel-table occupancy and is
+          documented as NOT receiving data. That arm is BLO-33457.
+        default: "1"
   push:
     branches: [blo-21823-public-amt-probe]
 
@@ -46,6 +59,7 @@ jobs:
       GROUP: ${{ inputs.group || '232.1.1.60' }}
       TIMEOUT: ${{ inputs.timeout || '30' }}
       PACKETS: ${{ inputs.packet_count || '3' }}
+      TUNNELS: ${{ inputs.tunnels || '1' }}
     steps:
       - name: Vantage receipt
         run: |
@@ -157,11 +171,31 @@ jobs:
           udp_counters() { awk '/^Udp:/{n++; if (n==2) print}' /proc/net/snmp; }
           udp_before=$(udp_counters)
           t0=$(date +%s%3N)
-          docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
-            --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
-            --timeout "$TIMEOUT" --packet-count "$PACKETS" --json --verbose \
-            >report.json 2>verbose.log
-          status=$?
+          # BLO-26574 step 1 (harness ceiling). One tunnel per PROCESS, all in
+          # the runner netns. At TUNNELS=1 this is byte-identical in behaviour
+          # to the single `docker run` it replaces, including the exit code.
+          pids=""
+          for i in $(seq 1 "$TUNNELS"); do
+            docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
+              --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
+              --timeout "$TIMEOUT" --packet-count "$PACKETS" --json --verbose \
+              >"report-$i.json" 2>"verbose-$i.log" &
+            pids="$pids $!"
+          done
+          # Record what the RIG could even launch, before asking what the relay
+          # did. A launch that fails on fds or source ports is the harness
+          # ceiling and must not be read as a relay result.
+          echo "tunnels_requested=$TUNNELS"
+          echo "ulimit_n_soft=$(ulimit -Sn) ulimit_n_hard=$(ulimit -Hn)"
+          echo "nproc=$(nproc)"
+          i=0; status=0; ok=0
+          for p in $pids; do
+            i=$((i+1))
+            wait "$p"; s=$?
+            [ "$i" = 1 ] && status=$s
+            [ "$s" = 0 ] && ok=$((ok+1))
+            echo "tunnel_exit[$i]=$s"
+          done
           t1=$(date +%s%3N)
           udp_after=$(udp_counters)
           set -e
@@ -197,6 +231,7 @@ jobs:
               for (i = 2; i <= nh; i++) out = out sprintf(" %s=%d", H[i], A[i] - B[i])
               printf "udp_delta%s\n", out
             }'
+          echo "tunnels_exit_zero=$ok/$TUNNELS"
           echo "amt_verify_exit=$status"
           # BLO-27413: receiver-side saturation witness. The relay fans one
           # multicast stream into N unicast tunnels, so the receiving vantage
@@ -211,9 +246,31 @@ jobs:
           # has completed, so it excludes the handshake too.
           # Kept only as an outer bound and a cross-check on that constant.
           echo "wallclock_elapsed_ms=$((t1-t0))"
-          echo '--- report.json ---'; cat report.json || true
-          echo '--- verbose.log ---'; cat verbose.log || true
-          sha256sum report.json verbose.log
+          for i in $(seq 1 "$TUNNELS"); do
+            echo "--- report-$i.json ---"; cat "report-$i.json" || true
+          done
+          # verbose.log is per-tunnel and large; dump it only for the 1-tunnel
+          # case, where it is the handshake trace someone actually reads.
+          # `if`, not `[ ] && { }` — the latter returns 1 when TUNNELS != 1 and
+          # GitHub runs this under `bash -e`, so it would abort every ramp step.
+          if [ "$TUNNELS" = 1 ]; then echo '--- verbose-1.log ---'; cat verbose-1.log || true; fi
+          sha256sum report-*.json verbose-*.log
+          # BLO-26574: the (S,G) GUARD. The dispatch defaults are cast
+          # (69.25.95.192, 232.1.1.60); a caller who omits inputs silently
+          # measures a different stream than intended, and until now the `sg=`
+          # echo was the only tell. That cost a retracted 2.75x-low per-tunnel
+          # figure. report.json carries the tuple the client actually joined, so
+          # assert it rather than printing it: a receipt that disagrees with the
+          # caller's intent fails the job.
+          for i in $(seq 1 "$TUNNELS"); do
+            got_s=$(jq -r '.source // "null"' "report-$i.json")
+            got_g=$(jq -r '.group  // "null"' "report-$i.json")
+            if [ "$got_s" != "$SOURCE" ] || [ "$got_g" != "$GROUP" ]; then
+              echo "::error::receipt $i joined ($got_s,$got_g), caller asked for ($SOURCE,$GROUP)"
+              exit 90
+            fi
+          done
+          echo "sg_guard=ok ($SOURCE,$GROUP) on $TUNNELS receipt(s)"
           # A probe that cannot fail is not a probe: surface the client's verdict
           # as the job's verdict. Receipts still upload via `if: always()`.
           exit "$status"
@@ -222,5 +279,5 @@ jobs:
         with:
           name: amt-verify-receipt
           path: |
-            report.json
-            verbose.log
+            report-*.json
+            verbose-*.log
