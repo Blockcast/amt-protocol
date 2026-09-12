@@ -4,7 +4,7 @@
 //! Captures inbound datagram types so tests can assert on them.
 
 use amt_protocol::messages::AmtMessage;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -42,12 +42,27 @@ impl FakeRelay {
     /// - Responds to Request with a MembershipQuery
     /// - After Update, emits one MulticastData with a synthetic v4+UDP packet
     pub fn spawn(&self, inner_payload: Vec<u8>) {
+        self.spawn_advertising(inner_payload, None);
+    }
+
+    /// As `spawn`, but advertises `advertise` as the relay address instead of
+    /// this relay's own. Used to force a gateway-side `send_to` failure: the
+    /// gateway redirects all later traffic to the advertised address, so
+    /// advertising a broadcast address makes the next send fail EACCES on a
+    /// socket without SO_BROADCAST. That is the only way to drive the runtime's
+    /// fatal-socket-error path from outside the process.
+    pub fn spawn_advertising(&self, inner_payload: Vec<u8>, advertise: Option<IpAddr>) {
         let sock = self.sock.clone();
         let captured = self.captured.clone();
-        let relay_ip = self.addr.ip();
+        let relay_ip = advertise.unwrap_or_else(|| self.addr.ip());
         tokio::spawn(async move {
             let mut buf = [0u8; 65535];
-            let mut req_nonce: u32 = 0;
+            // Keyed by the gateway's ephemeral source address, NOT a single
+            // shared slot: `--tunnels N` puts N gateways on this one relay
+            // socket concurrently, and a shared nonce means gateway B's
+            // Request invalidates gateway A's in-flight Update.
+            let mut req_nonce: std::collections::HashMap<SocketAddr, u32> =
+                std::collections::HashMap::new();
             let mac: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
             loop {
                 let (n, src) = match sock.recv_from(&mut buf).await {
@@ -72,7 +87,7 @@ impl FakeRelay {
                         let _ = sock.send_to(&advert.encode(), src).await;
                     }
                     AmtMessage::Request { request_nonce, .. } => {
-                        req_nonce = request_nonce;
+                        req_nonce.insert(src, request_nonce);
                         let query = AmtMessage::MembershipQuery {
                             request_nonce,
                             response_mac: mac,
@@ -85,7 +100,7 @@ impl FakeRelay {
                         response_mac,
                         ..
                     } => {
-                        if request_nonce == req_nonce && response_mac == mac {
+                        if req_nonce.get(&src) == Some(&request_nonce) && response_mac == mac {
                             let data = AmtMessage::MulticastData {
                                 ip_packet: inner_payload.clone(),
                             };

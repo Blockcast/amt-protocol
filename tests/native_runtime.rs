@@ -143,3 +143,66 @@ async fn subscribe_v4_relay_rejects_v6_group() {
 
     gw.shutdown().await.unwrap();
 }
+
+/// A fatal socket error must make the gateway report itself DEAD.
+///
+/// Regression guard for the `--tunnels` liveness verdict (BLO-33457). The
+/// runtime published whatever state the SubscriptionManager last reported, and
+/// the manager cannot observe socket failures — so a gateway whose task had
+/// already died on a send error still read `Active`. That is precisely the
+/// shape `amt-verify` counts as a surviving tunnel, so a host-side send failure
+/// during a ramp would have inflated the measured ceiling instead of showing up
+/// as an instrument failure.
+///
+/// The relay advertises 255.255.255.255, so the gateway redirects there and its
+/// next `send_to` fails EACCES on a socket without SO_BROADCAST. This is the
+/// only way to drive the fatal-socket path from outside the process: the
+/// destination is fixed for the session, so a send failure reachable *after* a
+/// completed handshake cannot be forced without a production fault-injection
+/// seam.
+#[tokio::test(flavor = "current_thread")]
+async fn fatal_send_error_reports_dead_not_active() {
+    let relay = FakeRelay::bind("v4").await;
+    relay.spawn_advertising(
+        synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x"),
+        Some("255.255.255.255".parse().unwrap()),
+    );
+
+    let gw = AsyncAmtGateway::builder(relay.addr.ip())
+        .relay_port(relay.addr.port())
+        .keepalive(Duration::from_secs(1))
+        .build()
+        .await
+        .expect("build gateway");
+
+    gw.subscribe(
+        "232.0.0.1".parse().unwrap(),
+        Some("10.0.0.1".parse().unwrap()),
+    )
+    .await
+    .expect("subscribe");
+
+    // Let discovery -> advertisement -> redirected (failing) send play out.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert!(
+        gw.has_fatal().await,
+        "a failed send_to must be recorded as a fatal runtime error"
+    );
+    // Closed specifically, not merely "not Active": the contract is that a
+    // gateway whose runtime task has exited reports Closed on EVERY exit path.
+    // Before this was published explicitly the runtime left whatever state the
+    // manager last reported (here `Idle`/`Requesting`, but `Active` when the
+    // failure lands after a completed handshake), which is what let a caller
+    // count a dead tunnel as live state.
+    assert_eq!(
+        gw.state(),
+        amt_protocol::GatewayState::Closed,
+        "a gateway whose runtime died on a socket error must report Closed"
+    );
+    assert_eq!(
+        gw.keepalives_sent(),
+        0,
+        "a keep-alive that never left the process must not be counted as one"
+    );
+}
