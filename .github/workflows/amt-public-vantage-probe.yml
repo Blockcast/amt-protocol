@@ -135,8 +135,17 @@ jobs:
   # 2026-09-12. The OTHER relay -- Service/blockcastd-amt-relay, the gw-* one
   # whose job="production-amt-relay" reports amt_relay_tunnel_limit=0 -- is
   # ClusterIP-only and has no public 2268, so a public-vantage ramp cannot
-  # accidentally measure it. Corroborate against
-  # amt_relay_active_tunnels{job="production-amt-relay-linux"} (limit 10000).
+  # accidentally measure it.
+  #
+  # THE WITNESS IS RECEIVER-SIDE, and that is a correction, not a preference.
+  # The AC originally wanted amt_relay_active_tunnels{job="production-amt-relay-linux"}
+  # corroborating each step. That gauge is DEAD on both production relays
+  # (linux: never non-zero in 30d; juniper: zero variance in 30d, pinned at 1 --
+  # BLO-33457). A ramp joined against it reports 0 occupancy at every N, which
+  # reads as a relay defect rather than a dead dial. So the witness is
+  # `alive` from the client: how many of N reached Active and sustained it past
+  # a keep-alive interval. Its positive control is in-tree
+  # (each_deliberate_failure_mode_reduces_the_alive_count).
   tunnels-ramp:
     if: ${{ inputs.mode == 'tunnels-ramp' }}
     runs-on: ubuntu-latest
@@ -147,6 +156,13 @@ jobs:
       STEPS: ${{ inputs.ramp_steps || '1,8,64,256,1024,4096,8192,10000' }}
       HOLD: ${{ inputs.hold || '25' }}
       KEEPALIVE: ${{ inputs.keepalive || '10' }}
+      # Raised inside the container for every docker run below. Declared once so
+      # the value enforced against max N cannot drift from the value applied.
+      CONTAINER_NOFILE: '1048576'
+      # Instrument ceiling, not a relay limit: ~10 KB/tunnel measured to N=10000
+      # in one process (tunnels_mode_scales_to_512_concurrent doc comment).
+      # Above this the RIG is unvalidated, so a knee there is unattributable.
+      MAX_SUPPORTED_N: '10000'
     steps:
       - name: Vantage receipt
         run: |
@@ -154,42 +170,118 @@ jobs:
           echo "public_ip=$(curl -fsS https://api.ipify.org)"
           echo "target=$RELAY:2268 sg=($SOURCE,$GROUP) steps=$STEPS"
 
+      # THE STEP LIST IS A CONTRACT AND IT WAS NEVER CHECKED.
+      #
+      # Everything downstream assumes ascending order. The ramp stops at the
+      # first step that establishes nothing, and the verdict reads the run of
+      # fully-alive steps as a prefix. Fed `1024,8` those two disagree with each
+      # other and both report confidently: the ramp could stop below the
+      # configured cap, or the verdict could name a knee above an N that had
+      # already failed. Neither shows up as an error -- the numbers just mean
+      # something other than what they say.
+      - name: Validate ramp steps
+        run: |
+          steps=$(echo "$STEPS" | tr ',' ' ')
+          [ -n "$(echo "$steps" | tr -d ' ')" ] || { echo "::error::ramp_steps is empty"; exit 1; }
+          prev=0
+          for n in $steps; do
+            case "$n" in
+              ''|*[!0-9]*) echo "::error::ramp step '$n' is not a non-negative integer"; exit 1 ;;
+            esac
+            [ "$n" -gt 0 ] || { echo "::error::ramp step '$n' must be > 0"; exit 1; }
+            if [ "$n" -le "$prev" ]; then
+              echo "::error::ramp steps must be STRICTLY ASCENDING ($n follows $prev). The stop rule and the verdict both read the list in order; unsorted input makes both wrong without failing."
+              exit 1
+            fi
+            if [ "$n" -gt "$MAX_SUPPORTED_N" ]; then
+              echo "::error::ramp step $n exceeds MAX_SUPPORTED_N=$MAX_SUPPORTED_N -- the rig is only validated to that N, so a knee above it could not be attributed to the relay"
+              exit 1
+            fi
+            prev=$n
+          done
+          echo "steps_validated=$steps"
+
       # INSTRUMENT CEILINGS, MEASURED BEFORE THE FIRST STEP.
       #
       # Each of these would present as a relay-side state knee if it bound
       # first, which is the specific way this measurement gets silently wrong:
       # the ramp would report a ceiling that is really the runner's.
       #
-      #   nofile      -- soft default on ubuntu-latest is 1024, an order of
-      #                  magnitude under AMT_MAX_TUNNELS=10000. One socket per
-      #                  tunnel, so this alone caps the ramp near ~1000.
-      #   port range  -- the relay keys tunnels by source (IP, port), so N
-      #                  tunnels need N distinct source ports. The usable span
-      #                  is a hard ceiling on N from a single vantage.
-      #   conntrack   -- NAT state table; N flows need N entries.
-      - name: Host ceilings (recorded, not assumed)
+      # Every ceiling below is either ENFORCED against max N or explicitly
+      # labelled an OBSERVATION with its failure signature named. Recording a
+      # number and then not comparing it is the worst of both: it reads as a
+      # guard in the log and guards nothing.
+      #
+      #   ENFORCED
+      #     port range  -- the relay keys tunnels by source (IP, port), so N
+      #                    tunnels need N distinct source ports. Hard ceiling on
+      #                    N from a single vantage; exhaustion is silent.
+      #     nofile      -- one socket per tunnel. The RUNNER's soft default is
+      #                    1024, but the client runs in a container with
+      #                    --ulimit nofile=$CONTAINER_NOFILE, so the container
+      #                    value is the binder and is what gets compared. The
+      #                    runner's own limit is recorded as context only.
+      #     conntrack   -- NAT state table; N flows need N entries. Enforced
+      #                    when readable; when not, downgraded to an observation
+      #                    rather than silently skipped.
+      #
+      #   OBSERVATIONS (recorded, NOT enforced -- no defensible per-tunnel
+      #   constant to compare against, so a threshold here would be invented)
+      #     nproc / mem -- these do not produce a clean shortfall. CPU
+      #                    starvation shows up as establishment TIMEOUTS
+      #                    (establish_errors, "timed out ... Discovering") and
+      #                    memory pressure as an OOM-killed container (step
+      #                    exit 137, established=0). Both are distinguishable
+      #                    from a relay knee in the artifact IF you look: a
+      #                    relay-side ceiling refuses new tunnels while the
+      #                    established ones stay alive, whereas a host-side one
+      #                    degrades the whole step. Read establish_errors and
+      #                    not_alive before attributing any knee.
+      - name: Host ceilings (recorded, then enforced or labelled)
         run: |
           {
-            echo "nofile_soft=$(ulimit -Sn)"
-            echo "nofile_hard=$(ulimit -Hn)"
+            echo "runner_nofile_soft=$(ulimit -Sn)"
+            echo "runner_nofile_hard=$(ulimit -Hn)"
+            echo "container_nofile=$CONTAINER_NOFILE"
             echo "ip_local_port_range=$(cat /proc/sys/net/ipv4/ip_local_port_range)"
             lo=$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range)
             hi=$(awk '{print $2}' /proc/sys/net/ipv4/ip_local_port_range)
             echo "source_ports_available=$((hi-lo+1))"
             echo "nf_conntrack_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo unavailable)"
-            echo "nproc=$(nproc)"
-            echo "mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)"
+            echo "nproc=$(nproc)                # OBSERVATION"
+            echo "mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)   # OBSERVATION"
           } | tee host-ceilings.txt
-          # The largest requested N must fit under every ceiling above, or the
-          # ramp is measuring this runner. Fail LOUDLY here rather than
-          # producing a plausible number.
+
+          # The largest requested N must fit under every ENFORCED ceiling, or
+          # the ramp is measuring this runner. Fail LOUDLY rather than produce
+          # a plausible number.
           max_n=$(echo "$STEPS" | tr ',' '\n' | sort -n | tail -1)
+          echo "max_requested_n=$max_n" | tee -a host-ceilings.txt
+          fail=0
+
           ports=$(sed -n 's/^source_ports_available=//p' host-ceilings.txt)
-          echo "max_requested_n=$max_n"
           if [ "$max_n" -gt "$ports" ]; then
             echo "::error::max N ($max_n) exceeds available source ports ($ports) -- the ramp would measure SNAT exhaustion, not relay state"
-            exit 1
+            fail=1
           fi
+
+          # One socket per tunnel plus the process's own handles. Headroom is
+          # deliberate: at the cap the shortfall would otherwise land exactly
+          # where the knee is expected.
+          if [ "$max_n" -ge "$CONTAINER_NOFILE" ]; then
+            echo "::error::max N ($max_n) is at or above the container nofile limit ($CONTAINER_NOFILE) -- 'Too many open files' would be recorded as a relay knee"
+            fail=1
+          fi
+
+          ct=$(sed -n 's/^nf_conntrack_max=//p' host-ceilings.txt)
+          if [ "$ct" = "unavailable" ]; then
+            echo "::warning::nf_conntrack_max unreadable -- DOWNGRADED to an observation. If a step degrades near a round number, suspect NAT state before the relay."
+          elif [ "$max_n" -gt "$ct" ]; then
+            echo "::error::max N ($max_n) exceeds nf_conntrack_max ($ct) -- NAT state exhaustion would be recorded as a relay knee"
+            fail=1
+          fi
+
+          [ "$fail" -eq 0 ] || exit 1
 
       - uses: docker/login-action@v3
         with:
@@ -217,7 +309,8 @@ jobs:
       - name: N=1 positive control (a ramp on a non-establishing tuple is void)
         run: |
           set +e
-          docker run --rm --network host --ulimit nofile=1048576:1048576 \
+          docker run --rm --network host \
+            --ulimit "nofile=$CONTAINER_NOFILE:$CONTAINER_NOFILE" \
             ghcr.io/blockcast/amt-verify:main \
             --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
             --tunnels 1 --keepalive "$KEEPALIVE" --hold "$HOLD" --json \
@@ -232,13 +325,11 @@ jobs:
             exit 1
           fi
 
-      # Per-step UTC start/end are load-bearing, not bookkeeping. The ramp runs
-      # from a PUBLIC runner (in-cluster clients get DISCOVERY logged and
-      # nothing back -- BLO-27413) while Prometheus is in-cluster and
-      # unreachable from here, so the two halves of AC 2 cannot be captured by
-      # one process. The relay-side series is pulled afterwards as a range query
-      # over this window and joined per step -- which is only possible if the
-      # timestamps were recorded while the ramp ran.
+      # Per-step UTC start/end. The relay-side join these were originally for is
+      # off the table (amt_relay_active_tunnels is dead -- see the job header),
+      # but they stay: they are what lets a step be correlated with the relay
+      # pod's own CPU/memory series, with LB behaviour, or with anything else
+      # measured later. Unrecordable after the fact, cheap now.
       - name: Ramp
         run: |
           echo '[]' > ramp-index.json
@@ -246,7 +337,8 @@ jobs:
             t0=$(date -u +%FT%TZ)
             echo "=== N=$n start=$t0 ==="
             set +e
-            docker run --rm --network host --ulimit nofile=1048576:1048576 \
+            docker run --rm --network host \
+              --ulimit "nofile=$CONTAINER_NOFILE:$CONTAINER_NOFILE" \
               ghcr.io/blockcast/amt-verify:main \
               --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
               --tunnels "$n" --keepalive "$KEEPALIVE" --hold "$HOLD" --json \
@@ -274,17 +366,33 @@ jobs:
       # AC 4: a clean completion at the cap is "ceiling >= cap, config-bound",
       # NOT "no state knee". Those are different findings and only one of them
       # is honest about what was and was not shown.
+      #
+      # `top` is the last step of the LEADING RUN of fully-alive steps, not the
+      # largest fully-alive step anywhere in the list. With a degraded step at
+      # 256 and a clean one at 1024, `max` would report a ceiling above an N
+      # that had already failed. The leading run is the only reading that says
+      # "every N up to here held", which is the claim BLO-20175 sizes against.
       - name: Verdict
         run: |
           cap=$(echo "$STEPS" | tr ',' '\n' | sort -n | tail -1)
-          top=$(jq -r '[.[]|select(.report.alive == .requested)]|last|.requested // 0' ramp-index.json)
-          echo "highest_fully_alive_N=$top cap=$cap"
+          top=$(jq -r '
+            (map((.report.alive // -1) == .requested) | index(false)) as $i
+            | (if $i == null then . else .[0:$i] end)
+            | if length == 0 then 0 else .[-1].requested end' ramp-index.json)
+          ran=$(jq -r 'length' ramp-index.json)
+          echo "highest_fully_alive_N=$top cap=$cap steps_run=$ran"
           if [ "$top" = "$cap" ]; then
             echo "verdict=ceiling >= $cap, config-bound (NOT 'no state knee': the ramp ended at the configured cap, so no knee was reached or excluded above it)" | tee verdict.txt
           else
             echo "verdict=knee at N>$top (first degraded step above $top); see ramp-index.json for the named host-side vs relay-side split" | tee verdict.txt
           fi
-          echo "NOTE: control-plane tunnel-table ceiling, not a loaded-state ceiling. Every step report carries the caveat inline." | tee -a verdict.txt
+          # A knee is only the RELAY's if nothing host-side bound first. The
+          # tool attributes these by name; surface them next to the verdict so
+          # the two are not read apart.
+          jq -r '[.[]|select((.report.establish_errors // {}) != {} or (.report.not_alive // {}) != {})
+                 |{requested, establish_errors:.report.establish_errors, not_alive:.report.not_alive}]' \
+             ramp-index.json | tee -a verdict.txt
+          echo "NOTE: control-plane tunnel-table ceiling, not a loaded-state ceiling. Witness is RECEIVER-SIDE (client 'alive'); relay-side amt_relay_active_tunnels is dead and was deliberately not used. Every step report carries the caveat inline." | tee -a verdict.txt
 
       - uses: actions/upload-artifact@v4
         if: always()

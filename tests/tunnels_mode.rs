@@ -92,10 +92,13 @@ async fn tunnels_mode_reports_per_tunnel_survival() {
 
     // BLO-33457 acceptance criterion: the control-plane-vs-loaded-state caveat
     // travels WITH the numbers, so a raw per-step artifact cannot be read as a
-    // loaded ceiling.
+    // loaded ceiling. It must ALSO name the witness as receiver-side: the
+    // relay's amt_relay_active_tunnels is dead on both production relays, so a
+    // reader sent there for corroboration reads 0 and calls it a relay defect.
     let caveat = v["caveat"].as_str().expect("caveat field");
     assert!(caveat.contains("CONTROL-PLANE"), "{caveat}");
-    assert!(caveat.contains("amt_relay_active_tunnels"), "{caveat}");
+    assert!(caveat.contains("RECEIVER-SIDE"), "{caveat}");
+    assert!(caveat.contains("ATTRIBUTION"), "{caveat}");
 }
 
 /// A relay that never answers. The knee case: the report must say `degraded`
