@@ -30,6 +30,30 @@ on:
       packet_count:
         description: Packets to receive before reporting ok
         default: "3"
+      mode:
+        description: >-
+          oneshot = the BLO-21823 data-receipt probe (default, unchanged).
+          tunnels-ramp = the BLO-33457 tunnel-STATE occupancy ramp.
+        type: choice
+        options: [oneshot, tunnels-ramp]
+        default: oneshot
+      ramp_steps:
+        description: >-
+          tunnels-ramp only. Comma-separated N values, ascending. The cap is
+          AMT_MAX_TUNNELS=10000 on production-amt-relay-linux (read live from
+          amt_relay_tunnel_limit, 2026-09-12).
+        default: "1,8,64,256,1024,4096,8192,10000"
+      hold:
+        description: >-
+          tunnels-ramp only. Seconds to hold tunnels open after the last one is
+          established, before reading the survival verdict. Must exceed
+          --keepalive so every tunnel can emit >=1 keep-alive Membership Update
+          (BLO-33457 AC 3); amt-verify exits 2 rather than reporting a false
+          knee if it does not.
+        default: "25"
+      keepalive:
+        description: tunnels-ramp only. Keep-alive interval in seconds.
+        default: "10"
   push:
     branches: [blo-21823-public-amt-probe]
 
@@ -39,6 +63,7 @@ permissions:
 
 jobs:
   probe:
+    if: ${{ (inputs.mode || 'oneshot') == 'oneshot' }}
     runs-on: ubuntu-latest
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
@@ -99,3 +124,178 @@ jobs:
           path: |
             report.json
             verbose.log
+
+  # BLO-33457. Tunnel-STATE occupancy ramp: how many concurrent AMT tunnels can
+  # the linux relay hold in its tunnel table? This is the MX301-M leg of
+  # BLO-20175's sizing model, which is a STATE claim (tunnel-limit 16,384), not
+  # the throughput claim BLO-26574 measures.
+  #
+  # Target is 69.25.95.128:2268 = Service/blockcastd-amt-relay-linux
+  # (LoadBalancer, selector app.kubernetes.io/name=amt-relay-linux), verified
+  # 2026-09-12. The OTHER relay -- Service/blockcastd-amt-relay, the gw-* one
+  # whose job="production-amt-relay" reports amt_relay_tunnel_limit=0 -- is
+  # ClusterIP-only and has no public 2268, so a public-vantage ramp cannot
+  # accidentally measure it. Corroborate against
+  # amt_relay_active_tunnels{job="production-amt-relay-linux"} (limit 10000).
+  tunnels-ramp:
+    if: ${{ inputs.mode == 'tunnels-ramp' }}
+    runs-on: ubuntu-latest
+    env:
+      RELAY: ${{ inputs.relay || '69.25.95.128' }}
+      SOURCE: ${{ inputs.source || '69.25.95.192' }}
+      GROUP: ${{ inputs.group || '232.1.1.60' }}
+      STEPS: ${{ inputs.ramp_steps || '1,8,64,256,1024,4096,8192,10000' }}
+      HOLD: ${{ inputs.hold || '25' }}
+      KEEPALIVE: ${{ inputs.keepalive || '10' }}
+    steps:
+      - name: Vantage receipt
+        run: |
+          echo "utc=$(date -u +%FT%TZ)"
+          echo "public_ip=$(curl -fsS https://api.ipify.org)"
+          echo "target=$RELAY:2268 sg=($SOURCE,$GROUP) steps=$STEPS"
+
+      # INSTRUMENT CEILINGS, MEASURED BEFORE THE FIRST STEP.
+      #
+      # Each of these would present as a relay-side state knee if it bound
+      # first, which is the specific way this measurement gets silently wrong:
+      # the ramp would report a ceiling that is really the runner's.
+      #
+      #   nofile      -- soft default on ubuntu-latest is 1024, an order of
+      #                  magnitude under AMT_MAX_TUNNELS=10000. One socket per
+      #                  tunnel, so this alone caps the ramp near ~1000.
+      #   port range  -- the relay keys tunnels by source (IP, port), so N
+      #                  tunnels need N distinct source ports. The usable span
+      #                  is a hard ceiling on N from a single vantage.
+      #   conntrack   -- NAT state table; N flows need N entries.
+      - name: Host ceilings (recorded, not assumed)
+        run: |
+          {
+            echo "nofile_soft=$(ulimit -Sn)"
+            echo "nofile_hard=$(ulimit -Hn)"
+            echo "ip_local_port_range=$(cat /proc/sys/net/ipv4/ip_local_port_range)"
+            lo=$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range)
+            hi=$(awk '{print $2}' /proc/sys/net/ipv4/ip_local_port_range)
+            echo "source_ports_available=$((hi-lo+1))"
+            echo "nf_conntrack_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo unavailable)"
+            echo "nproc=$(nproc)"
+            echo "mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)"
+          } | tee host-ceilings.txt
+          # The largest requested N must fit under every ceiling above, or the
+          # ramp is measuring this runner. Fail LOUDLY here rather than
+          # producing a plausible number.
+          max_n=$(echo "$STEPS" | tr ',' '\n' | sort -n | tail -1)
+          ports=$(sed -n 's/^source_ports_available=//p' host-ceilings.txt)
+          echo "max_requested_n=$max_n"
+          if [ "$max_n" -gt "$ports" ]; then
+            echo "::error::max N ($max_n) exceeds available source ports ($ports) -- the ramp would measure SNAT exhaustion, not relay state"
+            exit 1
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image receipt
+        run: |
+          docker pull -q ghcr.io/blockcast/amt-verify:main
+          {
+            echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/blockcast/amt-verify:main)"
+            echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/blockcast/amt-verify:main)"
+          } | tee image-receipt.txt
+
+      # POSITIVE CONTROL, and it gates the ramp.
+      #
+      # BLO-20175's liveness AC exists because a relay that answers NOTHING
+      # produces a clean-looking sweep: 0 tunnels, 0 drops, no stop rule ever
+      # trips, and the ramp reports "no knee through N=10000" -- i.e. maximal
+      # capacity -- for a relay that established nothing. An idle (S,G) is
+      # deliberate here (the witness is tunnel-table occupancy, not data
+      # receipt), but "idle" must not be allowed to shade into "the relay
+      # ignores this tuple". One tunnel must come up first, or the ramp is void.
+      - name: N=1 positive control (a ramp on a non-establishing tuple is void)
+        run: |
+          set +e
+          docker run --rm --network host --ulimit nofile=1048576:1048576 \
+            ghcr.io/blockcast/amt-verify:main \
+            --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
+            --tunnels 1 --keepalive "$KEEPALIVE" --hold "$HOLD" --json \
+            >control.json 2>control.log
+          status=$?
+          set -e
+          echo "control_exit=$status"; cat control.json || true
+          alive=$(jq -r '.alive // 0' control.json 2>/dev/null || echo 0)
+          if [ "$alive" != "1" ]; then
+            echo "::error::N=1 control did not establish+survive (alive=$alive). Ramp aborted: a sweep from here would report a false ceiling."
+            cat control.log || true
+            exit 1
+          fi
+
+      # Per-step UTC start/end are load-bearing, not bookkeeping. The ramp runs
+      # from a PUBLIC runner (in-cluster clients get DISCOVERY logged and
+      # nothing back -- BLO-27413) while Prometheus is in-cluster and
+      # unreachable from here, so the two halves of AC 2 cannot be captured by
+      # one process. The relay-side series is pulled afterwards as a range query
+      # over this window and joined per step -- which is only possible if the
+      # timestamps were recorded while the ramp ran.
+      - name: Ramp
+        run: |
+          echo '[]' > ramp-index.json
+          for n in $(echo "$STEPS" | tr ',' ' '); do
+            t0=$(date -u +%FT%TZ)
+            echo "=== N=$n start=$t0 ==="
+            set +e
+            docker run --rm --network host --ulimit nofile=1048576:1048576 \
+              ghcr.io/blockcast/amt-verify:main \
+              --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
+              --tunnels "$n" --keepalive "$KEEPALIVE" --hold "$HOLD" --json \
+              >"step-$n.json" 2>"step-$n.log"
+            rc=$?
+            set -e
+            t1=$(date -u +%FT%TZ)
+            echo "N=$n exit=$rc end=$t1"; cat "step-$n.json" || true
+            jq --argjson n "$n" --arg t0 "$t0" --arg t1 "$t1" --argjson rc "$rc" \
+               --slurpfile r "step-$n.json" \
+               '. + [{requested:$n, started_utc:$t0, ended_utc:$t1, exit:$rc,
+                      report:($r[0] // null)}]' \
+               ramp-index.json > tmp.json && mv tmp.json ramp-index.json
+            # A degraded step IS the measurement -- it is where the knee is --
+            # so the loop does not stop on a non-zero exit. It stops only when
+            # nothing came up at all, which means every larger N is wasted.
+            est=$(jq -r '.established // 0' "step-$n.json" 2>/dev/null || echo 0)
+            if [ "$est" = "0" ]; then
+              echo "::warning::N=$n established 0 tunnels; stopping the ramp"
+              break
+            fi
+          done
+          echo '--- ramp-index.json ---'; jq . ramp-index.json
+
+      # AC 4: a clean completion at the cap is "ceiling >= cap, config-bound",
+      # NOT "no state knee". Those are different findings and only one of them
+      # is honest about what was and was not shown.
+      - name: Verdict
+        run: |
+          cap=$(echo "$STEPS" | tr ',' '\n' | sort -n | tail -1)
+          top=$(jq -r '[.[]|select(.report.alive == .requested)]|last|.requested // 0' ramp-index.json)
+          echo "highest_fully_alive_N=$top cap=$cap"
+          if [ "$top" = "$cap" ]; then
+            echo "verdict=ceiling >= $cap, config-bound (NOT 'no state knee': the ramp ended at the configured cap, so no knee was reached or excluded above it)" | tee verdict.txt
+          else
+            echo "verdict=knee at N>$top (first degraded step above $top); see ramp-index.json for the named host-side vs relay-side split" | tee verdict.txt
+          fi
+          echo "NOTE: control-plane tunnel-table ceiling, not a loaded-state ceiling. Every step report carries the caveat inline." | tee -a verdict.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: amt-tunnels-ramp
+          path: |
+            host-ceilings.txt
+            image-receipt.txt
+            control.json
+            control.log
+            ramp-index.json
+            verdict.txt
+            step-*.json
+            step-*.log
