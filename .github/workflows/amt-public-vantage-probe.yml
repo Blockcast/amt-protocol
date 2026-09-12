@@ -20,6 +20,9 @@ on:
       timeout:
         description: Seconds to wait for first data
         default: "30"
+      packet_count:
+        description: Packets to receive before reporting ok
+        default: "3"
   push:
     branches: [blo-21823-public-amt-probe]
 
@@ -35,6 +38,7 @@ jobs:
       SOURCE: ${{ inputs.source || '69.25.95.192' }}
       GROUP: ${{ inputs.group || '232.1.1.60' }}
       TIMEOUT: ${{ inputs.timeout || '30' }}
+      PACKETS: ${{ inputs.packet_count || '3' }}
     steps:
       - name: Vantage receipt
         run: |
@@ -53,13 +57,22 @@ jobs:
           # BLO-21823 AC#3 wants the client commit alongside the artifact hash.
           echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/blockcast/amt-verify:main)"
           set +e
+          t0=$(date +%s%3N)
           docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
             --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
-            --timeout "$TIMEOUT" --packet-count 3 --json --verbose \
+            --timeout "$TIMEOUT" --packet-count "$PACKETS" --json --verbose \
             >report.json 2>verbose.log
           status=$?
+          t1=$(date +%s%3N)
           set -e
           echo "amt_verify_exit=$status"
+          # BLO-27413: receiver-side saturation witness. The relay fans one
+          # multicast stream into N unicast tunnels, so the receiving vantage
+          # absorbs N x stream_bitrate. Without a per-tunnel bitrate there is no
+          # way to tell a relay knee from the receiver's own ceiling -- which is
+          # the same class of error as the five weeks that measured probe vantage.
+          # elapsed_ms + byte_count + timings_ms.first_data size that ceiling.
+          echo "elapsed_ms=$((t1-t0))"
           echo '--- report.json ---'; cat report.json || true
           echo '--- verbose.log ---'; cat verbose.log || true
           sha256sum report.json verbose.log
