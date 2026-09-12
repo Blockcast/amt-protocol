@@ -57,11 +57,15 @@ jobs:
             --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
             --timeout "$TIMEOUT" --packet-count 3 --json --verbose \
             >report.json 2>verbose.log
-          echo "amt_verify_exit=$?"
+          status=$?
           set -e
+          echo "amt_verify_exit=$status"
           echo '--- report.json ---'; cat report.json || true
           echo '--- verbose.log ---'; cat verbose.log || true
           sha256sum report.json verbose.log
+          # A probe that cannot fail is not a probe: surface the client's verdict
+          # as the job's verdict. Receipts still upload via `if: always()`.
+          exit "$status"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
