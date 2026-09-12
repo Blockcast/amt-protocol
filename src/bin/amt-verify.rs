@@ -313,9 +313,13 @@ impl SeqTracker {
 
 #[derive(serde::Serialize)]
 struct MmtpLoss {
-    /// Distinct `packet_id` values seen. The catalog this stream publishes
-    /// advertises 8: three video renditions plus audio, each with a RaptorQ
-    /// repair track.
+    /// Distinct `packet_id` values seen. The catalog advertises 8 — three video
+    /// renditions plus audio, each with a RaptorQ repair track — but two 90 s
+    /// public-vantage receipts both observed 9 (runs 34703831798 / 34703980464,
+    /// BLO-33456, 245,442 packets, `implausible: 0`). The 9th track is NOT
+    /// explained: `packet_id` 0 carried the first packet in both receipts, which
+    /// is where MMT conventionally puts signalling, but nothing here has
+    /// confirmed that. Do not treat 8 as the expected value.
     tracks: usize,
     /// Adjacent per-track arrivals whose sequence numbers differed by exactly 1.
     in_sequence: u64,
