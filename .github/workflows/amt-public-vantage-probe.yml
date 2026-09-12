@@ -519,14 +519,28 @@ jobs:
             | if length == 0 then 0 else .[-1].requested end' ramp-index.json)
           ran=$(jq -r 'length' ramp-index.json)
           echo "highest_fully_alive_N=$top cap=$cap steps_run=$ran"
+          # A shortfall is the RELAY's tunnel table only if its cause says so.
+          # This is a POSITIVE test for relay attribution, not a blocklist of
+          # host-side symptoms: an error string nobody has seen before must fall
+          # through to "not a relay knee", because that is the direction a capex
+          # number is safe to be wrong in. (An earlier blocklist spelling of this
+          # matched "refused" and so swallowed "relay refused: tunnel table
+          # full" -- the negative control below exists to keep that fixed.)
+          # Surfacing-without-enforcing is the fourth instance of that pattern in
+          # this file; the other three were the ramp contract, the host ceilings,
+          # and the image label.
+          causes=$(jq -r '.[]|select((.report.alive // -1) != .requested)
+            |(((.report.establish_errors // {})|keys[]?),((.report.not_alive // {})|keys[]?))' ramp-index.json)
+          n_relay=$(echo "$causes" | grep -cEi 'relay (refused|rejected)|tunnel[ -](table|limit)|no more tunnels' || true)
+          n_other=$(echo "$causes" | grep -cvEi 'relay (refused|rejected)|tunnel[ -](table|limit)|no more tunnels' || true)
+          [ -z "$causes" ] && n_relay=0 && n_other=0
           if [ "$top" = "$cap" ]; then
             echo "verdict=ceiling >= $cap, config-bound (NOT 'no state knee': the ramp ended at the configured cap, so no knee was reached or excluded above it)" | tee verdict.txt
+          elif [ "$n_relay" -gt 0 ] && [ "$n_other" -eq 0 ]; then
+            echo "verdict=knee at N>$top (first degraded step above $top; every shortfall is relay-attributed -- see ramp-index.json)" | tee verdict.txt
           else
-            echo "verdict=knee at N>$top (first degraded step above $top); see ramp-index.json for the named host-side vs relay-side split" | tee verdict.txt
+            echo "verdict=degraded above N=$top, BINDER NOT ESTABLISHED ($n_other cause(s) not attributed to the relay). NOT a relay knee: a bare transport failure is equally consistent with the relay's tunnel table, public-path loss, and this runner's NAT/source-port or rate limiting. Do NOT size against this number." | tee verdict.txt
           fi
-          # A knee is only the RELAY's if nothing host-side bound first. The
-          # tool attributes these by name; surface them next to the verdict so
-          # the two are not read apart.
           jq -r '[.[]|select((.report.establish_errors // {}) != {} or (.report.not_alive // {}) != {})
                  |{requested, establish_errors:.report.establish_errors, not_alive:.report.not_alive}]' \
              ramp-index.json | tee -a verdict.txt
@@ -537,9 +551,26 @@ jobs:
           # _astats earned the right to corroborate the NEXT one.
           {
             echo "--- candidate occupancy instrument (_astats :8080), qualification ---"
-            echo "baseline_pre_ramp=$(jq -c '.ats|{relay:."amt.relay.active_tunnels",iface:."amt.interface.amtr.tunnels",limit:."amt.relay.tunnel_limit"}' astats-baseline.json 2>/dev/null || echo unreachable)"
+            # `jq` exits 0 and prints NOTHING on an empty file, so the old
+            # `|| echo unreachable` could never fire: an unreachable instrument
+            # was rendered as an empty string and read as "no data". Test the
+            # file has bytes first -- an instrument that was never read must not
+            # be reported in the same shape as one that answered.
+            if [ -s astats-baseline.json ]; then
+              echo "baseline_pre_ramp=$(jq -c '.ats|{relay:."amt.relay.active_tunnels",iface:."amt.interface.amtr.tunnels",limit:."amt.relay.tunnel_limit"}' astats-baseline.json 2>/dev/null || echo malformed)"
+            else
+              echo "baseline_pre_ramp=UNREACHABLE (no bytes returned; _astats is in-cluster only and this job runs from the public runner)"
+            fi
             jq -r '.[]|"requested=\(.requested) peak_relay_active_tunnels=\(.astats_peak_relay_active_tunnels) peak_iface_tunnels=\(.astats_peak_iface_tunnels) alive=\(.report.alive // "n/a")"' ramp-index.json
-            echo "QUALIFIED if a peak column rises with requested N; DEAD DIAL if it stays flat (that is the amt_relay_active_tunnels failure, and it would be the seventh). Read the two peak columns separately: they were NOT equal pre-ramp (relay=29, iface=47), so whichever tracks N is the occupancy counter and the other is something else."
+            # Three outcomes, not two. A column of nulls means the instrument was
+            # NOT SAMPLED -- it is not evidence the dial is dead, and recording it
+            # as such would condemn a counter measured live at relay=29/iface=47
+            # from in-cluster hours earlier.
+            if jq -e '[.[]|.astats_peak_relay_active_tunnels,.astats_peak_iface_tunnels]|all(.==null)' ramp-index.json >/dev/null; then
+              echo "qualification=NOT SAMPLED -- every peak is null, i.e. no reading was taken. This is NOT the 'dead dial' verdict and must not be recorded as one: it says nothing about _astats, only that this vantage could not reach it. Re-run with the sampler in-cluster."
+            else
+              echo "qualification=QUALIFIED if a peak column rises with requested N; DEAD DIAL if it stays flat at a value (that is the amt_relay_active_tunnels failure, and it would be the seventh). Read the two peak columns separately: they were NOT equal pre-ramp (relay=29, iface=47), so whichever tracks N is the occupancy counter and the other is something else."
+            fi
           } | tee -a verdict.txt
 
       - uses: actions/upload-artifact@v4
