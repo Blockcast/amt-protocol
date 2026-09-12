@@ -4,7 +4,7 @@
 //! via select! over: command channel, socket recv, sleep timer, shutdown.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,6 +54,21 @@ pub struct AsyncAmtGateway {
     /// the spawned task exited because of one. `shutdown()` checks this and
     /// returns Err(...) instead of Ok(()) when set.
     pub(crate) fatal: Arc<Mutex<Option<anyhow::Error>>>,
+    /// Membership Updates transmitted AFTER the handshake completed, i.e.
+    /// keep-alives. The initial current-state Update is excluded: the runtime
+    /// drains `Transmit` before the `HandshakeComplete` that stores `Active`,
+    /// so at that point `state` still reads the pre-handshake value.
+    ///
+    /// A tunnel is only demonstrably held across a keep-alive interval if this
+    /// is >= 1. Note what it does NOT prove: it is client-side emission, not
+    /// relay-side acceptance. Relay-side occupancy must come from the relay
+    /// (`amt_relay_active_tunnels`) — see BLO-33457.
+    pub(crate) keepalives: Arc<AtomicU64>,
+    /// Datagrams received from the relay over this tunnel's socket, all types.
+    /// Relay-originated, so non-zero is positive evidence the relay is still
+    /// talking to us; zero is NOT evidence of death, because an AMT relay owes
+    /// an idle established gateway no unprompted traffic.
+    pub(crate) rx_datagrams: Arc<AtomicU64>,
 }
 
 pub struct AsyncAmtGatewayBuilder {
@@ -61,6 +76,8 @@ pub struct AsyncAmtGatewayBuilder {
     relay_port: u16,
     keepalive: Duration,
     log_target: &'static str,
+    data_capacity: usize,
+    recv_buf_bytes: usize,
 }
 
 impl AsyncAmtGateway {
@@ -70,6 +87,8 @@ impl AsyncAmtGateway {
             relay_port: 2268,
             keepalive: Duration::from_secs(AmtConfig::DEFAULT_KEEPALIVE_SECS as u64),
             log_target: "amt",
+            data_capacity: 1024,
+            recv_buf_bytes: 65535,
         }
     }
 
@@ -97,6 +116,17 @@ impl AsyncAmtGateway {
 
     pub fn subscribe_data(&self) -> broadcast::Receiver<DataEvent> {
         self.data_tx.subscribe()
+    }
+
+    /// Keep-alive Membership Updates sent since the handshake completed.
+    /// See the field docs for exactly what this does and does not witness.
+    pub fn keepalives_sent(&self) -> u64 {
+        self.keepalives.load(Ordering::Relaxed)
+    }
+
+    /// Datagrams received from the relay on this tunnel's socket.
+    pub fn rx_datagrams(&self) -> u64 {
+        self.rx_datagrams.load(Ordering::Relaxed)
     }
 
     pub async fn subscribe(&self, group: IpAddr, source: Option<IpAddr>) -> Result<()> {
@@ -150,6 +180,31 @@ impl AsyncAmtGatewayBuilder {
         self.log_target = t;
         self
     }
+    /// Slots in this gateway's data broadcast ring. Default 1024.
+    ///
+    /// tokio preallocates the ring, so this is per-gateway resident memory —
+    /// at the default it is ~100 KiB, which is invisible for one gateway and
+    /// is ~1 GiB across 8192 of them. A caller holding many gateways purely
+    /// for tunnel state (BLO-33457) should set this to a small value: the
+    /// ceiling it would otherwise measure is this allocation, not the relay.
+    pub fn data_capacity(mut self, n: usize) -> Self {
+        self.data_capacity = n.max(1);
+        self
+    }
+
+    /// Per-gateway UDP receive buffer, in bytes. Default 65535 (max UDP
+    /// payload). This is one heap allocation per gateway, so it is also
+    /// per-tunnel resident memory: ~512 MiB across 8192 gateways at the
+    /// default.
+    ///
+    /// **A datagram longer than this is silently TRUNCATED by `recv_from`,**
+    /// which for a data-carrying tunnel means corrupt inner packets rather
+    /// than a visible error. Only lower it for control-plane-only use where
+    /// no multicast data is expected (BLO-33457 tunnel-state ramp).
+    pub fn recv_buf_bytes(mut self, n: usize) -> Self {
+        self.recv_buf_bytes = n.max(576);
+        self
+    }
 
     /// Build and spawn the runtime task.
     pub async fn build(self) -> Result<AsyncAmtGateway> {
@@ -163,9 +218,11 @@ impl AsyncAmtGatewayBuilder {
         cfg.keepalive_interval_secs = self.keepalive.as_secs() as u32;
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(32);
-        let (data_tx, _) = broadcast::channel::<DataEvent>(1024);
+        let (data_tx, _) = broadcast::channel::<DataEvent>(self.data_capacity);
         let state = Arc::new(AtomicU8::new(state_to_u8(GatewayState::Idle)));
         let fatal: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+        let keepalives = Arc::new(AtomicU64::new(0));
+        let rx_datagrams = Arc::new(AtomicU64::new(0));
 
         let task = tokio::spawn(run_task(
             sock,
@@ -174,6 +231,9 @@ impl AsyncAmtGatewayBuilder {
             data_tx.clone(),
             state.clone(),
             fatal.clone(),
+            keepalives.clone(),
+            rx_datagrams.clone(),
+            self.recv_buf_bytes,
             self.log_target,
         ));
 
@@ -183,6 +243,8 @@ impl AsyncAmtGatewayBuilder {
             state,
             task: Mutex::new(Some(task)),
             fatal,
+            keepalives,
+            rx_datagrams,
         })
     }
 }
@@ -198,6 +260,7 @@ fn state_to_u8(s: GatewayState) -> u8 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_task(
     sock: UdpSocket,
     cfg: AmtConfig,
@@ -205,11 +268,14 @@ async fn run_task(
     data_tx: broadcast::Sender<DataEvent>,
     state: Arc<AtomicU8>,
     fatal: Arc<Mutex<Option<anyhow::Error>>>,
+    keepalives: Arc<AtomicU64>,
+    rx_datagrams: Arc<AtomicU64>,
+    recv_buf_bytes: usize,
     _log_target: &'static str,
 ) {
     let platform = Arc::new(NativePlatform::new());
     let mut mgr = SubscriptionManager::new(cfg, platform.clone());
-    let mut buf = [0u8; 65535];
+    let mut buf = vec![0u8; recv_buf_bytes];
     let mut shutdown_ack: Option<oneshot::Sender<Result<()>>> = None;
 
     loop {
@@ -230,6 +296,7 @@ async fn run_task(
             r = sock.recv_from(&mut buf) => {
                 match r {
                     Ok((n, _)) => {
+                        rx_datagrams.fetch_add(1, Ordering::Relaxed);
                         let _ = mgr.handle_datagram(&buf[..n], now_ms_local());
                     }
                     Err(e) => {
@@ -249,6 +316,12 @@ async fn run_task(
         while let Some(ev) = mgr.poll_event() {
             match ev {
                 Event::Transmit { dst, port, payload } => {
+                    // Counted BEFORE the HandshakeComplete arm below stores
+                    // `Active`, so the initial current-state Update is excluded
+                    // and this counts keep-alives only. See field docs.
+                    if state.load(Ordering::SeqCst) == state_to_u8(GatewayState::Active) {
+                        keepalives.fetch_add(1, Ordering::Relaxed);
+                    }
                     let target = SocketAddr::new(dst, port);
                     if let Err(e) = sock.send_to(&payload, target).await {
                         tracing::error!(target: "amt", error=?e, "socket send error (fatal)");
