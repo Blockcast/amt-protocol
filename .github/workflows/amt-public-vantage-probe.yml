@@ -534,7 +534,18 @@ jobs:
           n_relay=$(echo "$causes" | grep -cEi 'relay (refused|rejected)|tunnel[ -](table|limit)|no more tunnels' || true)
           n_other=$(echo "$causes" | grep -cvEi 'relay (refused|rejected)|tunnel[ -](table|limit)|no more tunnels' || true)
           [ -z "$causes" ] && n_relay=0 && n_other=0
-          if [ "$top" = "$cap" ]; then
+          # Does any step admit it could not tell N tunnels from one aliased N
+          # ways? This gate runs FIRST and supersedes every branch below,
+          # including the clean-to-cap one -- a ramp that sails to the cap on a
+          # single source address is the WORST case, not the best: it reports a
+          # ceiling having established one tunnel. `alive` is a send-side
+          # self-report, so nothing downstream of it can notice.
+          # `// .requested` defaults a report predating the field to "shared",
+          # i.e. an unknown fails to the safe side rather than passing the gate.
+          aliased=$(jq -r '[.[]|select(((.report.distinct_outer_sources // 1)) < .requested)]|length' ramp-index.json)
+          if [ "$aliased" -gt 0 ]; then
+            echo "verdict=WITNESS NOT ESTABLISHED ($aliased/$ran steps ran all gateways from ONE outer source address). NOT a ceiling, NOT a knee, and NOT 'no knee': linux-amt as deployed keys tunnel state on the outer ADDRESS alone, so N gateways from one address occupy ONE relay tunnel entry while every one still reads Active and sends keep-alives. An alive of N here is indistinguishable from one tunnel aliased N ways, so this run says nothing about the relay's tunnel table at any N. Do NOT size against this number. Needs distinct source addresses (linux-amt kernel/selftests/amt_capacity.sh) and/or the BLO-33636 keying fix." | tee verdict.txt
+          elif [ "$top" = "$cap" ]; then
             echo "verdict=ceiling >= $cap, config-bound (NOT 'no state knee': the ramp ended at the configured cap, so no knee was reached or excluded above it)" | tee verdict.txt
           elif [ "$n_relay" -gt 0 ] && [ "$n_other" -eq 0 ]; then
             echo "verdict=knee at N>$top (first degraded step above $top; every shortfall is relay-attributed -- see ramp-index.json)" | tee verdict.txt

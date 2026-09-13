@@ -761,7 +761,19 @@ NOT comparable to a measured loaded ceiling. WITNESS IS RECEIVER-SIDE: `alive` i
 It is NOT corroborated by relay-side amt_relay_active_tunnels, which is dead on both production \
 relays (linux: never non-zero in 30d; juniper: zero variance in 30d, pinned at 1) -- see BLO-33457. \
 ATTRIBUTION: a shortfall here is the relay's tunnel table ONLY if establish_errors and not_alive \
-are empty of host-side reasons; otherwise the binder is this rig, not the relay.";
+are empty of host-side reasons; otherwise the binder is this rig, not the relay. \
+DISQUALIFIER -- READ BEFORE CITING ANY NUMBER FROM THIS MODE: every gateway here binds the SAME \
+outer source address (distinct ephemeral ports only), so `distinct_outer_sources` is 1 regardless \
+of `requested`. RFC 7450 s4.2.2 keys a tunnel on the (address, port) endpoint, but linux-amt as \
+deployed matches on the outer source ADDRESS alone (`tunnel->addr.ip4 == iph->saddr`, amt.c \
+amt_request_handler), overwriting `source_port` from the newest Request. So N gateways from one \
+address occupy exactly ONE relay tunnel entry while every one of them still reads Active and still \
+sends keep-alives -- `alive` is a SEND-side self-report (state == Active && keepalives_sent >= 1; \
+all three not-alive reasons are client-local) and cannot witness relay state at all. An `alive` of \
+N is therefore indistinguishable from one tunnel aliased N ways. This mode CANNOT produce a relay \
+tunnel-state ceiling; see BLO-33636 for the keying fix and linux-amt \
+kernel/selftests/amt_capacity.sh for a rig that provisions distinct source addresses and takes \
+ground truth from the relay's own admit/refuse reply.";
 
 /// Per-tunnel result. `establish_ms` is wall-clock from gateway construction to
 /// the gateway reporting `Active`.
@@ -850,6 +862,21 @@ struct TunnelsReport {
     /// recorded as a state knee, whereas `state_left_active` /
     /// `no_keepalive_sent` are the tunnel genuinely failing to survive.
     not_alive: BTreeMap<String, u32>,
+    /// How many DISTINCT outer source addresses the N gateways were spread
+    /// across. Structurally 1 here: `run_tunnels` builds every gateway with
+    /// `AsyncAmtGateway::builder(relay)`, which binds the host's default
+    /// source, so the tunnels differ only by ephemeral port.
+    ///
+    /// This is the field that makes the mode's central limitation machine-
+    /// checkable instead of prose. A relay that keys tunnel state on the outer
+    /// ADDRESS alone -- which is what linux-amt does as deployed -- collapses
+    /// all N onto one tunnel entry, and because `alive` is a send-side
+    /// self-report every aliased gateway still counts. So whenever this is
+    /// less than `requested`, no tunnel-state ceiling can be read off the run,
+    /// and the verdict must say so rather than print a number. When a rig that
+    /// provisions distinct source addresses lands, this becomes N and the gate
+    /// opens on its own.
+    distinct_outer_sources: u32,
     caveat: &'static str,
 }
 
@@ -937,6 +964,11 @@ fn summarize(
         rx_datagrams_total: rx_total,
         establish_errors,
         not_alive,
+        // Every gateway in `run_tunnels` is built with `builder(relay)`, i.e.
+        // the host default source. Hardcoded rather than counted because there
+        // is exactly one call site and a counted-but-always-1 value would read
+        // as a measurement.
+        distinct_outer_sources: 1,
         caveat: CONTROL_PLANE_CAVEAT,
     }
 }
