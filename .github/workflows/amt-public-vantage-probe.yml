@@ -113,6 +113,30 @@ jobs:
           # On an otherwise-idle hosted runner ours is the only meaningful UDP
           # traffic, but a non-zero delta is evidence about the netns, so do not
           # read a small one as proof it was us.
+          #
+          # That partition localises a gap to THIS HOST or not. It cannot place
+          # an upstream gap on the shared leg vs. on this receiver's own leg
+          # downstream of the relay's per-tunnel fan-out -- and `gaps` /
+          # `gap_events` cannot either: BLO-33456 pair E had two receivers on
+          # different /8s report 501 / 34 identically, which fits both "they
+          # share the lossy leg" and "the source emitted a discontinuous
+          # sequence, so nothing was lost". `mmtp.gap_positions` settles it.
+          # Run two CONCURRENT probes (check overlap via data_started_at_ms /
+          # data_ended_at_ms, NOT dispatch time), then over the two receipts:
+          #
+          #   A=$(jq -S -c '[.mmtp.gap_positions[]]' a/report.json)
+          #   B=$(jq -S -c '[.mmtp.gap_positions[]]' b/report.json)
+          #   jq -n --argjson a "$A" --argjson b "$B" \
+          #     '{shared:[$a[]|select(. as $x|$b|index($x))]|length,
+          #       a_only:[$a[]|select(. as $x|($b|index($x))|not)]|length,
+          #       b_only:[$b[]|select(. as $x|($a|index($x))|not)]|length}'
+          #
+          #   shared >> a_only+b_only -> stream-as-delivered (shared leg, or
+          #                              source-side sequence discontinuity)
+          #   mostly disjoint         -> per-receiver loss below the fan-out
+          #
+          # Truncation is visible as gap_positions|length < gap_events; a
+          # truncated list makes `shared` a lower bound, not a verdict.
           udp_counters() { awk '/^Udp:/{n++; if (n==2) print}' /proc/net/snmp; }
           udp_before=$(udp_counters)
           t0=$(date +%s%3N)

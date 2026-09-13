@@ -227,6 +227,35 @@ struct FirstPacket {
 /// ~1.3k pkt/s across 8 tracks, so this is minutes of outage on one track.
 const MAX_PLAUSIBLE_GAP: u32 = 10_000;
 
+/// How many gap runs [`MmtpLoss::gap_positions`] retains. The densest session
+/// measured on this stream had 214 runs in 90 s (BLO-33456 phase B), so this is
+/// ~19x that; it exists only so a pathological stream cannot grow the list
+/// without bound in a long `--watch` run. Truncating the sample never affects
+/// `gap_event_count`, which stays exact.
+const MAX_GAP_POSITIONS: usize = 4_096;
+
+/// One contiguous run of missing sequence numbers on one track.
+///
+/// Recorded so two CONCURRENT receipts can be compared by gap POSITION rather
+/// than by gap count. Counts alone cannot separate the two mechanisms: in
+/// BLO-33456 pair E, two receivers on different /8s reported the same `gaps`
+/// (501) and the same run count (34), which is equally consistent with
+/// (a) loss on a leg they share, and (b) the source emitting a discontinuous
+/// sequence, in which case nothing was lost at all. Identical positions mean
+/// the discontinuity is a property of the stream as emitted; disjoint positions
+/// mean each receiver lost its own packets downstream of the relay's fan-out.
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+struct GapEvent {
+    /// MMTP `packet_id`. Sequence numbers are per-track, so positions are only
+    /// comparable within the same `pid`.
+    pid: u16,
+    /// Sequence number of the last packet that ARRIVED before the run. The
+    /// absent numbers are `after + 1 ..= after + missing`.
+    after: u32,
+    /// How many consecutive sequence numbers are absent. Sums to `gaps`.
+    missing: u32,
+}
+
 /// Receiver-intrinsic loss accounting, parsed from the MMTP packet header
 /// (ISO/IEC 23008-1: `packet_id` at bytes 2..4 and `packet_sequence_number` at
 /// bytes 8..12, both big-endian; `version` is the top 2 bits of byte 0 and is 0
@@ -246,6 +275,14 @@ struct SeqTracker {
     observed: u64,
     in_sequence: u64,
     gaps: u64,
+    /// Number of gap RUNS. Counted directly rather than derived as
+    /// `received - last.len() - in_sequence`: that identity holds only while
+    /// `reordered` and `implausible` are 0, which is exactly the assumption a
+    /// loss measurement should not be quietly resting on.
+    gap_events: u64,
+    /// First [`MAX_GAP_POSITIONS`] runs, in arrival order. A diagnostic sample,
+    /// not an accounting — `gap_events` stays exact when this is truncated.
+    gap_positions: Vec<GapEvent>,
     /// Valid packets admitted to sequence accounting: the first per track, plus
     /// every later arrival that advanced its track's high-water mark. This is
     /// the `received` term of the loss ratio — see [`SeqTracker::finish`].
@@ -288,6 +325,14 @@ impl SeqTracker {
             self.received += 1;
         } else {
             self.gaps += u64::from(delta - 1);
+            self.gap_events += 1;
+            if self.gap_positions.len() < MAX_GAP_POSITIONS {
+                self.gap_positions.push(GapEvent {
+                    pid,
+                    after: prev,
+                    missing: delta - 1,
+                });
+            }
             // The arrival that ENDS the gap is itself received. Omitting it is
             // what made the ratio overstate loss (Ally review, PR #23).
             self.received += 1;
@@ -314,6 +359,8 @@ impl SeqTracker {
             tracks: self.last.len(),
             in_sequence: self.in_sequence,
             gaps: self.gaps,
+            gap_events: self.gap_events,
+            gap_positions: self.gap_positions,
             received: self.received,
             reordered: self.reordered,
             implausible: self.implausible,
@@ -337,6 +384,20 @@ struct MmtpLoss {
     /// Packets missing between adjacent arrivals, summed over tracks. This is
     /// the loss figure; it needs no source-side counter.
     gaps: u64,
+    /// Number of gap RUNS, where `gaps` counts missing packets. `gaps /
+    /// gap_events` is the mean burst length, which separates isolated WAN loss
+    /// (~1) from a queue or stall: BLO-33456 measured 5.3–21.3 across four
+    /// lossy sessions, rising monotonically with event rate. Exact even when
+    /// `gap_positions` is truncated.
+    gap_events: u64,
+    /// Where the runs are, not just how many — see [`GapEvent`]. Compared
+    /// between two CONCURRENT receipts this separates loss on a shared leg
+    /// (identical positions) from per-receiver loss downstream of the relay's
+    /// fan-out (disjoint positions); `gaps` and `gap_events` alone cannot, and
+    /// in BLO-33456 pair E they agreed exactly while the mechanism stayed
+    /// ambiguous. Capped at [`MAX_GAP_POSITIONS`]; truncation is visible as
+    /// `gap_positions.len() < gap_events`.
+    gap_positions: Vec<GapEvent>,
     /// Valid packets that arrived: each track's first, plus every later arrival
     /// that advanced the high-water mark. The `received` term of `loss_ratio`,
     /// exported so the ratio can be re-derived from the receipt rather than
@@ -1260,6 +1321,100 @@ mod tests {
         let got = track(&[(1, 10), (1, 11), (1, 12), (1, 13)]);
         assert_eq!((got.gaps, got.in_sequence, got.implausible), (0, 3, 0));
         assert_eq!(got.loss_ratio, Some(0.0));
+        // A clean run records no positions — the negative control for the
+        // comparison below, without which "positions match" would be trivially
+        // true for two empty lists.
+        assert_eq!(got.gap_events, 0);
+        assert!(got.gap_positions.is_empty());
+    }
+
+    /// Gap POSITIONS, which is what separates loss on a shared leg from
+    /// per-receiver loss when two concurrent receipts report the same counts
+    /// (BLO-33456 pair E). Asserts the run is anchored to the last ARRIVAL, so
+    /// the absent numbers are `after + 1 ..= after + missing` — here 11..=13,
+    /// with 10 and 14 present.
+    #[test]
+    fn gap_positions_record_track_anchor_and_length() {
+        let got = track(&[(1, 10), (1, 14), (2, 5), (2, 6), (2, 9)]);
+        assert_eq!(
+            got.gap_positions,
+            vec![
+                GapEvent {
+                    pid: 1,
+                    after: 10,
+                    missing: 3
+                },
+                GapEvent {
+                    pid: 2,
+                    after: 6,
+                    missing: 2
+                },
+            ]
+        );
+        // Positions must account for every missing packet, or comparing two
+        // receipts by position would silently compare different subsets.
+        assert_eq!(
+            got.gap_positions
+                .iter()
+                .map(|g| u64::from(g.missing))
+                .sum::<u64>(),
+            got.gaps
+        );
+        assert_eq!(got.gap_events, got.gap_positions.len() as u64);
+    }
+
+    /// Two receivers of the SAME emitted sequence must produce identical
+    /// positions even when their arrival counts differ — that is the whole
+    /// inference, and a tracker keyed on arrival order rather than on sequence
+    /// number would break it. Both arms miss 11..=13; arm A additionally loses
+    /// 17..=18, which must appear as an extra run and leave the shared one
+    /// byte-identical.
+    #[test]
+    fn shared_discontinuity_yields_identical_positions_across_arms() {
+        let a = track(&[(1, 10), (1, 14), (1, 15), (1, 16), (1, 19)]);
+        let b = track(&[
+            (1, 10),
+            (1, 14),
+            (1, 15),
+            (1, 16),
+            (1, 17),
+            (1, 18),
+            (1, 19),
+        ]);
+        let shared = GapEvent {
+            pid: 1,
+            after: 10,
+            missing: 3,
+        };
+        assert_eq!(a.gap_positions[0], shared);
+        assert_eq!(b.gap_positions[0], shared);
+        // Disjoint tail = loss private to arm A, which is the reading that
+        // identical counts alone cannot distinguish.
+        assert_eq!(
+            a.gap_positions[1],
+            GapEvent {
+                pid: 1,
+                after: 16,
+                missing: 2
+            }
+        );
+        assert_eq!((a.gap_events, b.gap_events), (2, 1));
+        assert_eq!((a.gaps, b.gaps), (5, 3));
+    }
+
+    /// The sample is capped; the COUNT is not. Truncating both would understate
+    /// burst structure exactly in the regime where it matters most.
+    #[test]
+    fn gap_positions_are_capped_but_the_event_count_is_exact() {
+        let n = MAX_GAP_POSITIONS + 50;
+        // Every arrival skips one sequence number, so each is its own run.
+        let pkts: Vec<(u16, u32)> = (0..=n as u32).map(|i| (1, i * 2)).collect();
+        let got = track(&pkts);
+        assert_eq!(got.gap_positions.len(), MAX_GAP_POSITIONS);
+        assert_eq!(got.gap_events, n as u64);
+        assert_eq!(got.gaps, n as u64);
+        // Truncation is detectable from the receipt alone.
+        assert!((got.gap_positions.len() as u64) < got.gap_events);
     }
 
     /// The whole point of the field: loss is counted without any source-side
