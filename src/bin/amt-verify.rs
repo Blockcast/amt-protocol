@@ -174,6 +174,17 @@ struct OneshotReport {
     /// (`first_data` is the field that still includes join latency.) `null` if
     /// no packet arrived.
     elapsed_ms: Option<u64>,
+    /// Unix epoch millis at which the data phase opened — i.e. the absolute
+    /// wall clock of the `elapsed_ms` origin, taken right after `subscribe()`.
+    /// Together with `data_ended_at_ms` this makes "were these two receipts
+    /// concurrent?" answerable FROM THE RECEIPT. `elapsed_ms` alone cannot:
+    /// it is a monotonic duration with no shared origin, so two probes of the
+    /// same stream are not comparable without an external clock.
+    data_started_at_ms: u128,
+    /// Unix epoch millis at which the last counted packet arrived. `null` if
+    /// none did. Two receipts overlap iff each one's start precedes the
+    /// other's end.
+    data_ended_at_ms: Option<u128>,
     /// Packets the receiver's broadcast channel dropped before this process
     /// dequeued them. NOT included in `packet_count`. Non-zero means the
     /// receiver could not keep up, so any shortfall against the source is a
@@ -345,6 +356,15 @@ struct MmtpLoss {
     loss_ratio: Option<f64>,
 }
 
+/// Wall clock as Unix epoch millis. Saturates to 0 before the epoch, which is
+/// unreachable on any host whose clock is sane enough for the receipt to mean
+/// anything.
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
@@ -445,6 +465,14 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
         .await
         .map_err(ExitCategory::HandshakeFail)?;
     let data_started = Instant::now();
+    // `elapsed_ms` is a monotonic duration, which cannot answer "did these two
+    // probes observe the same wall clock?" — and every differential measurement
+    // on this stream needs exactly that (BLO-33456: the concurrency of the
+    // phase-B pair had to be reconstructed from GitHub job timings, which are
+    // dispatch times and include `docker pull`). Unix epoch millis rather than
+    // RFC3339: this crate has no date dependency, and the receipts are compared
+    // numerically anyway.
+    let data_started_at_ms = unix_millis();
 
     // One overall deadline for the whole data phase, established before the
     // first recv and shared by every packet. Previously each packet got a fresh
@@ -456,6 +484,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     let mut first_evt = None;
     let mut first_data_ms = None;
     let mut elapsed_ms = None;
+    let mut data_ended_at_ms = None;
     // Held, not returned, until the report has been emitted: the partial counts
     // are the point of the probe and must survive the failure path.
     let mut stopped: Option<RecvStop> = None;
@@ -477,6 +506,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
                 byte_count += evt.payload.len() as u64;
                 seq.observe(&evt.payload);
                 elapsed_ms = Some(data_started.elapsed().as_millis() as u64);
+                data_ended_at_ms = Some(unix_millis());
                 if first_evt.is_none() {
                     first_data_ms = Some(started.elapsed().as_millis() as u64);
                     first_evt = Some(evt);
@@ -497,6 +527,8 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             packet_count,
             byte_count,
             elapsed_ms,
+            data_started_at_ms,
+            data_ended_at_ms,
             lagged_count,
             first_data: first_data_ms,
             relay: resolved_relay.to_string(),
@@ -1175,6 +1207,36 @@ mod tests {
         assert_eq!(got.src, SRC);
         assert_eq!(got.group, GROUP);
         assert_eq!(lagged, 0);
+    }
+
+    /// POSITIVE control for `lagged_count`. Every other test here asserts it is
+    /// ZERO, which licenses nothing: a counter that is never incremented and a
+    /// counter that is correctly reporting no loss read identically, and all six
+    /// BLO-33456 cast receipts report `lagged_count: 0`. That zero is now
+    /// load-bearing — it is what separates a userspace-side drop (this counter)
+    /// from a kernel socket-buffer drop (`/proc/net/snmp` `Udp: RcvbufErrors`)
+    /// from genuine upstream path loss (`mmtp.gaps` with both of those at zero).
+    /// So it has to be shown capable of moving.
+    #[tokio::test(flavor = "current_thread")]
+    async fn overflowing_the_broadcast_channel_is_counted_as_lagged() {
+        // Capacity 2, then 4 sends with nothing dequeued in between: the two
+        // oldest are evicted before this receiver ever sees them.
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<DataEvent>(2);
+        for _ in 0..4 {
+            tx.send(evt([10, 0, 0, 1], [232, 0, 0, 1])).unwrap();
+        }
+
+        let mut lagged = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let got = recv_first_matching(&mut rx, GROUP, SRC, deadline, &mut lagged)
+            .await
+            .expect("a surviving packet");
+
+        assert_eq!(got.group, GROUP);
+        // The evicted ones are counted, not silently skipped — otherwise a
+        // receiver that could not keep up would report a shortfall that reads
+        // as relay loss.
+        assert_eq!(lagged, 2);
     }
 
     /// Minimal MMTP packet: version 0, `packet_id` at 2..4, sequence at 8..12.

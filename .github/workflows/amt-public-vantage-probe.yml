@@ -94,6 +94,27 @@ jobs:
           # BLO-21823 AC#3 wants the client commit alongside the artifact hash.
           echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/blockcast/amt-verify:main)"
           set +e
+          # BLO-33456. `mmtp.gaps` says packets went missing; it does NOT say
+          # where. The kernel already counts the one candidate that is cheapest
+          # to rule in or out, so read it rather than dispatching a study:
+          # `Udp: RcvbufErrors` is datagrams dropped because the socket receive
+          # buffer was full -- i.e. this receiver fell behind, not the path.
+          # `--network host` puts the container in THIS netns, so the runner's
+          # /proc/net/snmp is the container's counter.
+          #
+          # Three-way partition of a gap, none of which needs a source counter:
+          #   lagged_count > 0  -> userspace consumer behind (broadcast channel)
+          #   RcvbufErrors > 0  -> kernel socket buffer overran (reader behind)
+          #   both 0, gaps > 0  -> loss upstream of this host
+          # The known-clean sessions (gaps: 0) are the built-in negative control:
+          # attribution is by COVARIATION across lossy/clean, not by a threshold.
+          #
+          # Caveat, and it is real: this counter is netns-WIDE, not per-socket.
+          # On an otherwise-idle hosted runner ours is the only meaningful UDP
+          # traffic, but a non-zero delta is evidence about the netns, so do not
+          # read a small one as proof it was us.
+          udp_counters() { awk '/^Udp:/{n++; if (n==2) print}' /proc/net/snmp; }
+          udp_before=$(udp_counters)
           t0=$(date +%s%3N)
           docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
             --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
@@ -101,7 +122,18 @@ jobs:
             >report.json 2>verbose.log
           status=$?
           t1=$(date +%s%3N)
+          udp_after=$(udp_counters)
           set -e
+          # Delta, labelled off the header line so a kernel that adds a field
+          # cannot silently shift `RcvbufErrors` onto a neighbour's value.
+          awk -v hdr="$(awk '/^Udp:/{print; exit}' /proc/net/snmp)" \
+              -v b="$udp_before" -v a="$udp_after" '
+            BEGIN {
+              nh = split(hdr, H); split(b, B); split(a, A)
+              out = ""
+              for (i = 2; i <= nh; i++) out = out sprintf(" %s=%d", H[i], A[i] - B[i])
+              printf "udp_delta%s\n", out
+            }'
           echo "amt_verify_exit=$status"
           # BLO-27413: receiver-side saturation witness. The relay fans one
           # multicast stream into N unicast tunnels, so the receiving vantage
