@@ -30,6 +30,19 @@ on:
       packet_count:
         description: Packets to receive before reporting ok
         default: "3"
+      tunnels:
+        description: >-
+          BLO-26574 step 1: number of CONCURRENT data-receiving tunnels to run
+          from this one runner, to find the HARNESS ceiling. Each is a separate
+          amt-verify process (one tunnel per process) sharing the runner netns
+          via --network host, so fds and NAT source ports are host-scoped —
+          which is what makes the ceiling measurable at all. Ramp this until
+          one of the four candidate binders gives (process/container count,
+          `ulimit -n`, NAT source-port exhaustion, 4-vCPU decap) and name which.
+          NOT the same knob as `amt-verify --tunnels N`, which holds N IDLE
+          gateways to measure control-plane tunnel-table occupancy and is
+          documented as NOT receiving data. That arm is BLO-33457.
+        default: "1"
   push:
     branches: [blo-21823-public-amt-probe]
 
@@ -46,6 +59,7 @@ jobs:
       GROUP: ${{ inputs.group || '232.1.1.60' }}
       TIMEOUT: ${{ inputs.timeout || '30' }}
       PACKETS: ${{ inputs.packet_count || '3' }}
+      TUNNELS: ${{ inputs.tunnels || '1' }}
     steps:
       - name: Vantage receipt
         run: |
@@ -82,6 +96,20 @@ jobs:
           # and it distinguishes "sysfs said nothing" from "sysfs said something
           # synthetic". `nic_speed_mbps` is the only authoritative field.
           echo "egress_dev=${dev:-unknown} nic_speed_mbps=$speed nic_driver=${drv:-unknown} nic_speed_mbps_reported=${reported}"
+          # BLO-26574 Amendment 12g, Finding 1: the relay keys tunnel state on
+          # the outer source ADDRESS, so this rig's fan-out ceiling is its count
+          # of distinct PUBLIC source addresses (k), not its process count. A
+          # routable v6 /64 is the cheap way to raise k -- measure whether this
+          # vantage has one rather than assuming it in either direction.
+          # CAPABILITY ONLY: it does not raise k until a gateway actually binds
+          # a distinct address, so it is recorded here and never read by the
+          # verdict. `no` answers the question outright; `yes` makes relay v6
+          # reachability the follow-up, not a licence to ramp.
+          v6n=$(ip -j -6 addr show scope global 2>/dev/null \
+                | jq '[.[].addr_info[]? | select(.family=="inet6" and .scope=="global")] | length' 2>/dev/null || echo 0)
+          v6ok=no
+          if curl -fsS -6 -m 5 -o /dev/null https://api6.ipify.org 2>/dev/null; then v6ok=yes; fi
+          echo "ipv6_global_addrs=${v6n:-0} ipv6_egress=$v6ok"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -89,6 +117,23 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: amt-verify (real client, public vantage)
         run: |
+          # Ally review (head 0ad7198), Important (2). `tunnels` is an unbounded
+          # workflow_dispatch input used directly as the process-launch count,
+          # so a typo or a large value spends the runner's fds, source ports and
+          # CPU before any measurement starts -- and `seq 1 abc` / `[ abc -gt 1 ]`
+          # fail in the middle of the launch loop rather than at the boundary.
+          # 256 is the documented top of this issue's ramp (BLO-26574 sweep
+          # parameters: `... 96, 128, 192, 256`) and sits above every candidate
+          # harness binder on a 4-vCPU runner, so it bounds a typo without
+          # clipping a legitimate step. Validated from $TUNNELS (env), never by
+          # interpolating the input into the script.
+          MAX_TUNNELS=256
+          case "$TUNNELS" in ''|*[!0-9]*)
+            echo "::error::tunnels must be an integer in 1..$MAX_TUNNELS, got '$TUNNELS'"; exit 92 ;;
+          esac
+          if [ "$TUNNELS" -lt 1 ] || [ "$TUNNELS" -gt "$MAX_TUNNELS" ]; then
+            echo "::error::tunnels must be an integer in 1..$MAX_TUNNELS, got '$TUNNELS'"; exit 92
+          fi
           docker pull -q ghcr.io/blockcast/amt-verify:main
           echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/blockcast/amt-verify:main)"
           # BLO-21823 AC#3 wants the client commit alongside the artifact hash.
@@ -157,11 +202,60 @@ jobs:
           udp_counters() { awk '/^Udp:/{n++; if (n==2) print}' /proc/net/snmp; }
           udp_before=$(udp_counters)
           t0=$(date +%s%3N)
-          docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
-            --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
-            --timeout "$TIMEOUT" --packet-count "$PACKETS" --json --verbose \
-            >report.json 2>verbose.log
-          status=$?
+          # BLO-26574 step 1 (harness ceiling). One tunnel per PROCESS, all in
+          # the runner netns. At TUNNELS=1 this is byte-identical in behaviour
+          # to the single `docker run` it replaces, including the exit code.
+          pids=""
+          for i in $(seq 1 "$TUNNELS"); do
+            docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
+              --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
+              --timeout "$TIMEOUT" --packet-count "$PACKETS" --json --verbose \
+              >"report-$i.json" 2>"verbose-$i.log" &
+            pids="$pids $!"
+          done
+          # Record what the RIG could even launch, before asking what the relay
+          # did. A launch that fails on fds or source ports is the harness
+          # ceiling and must not be read as a relay result.
+          echo "tunnels_requested=$TUNNELS"
+          echo "ulimit_n_soft=$(ulimit -Sn) ulimit_n_hard=$(ulimit -Hn)"
+          echo "nproc=$(nproc)"
+          # BLO-26574 Amendment 12g, Finding 1. The relay keys tunnel state on
+          # the outer source ADDRESS only -- `amt_request_handler` compares
+          # `tunnel->addr.ip4 == iph->saddr` with no port term (amt.c:3692),
+          # `amt_update_handler` matches the same way (amt.c:3330), and on a
+          # match `send:` OVERWRITES tunnel->source_port and tunnel->nonce
+          # (amt.c:3759-3766). So a later Request from the same address steals
+          # the one tunnel, and the earlier gateway's Membership Updates are
+          # then dropped as `Invalid MAC` (amt.c:3333-3341). N processes in one
+          # `--network host` netns therefore produce ONE tunnel, not N.
+          # k is how many distinct source addresses this rig can present;
+          # N_established can never exceed it. Recorded so that a clean-looking
+          # receipt cannot be read as fan-out it never generated, and READ BY
+          # THE VERDICT below -- as telemetry alone it stopped nothing.
+          # Defaults to 1 because every container shares the runner netns via
+          # `--network host` and egresses through one NAT'd address, however
+          # many processes launch. Deliberately NOT a workflow input: a dispatch
+          # caller must not be able to declare a fan-out capability the rig does
+          # not have. A rig that really does present distinct source addresses
+          # (runner matrix, routable v6) sets it here, in the same commit that
+          # makes it true.
+          K="${DISTINCT_SOURCE_IPS:-1}"
+          echo "distinct_source_ips=$K"
+          i=0; ok=0
+          for p in $pids; do
+            i=$((i+1))
+            wait "$p"; s=$?
+            # BLO-26574 (CTO ruling item 5). amt-verify exits 1 on
+            # `outcome: timeout`, which is the NORMAL end of a bounded sample --
+            # so the exit code alone cannot separate a healthy 90s probe from a
+            # tunnel that received nothing. packet_count is the verdict: >0 is a
+            # successful sample whatever the outcome, ==0 is a failure. Fails
+            # closed -- a missing, empty or unparseable receipt lands on 0.
+            pc=$(jq -r '.packet_count // 0' "report-$i.json" 2>/dev/null || echo 0)
+            case "$pc" in ''|*[!0-9]*) pc=0 ;; esac
+            [ "$pc" -gt 0 ] && ok=$((ok+1))
+            echo "tunnel_exit[$i]=$s packet_count[$i]=$pc"
+          done
           t1=$(date +%s%3N)
           udp_after=$(udp_counters)
           set -e
@@ -197,7 +291,7 @@ jobs:
               for (i = 2; i <= nh; i++) out = out sprintf(" %s=%d", H[i], A[i] - B[i])
               printf "udp_delta%s\n", out
             }'
-          echo "amt_verify_exit=$status"
+          echo "tunnels_receiving=$ok/$TUNNELS"
           # BLO-27413: receiver-side saturation witness. The relay fans one
           # multicast stream into N unicast tunnels, so the receiving vantage
           # absorbs N x stream_bitrate. Without a per-tunnel bitrate there is no
@@ -211,16 +305,87 @@ jobs:
           # has completed, so it excludes the handshake too.
           # Kept only as an outer bound and a cross-check on that constant.
           echo "wallclock_elapsed_ms=$((t1-t0))"
-          echo '--- report.json ---'; cat report.json || true
-          echo '--- verbose.log ---'; cat verbose.log || true
-          sha256sum report.json verbose.log
+          for i in $(seq 1 "$TUNNELS"); do
+            echo "--- report-$i.json ---"; cat "report-$i.json" || true
+          done
+          # verbose.log is per-tunnel and large; dump it only for the 1-tunnel
+          # case, where it is the handshake trace someone actually reads.
+          # `if`, not `[ ] && { }` — the latter returns 1 when TUNNELS != 1 and
+          # GitHub runs this under `bash -e`, so it would abort every ramp step.
+          if [ "$TUNNELS" = 1 ]; then echo '--- verbose-1.log ---'; cat verbose-1.log || true; fi
+          # Ally review (head ada02515): TUNNELS=1 must stay artifact-compatible
+          # with the single `docker run` this step replaced -- downstream
+          # consumers fetch `report.json` and `verbose.log` BY NAME, and the
+          # indexed rename would have made them silently miss the receipt.
+          # Keep the indexed files as the uniform internal contract and add the
+          # legacy names as aliases for the one-tunnel case, so both shapes
+          # resolve. Globs below are `report*` / `verbose*` (no dash) to cover
+          # the aliases as well as the indexed files.
+          if [ "$TUNNELS" = 1 ]; then cp report-1.json report.json; cp verbose-1.log verbose.log; fi
+          sha256sum report*.json verbose*.log
+          # BLO-26574: the (S,G) GUARD. The dispatch defaults are cast
+          # (69.25.95.192, 232.1.1.60); a caller who omits inputs silently
+          # measures a different stream than intended, and until now the `sg=`
+          # echo was the only tell. That cost a retracted 2.75x-low per-tunnel
+          # figure. report.json carries the tuple the client actually joined, so
+          # assert it rather than printing it: a receipt that disagrees with the
+          # caller's intent fails the job.
+          for i in $(seq 1 "$TUNNELS"); do
+            got_s=$(jq -r '.source // "null"' "report-$i.json")
+            got_g=$(jq -r '.group  // "null"' "report-$i.json")
+            if [ "$got_s" != "$SOURCE" ] || [ "$got_g" != "$GROUP" ]; then
+              echo "::error::receipt $i joined ($got_s,$got_g), caller asked for ($SOURCE,$GROUP)"
+              exit 90
+            fi
+          done
+          echo "sg_guard=ok ($SOURCE,$GROUP) on $TUNNELS receipt(s)"
+          # Ally review (head 0ad7198), Important (1). `fanout_capable` used to
+          # be telemetry the verdict never read, so an N-tunnel run whose
+          # receipts all carried data went GREEN for a measurement this step had
+          # already declared itself incapable of making. The relay keys tunnel
+          # state on outer source ADDRESS alone (amt.c:3692), so N_established
+          # <= k and TUNNELS > k cannot generate fan-out however clean the
+          # receipts look (BLO-26574 AC; Amendment 12g, Finding 1).
+          #
+          # Checked BEFORE the packet_count verdict on purpose: with k=1 the
+          # later tunnels receive nothing, so the aggregate check would exit 1
+          # saying "N-1 of N tunnels received no data" -- which reads as a
+          # DELIVERY failure of the relay when the truth is that the rig never
+          # established N tunnels to begin with. That misattribution is the
+          # whole hazard; a distinct code and message is the fix.
+          #
+          # The launch telemetry above (tunnels_requested, ulimit_n_*, nproc,
+          # per-tunnel exits) stays valid as a HARNESS-ceiling reading, and
+          # receipts still upload via `if: always()`.
+          if [ "$TUNNELS" -gt "$K" ]; then
+            echo "::error::VOID as a relay result: rig presents k=$K distinct source address(es), $TUNNELS tunnels requested. The relay keys tunnel state on source address alone, so this run cannot establish fan-out. Harness-ceiling telemetry above is still valid."
+            exit 91
+          fi
           # A probe that cannot fail is not a probe: surface the client's verdict
           # as the job's verdict. Receipts still upload via `if: always()`.
-          exit "$status"
+          #
+          # Ally review (head ada02515): this used to `exit "$status"`, which
+          # carried TUNNEL 1's exit code -- so a healthy first tunnel made the
+          # whole N-tunnel step green even when every later tunnel failed, and
+          # `tunnels_exit_zero` was printed but never consulted. The verdict is
+          # now the aggregate over packet_count, not tunnel 1's exit status.
+          #
+          # Deliberate divergence from that review, flagged rather than taken
+          # quietly: it asked to "keep the single-tunnel exit code unchanged",
+          # but the CTO ruling (item 5) is that the single-tunnel code is itself
+          # the defect -- `outcome: timeout` with packet_count > 0 is a
+          # SUCCESSFUL bounded sample and must exit 0. Both cases are therefore
+          # decided by packet_count. Consumers should still parse packet_count
+          # rather than the run conclusion.
+          if [ "$ok" -ne "$TUNNELS" ]; then
+            echo "::error::$((TUNNELS - ok)) of $TUNNELS tunnel(s) received no data (packet_count=0)"
+            exit 1
+          fi
+          exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: amt-verify-receipt
           path: |
-            report.json
-            verbose.log
+            report*.json
+            verbose*.log
