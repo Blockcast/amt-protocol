@@ -92,10 +92,28 @@ async fn tunnels_mode_reports_per_tunnel_survival() {
 
     // BLO-33457 acceptance criterion: the control-plane-vs-loaded-state caveat
     // travels WITH the numbers, so a raw per-step artifact cannot be read as a
-    // loaded ceiling.
+    // loaded ceiling. It must ALSO name the witness as receiver-side: the
+    // relay's amt_relay_active_tunnels is dead on both production relays, so a
+    // reader sent there for corroboration reads 0 and calls it a relay defect.
     let caveat = v["caveat"].as_str().expect("caveat field");
     assert!(caveat.contains("CONTROL-PLANE"), "{caveat}");
-    assert!(caveat.contains("amt_relay_active_tunnels"), "{caveat}");
+    assert!(caveat.contains("RECEIVER-SIDE"), "{caveat}");
+    assert!(caveat.contains("ATTRIBUTION"), "{caveat}");
+    assert!(caveat.contains("DISQUALIFIER"), "{caveat}");
+
+    // The disqualifier must be a FIELD, not only prose in the caveat: the
+    // workflow verdict gates on it, and a reader who trusts `alive` is exactly
+    // the reader who will not finish the caveat. All 3 gateways bound the host
+    // default source, so on a relay keying tunnels by outer address alone they
+    // are ONE tunnel entry -- while `alive` says 3, because `alive` is a
+    // send-side self-report and every aliased gateway still sends.
+    //
+    // This asserting `1` rather than `<= requested` is deliberate: if someone
+    // gives the gateways distinct sources, this test must FAIL and make them
+    // set the field honestly, not pass silently and leave the verdict gate
+    // clamped shut on a rig that has outgrown it.
+    assert_eq!(v["distinct_outer_sources"], 1, "{out}");
+    assert_eq!(v["alive"], 3, "{out}");
 }
 
 /// A relay that never answers. The knee case: the report must say `degraded`

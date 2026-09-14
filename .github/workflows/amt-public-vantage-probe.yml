@@ -30,6 +30,38 @@ on:
       packet_count:
         description: Packets to receive before reporting ok
         default: "3"
+      mode:
+        description: >-
+          oneshot = the BLO-21823 data-receipt probe (default, unchanged).
+          tunnels-ramp = the BLO-33457 tunnel-STATE occupancy ramp.
+        type: choice
+        options: [oneshot, tunnels-ramp]
+        default: oneshot
+      ramp_steps:
+        description: >-
+          tunnels-ramp only. Comma-separated N values, ascending. The cap is
+          AMT_MAX_TUNNELS=10000 on production-amt-relay-linux (read live from
+          amt_relay_tunnel_limit, 2026-09-12), but the DEFAULT stops at 1024:
+          4096/8192/10000 are withheld pending a working relay-side occupancy
+          instrument (CTO ruling 2026-09-12). 1024 against a 10000 cap cannot
+          displace a live subscriber even if the table is occupied, which is why
+          it is safe without one; the larger steps rested on "the table is
+          empty", and the only evidence for that was amt_relay_active_tunnels,
+          which is the gauge the same ruling declared dead. Raise this only with
+          an occupancy reading that has been shown capable of returning a
+          positive.
+        default: "1,8,64,256,1024"
+      hold:
+        description: >-
+          tunnels-ramp only. Seconds to hold tunnels open after the last one is
+          established, before reading the survival verdict. Must exceed
+          --keepalive so every tunnel can emit >=1 keep-alive Membership Update
+          (BLO-33457 AC 3); amt-verify exits 2 rather than reporting a false
+          knee if it does not.
+        default: "25"
+      keepalive:
+        description: tunnels-ramp only. Keep-alive interval in seconds.
+        default: "10"
   push:
     branches: [blo-21823-public-amt-probe]
 
@@ -37,8 +69,34 @@ permissions:
   contents: read
   packages: read
 
+# THE IMAGE IS PINNED TO THE CHECKOUT, and that is the whole point.
+#
+# This was `:main` in all eight places. `:main` is whatever was last pushed to
+# main, which is NOT the ref this run checked out -- so a run dispatched from a
+# branch executes main's client while every string the job emits (the ramp
+# contract, CONTROL_PLANE_CAVEAT, the receiver-side witness classify_held_tunnel)
+# comes from the branch. The witness under test is then not the witness that
+# runs, and the artifact reports the branch's caveat over main's measurement.
+#
+# publish-amt-verify.yml already pushes ghcr.io/blockcast/amt-verify:<sha> on
+# every main build, so pinning to github.sha costs nothing and cannot go stale:
+# the tag IS the commit.
+#
+# But that publisher only fires on main, so on a BRANCH no such tag exists and
+# the pull fails -- which made this workflow undispatchable from the very PR it
+# is supposed to verify (Ally, 945d069). So: pull, and on a miss BUILD from the
+# checkout. Both paths yield the checkout's client, by tag identity on main and
+# by construction on a branch. On the build path the revision assertion below is
+# tautological -- provenance there rests on having built the checked-out tree,
+# not on the label -- and the receipt says `local-build` rather than a registry
+# digest, because there isn't one and an empty field would read as a missing
+# measurement rather than an absent one.
+env:
+  IMAGE: ghcr.io/blockcast/amt-verify:${{ github.sha }}
+
 jobs:
   probe:
+    if: ${{ (inputs.mode || 'oneshot') == 'oneshot' }}
     runs-on: ubuntu-latest
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
@@ -82,6 +140,7 @@ jobs:
           # and it distinguishes "sysfs said nothing" from "sysfs said something
           # synthetic". `nic_speed_mbps` is the only authoritative field.
           echo "egress_dev=${dev:-unknown} nic_speed_mbps=$speed nic_driver=${drv:-unknown} nic_speed_mbps_reported=${reported}"
+      - uses: actions/checkout@v4
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -89,10 +148,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: amt-verify (real client, public vantage)
         run: |
-          docker pull -q ghcr.io/blockcast/amt-verify:main
-          echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/blockcast/amt-verify:main)"
+          docker pull -q $IMAGE || docker build -q -t $IMAGE \
+            --label org.opencontainers.image.revision=${{ github.sha }} .
+          echo "image_digest=$(docker inspect --format='{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}local-build{{end}}' $IMAGE)"
           # BLO-21823 AC#3 wants the client commit alongside the artifact hash.
-          echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/blockcast/amt-verify:main)"
+          echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"
           set +e
           # BLO-33456. `mmtp.gaps` says packets went missing; it does NOT say
           # where. The kernel already counts the one candidate that is cheapest
@@ -140,7 +200,7 @@ jobs:
           udp_counters() { awk '/^Udp:/{n++; if (n==2) print}' /proc/net/snmp; }
           udp_before=$(udp_counters)
           t0=$(date +%s%3N)
-          docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
+          docker run --rm --network host $IMAGE \
             --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
             --timeout "$TIMEOUT" --packet-count "$PACKETS" --json --verbose \
             >report.json 2>verbose.log
@@ -207,3 +267,413 @@ jobs:
           path: |
             report.json
             verbose.log
+
+  # BLO-33457. Tunnel-STATE occupancy ramp: how many concurrent AMT tunnels can
+  # the linux relay hold in its tunnel table? This is the MX301-M leg of
+  # BLO-20175's sizing model, which is a STATE claim (tunnel-limit 16,384), not
+  # the throughput claim BLO-26574 measures.
+  #
+  # Target is 69.25.95.128:2268 = Service/blockcastd-amt-relay-linux
+  # (LoadBalancer, selector app.kubernetes.io/name=amt-relay-linux), verified
+  # 2026-09-12. The OTHER relay -- Service/blockcastd-amt-relay, the gw-* one
+  # whose job="production-amt-relay" reports amt_relay_tunnel_limit=0 -- is
+  # ClusterIP-only and has no public 2268, so a public-vantage ramp cannot
+  # accidentally measure it.
+  #
+  # THE WITNESS IS RECEIVER-SIDE, and that is a correction, not a preference.
+  # The AC originally wanted amt_relay_active_tunnels{job="production-amt-relay-linux"}
+  # corroborating each step. That gauge is DEAD on both production relays
+  # (linux: never non-zero in 30d; juniper: zero variance in 30d, pinned at 1 --
+  # BLO-33457). A ramp joined against it reports 0 occupancy at every N, which
+  # reads as a relay defect rather than a dead dial. So the witness is
+  # `alive` from the client: how many of N reached Active and sustained it past
+  # a keep-alive interval. Its positive control is in-tree
+  # (each_deliberate_failure_mode_reduces_the_alive_count).
+  tunnels-ramp:
+    if: ${{ inputs.mode == 'tunnels-ramp' }}
+    runs-on: ubuntu-latest
+    env:
+      RELAY: ${{ inputs.relay || '69.25.95.128' }}
+      SOURCE: ${{ inputs.source || '69.25.95.192' }}
+      GROUP: ${{ inputs.group || '232.1.1.60' }}
+      # Must MATCH the declared input default. It read
+      # `...,1024,4096,8192,10000` -- the pre-ruling list -- so a dispatch that
+      # supplied ramp_steps as an empty string (REST does; the UI cannot) would
+      # silently select the four steps the CTO withheld, via the one path that
+      # skips the input default entirely.
+      STEPS: ${{ inputs.ramp_steps || '1,8,64,256,1024' }}
+      HOLD: ${{ inputs.hold || '25' }}
+      KEEPALIVE: ${{ inputs.keepalive || '10' }}
+      # Raised inside the container for every docker run below. Declared once so
+      # the value enforced against max N cannot drift from the value applied.
+      CONTAINER_NOFILE: '1048576'
+      # Instrument ceiling, not a relay limit: ~10 KB/tunnel measured to N=10000
+      # in one process (tunnels_mode_scales_to_512_concurrent doc comment).
+      # Above this the RIG is unvalidated, so a knee there is unattributable.
+      MAX_SUPPORTED_N: '10000'
+    steps:
+      - name: Vantage receipt
+        run: |
+          echo "utc=$(date -u +%FT%TZ)"
+          echo "public_ip=$(curl -fsS https://api.ipify.org)"
+          echo "target=$RELAY:2268 sg=($SOURCE,$GROUP) steps=$STEPS"
+
+      # THE STEP LIST IS A CONTRACT AND IT WAS NEVER CHECKED.
+      #
+      # Everything downstream assumes ascending order. The ramp stops at the
+      # first step that establishes nothing, and the verdict reads the run of
+      # fully-alive steps as a prefix. Fed `1024,8` those two disagree with each
+      # other and both report confidently: the ramp could stop below the
+      # configured cap, or the verdict could name a knee above an N that had
+      # already failed. Neither shows up as an error -- the numbers just mean
+      # something other than what they say.
+      - name: Validate ramp steps
+        run: |
+          steps=$(echo "$STEPS" | tr ',' ' ')
+          [ -n "$(echo "$steps" | tr -d ' ')" ] || { echo "::error::ramp_steps is empty"; exit 1; }
+          prev=0
+          for n in $steps; do
+            case "$n" in
+              ''|*[!0-9]*) echo "::error::ramp step '$n' is not a non-negative integer"; exit 1 ;;
+            esac
+            [ "$n" -gt 0 ] || { echo "::error::ramp step '$n' must be > 0"; exit 1; }
+            if [ "$n" -le "$prev" ]; then
+              echo "::error::ramp steps must be STRICTLY ASCENDING ($n follows $prev). The stop rule and the verdict both read the list in order; unsorted input makes both wrong without failing."
+              exit 1
+            fi
+            if [ "$n" -gt "$MAX_SUPPORTED_N" ]; then
+              echo "::error::ramp step $n exceeds MAX_SUPPORTED_N=$MAX_SUPPORTED_N -- the rig is only validated to that N, so a knee above it could not be attributed to the relay"
+              exit 1
+            fi
+            prev=$n
+          done
+          echo "steps_validated=$steps"
+
+      # INSTRUMENT CEILINGS, MEASURED BEFORE THE FIRST STEP.
+      #
+      # Each of these would present as a relay-side state knee if it bound
+      # first, which is the specific way this measurement gets silently wrong:
+      # the ramp would report a ceiling that is really the runner's.
+      #
+      # Every ceiling below is either ENFORCED against max N or explicitly
+      # labelled an OBSERVATION with its failure signature named. Recording a
+      # number and then not comparing it is the worst of both: it reads as a
+      # guard in the log and guards nothing.
+      #
+      #   ENFORCED
+      #     port range  -- the relay keys tunnels by source (IP, port), so N
+      #                    tunnels need N distinct source ports. Hard ceiling on
+      #                    N from a single vantage; exhaustion is silent.
+      #     nofile      -- one socket per tunnel. The RUNNER's soft default is
+      #                    1024, but the client runs in a container with
+      #                    --ulimit nofile=$CONTAINER_NOFILE, so the container
+      #                    value is the binder and is what gets compared. The
+      #                    runner's own limit is recorded as context only.
+      #     conntrack   -- NAT state table; N flows need N entries. Enforced
+      #                    when readable; when not, downgraded to an observation
+      #                    rather than silently skipped.
+      #
+      #   OBSERVATIONS (recorded, NOT enforced -- no defensible per-tunnel
+      #   constant to compare against, so a threshold here would be invented)
+      #     nproc / mem -- these do not produce a clean shortfall. CPU
+      #                    starvation shows up as establishment TIMEOUTS
+      #                    (establish_errors, "timed out ... Discovering") and
+      #                    memory pressure as an OOM-killed container (step
+      #                    exit 137, established=0). Both are distinguishable
+      #                    from a relay knee in the artifact IF you look: a
+      #                    relay-side ceiling refuses new tunnels while the
+      #                    established ones stay alive, whereas a host-side one
+      #                    degrades the whole step. Read establish_errors and
+      #                    not_alive before attributing any knee.
+      - name: Host ceilings (recorded, then enforced or labelled)
+        run: |
+          {
+            echo "runner_nofile_soft=$(ulimit -Sn)"
+            echo "runner_nofile_hard=$(ulimit -Hn)"
+            echo "container_nofile=$CONTAINER_NOFILE"
+            echo "ip_local_port_range=$(cat /proc/sys/net/ipv4/ip_local_port_range)"
+            lo=$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range)
+            hi=$(awk '{print $2}' /proc/sys/net/ipv4/ip_local_port_range)
+            echo "source_ports_available=$((hi-lo+1))"
+            echo "nf_conntrack_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo unavailable)"
+            echo "nproc=$(nproc)                # OBSERVATION"
+            echo "mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)   # OBSERVATION"
+          } | tee host-ceilings.txt
+
+          # The largest requested N must fit under every ENFORCED ceiling, or
+          # the ramp is measuring this runner. Fail LOUDLY rather than produce
+          # a plausible number.
+          max_n=$(echo "$STEPS" | tr ',' '\n' | sort -n | tail -1)
+          echo "max_requested_n=$max_n" | tee -a host-ceilings.txt
+          fail=0
+
+          ports=$(sed -n 's/^source_ports_available=//p' host-ceilings.txt)
+          if [ "$max_n" -gt "$ports" ]; then
+            echo "::error::max N ($max_n) exceeds available source ports ($ports) -- the ramp would measure SNAT exhaustion, not relay state"
+            fail=1
+          fi
+
+          # One socket per tunnel plus the process's own handles. Headroom is
+          # deliberate: at the cap the shortfall would otherwise land exactly
+          # where the knee is expected.
+          if [ "$max_n" -ge "$CONTAINER_NOFILE" ]; then
+            echo "::error::max N ($max_n) is at or above the container nofile limit ($CONTAINER_NOFILE) -- 'Too many open files' would be recorded as a relay knee"
+            fail=1
+          fi
+
+          ct=$(sed -n 's/^nf_conntrack_max=//p' host-ceilings.txt)
+          if [ "$ct" = "unavailable" ]; then
+            echo "::warning::nf_conntrack_max unreadable -- DOWNGRADED to an observation. If a step degrades near a round number, suspect NAT state before the relay."
+          elif [ "$max_n" -gt "$ct" ]; then
+            echo "::error::max N ($max_n) exceeds nf_conntrack_max ($ct) -- NAT state exhaustion would be recorded as a relay knee"
+            fail=1
+          fi
+
+          [ "$fail" -eq 0 ] || exit 1
+
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The tag pins by construction; this ASSERTS it. A receipt that is recorded
+      # and never compared is the same record-but-don't-enforce shape as the ramp
+      # contract and the host ceilings -- it reads as a guard in the artifact and
+      # guards nothing. Two lines, and it also catches the one case the tag alone
+      # cannot: a build that published under this sha with a different revision
+      # label.
+      - name: Image receipt
+        run: |
+          docker pull -q $IMAGE || docker build -q -t $IMAGE \
+            --label org.opencontainers.image.revision=${{ github.sha }} .
+          {
+            echo "image_digest=$(docker inspect --format='{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}local-build{{end}}' $IMAGE)"
+            echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"
+            echo "workflow_sha=${{ github.sha }}"
+          } | tee image-receipt.txt
+          cc=$(sed -n 's/^client_commit=//p' image-receipt.txt)
+          [ "$cc" = "${{ github.sha }}" ] || {
+            echo "::error::image revision ($cc) != checkout (${{ github.sha }}) -- the client under test is not the client that would run"; exit 1; }
+
+      # BASELINE OCCUPANCY, before the ramp adds anything.
+      #
+      # The withheld cap steps rested on "the linux relay has served zero tunnels
+      # for a week, so there is no live subscriber to displace". That read
+      # amt_relay_active_tunnels=0 as a fact about the relay when it is a fact
+      # about the gauge -- the same gauge a two-tunnel control had already shown
+      # stays flat at 0 while two tunnels were held. This records what the relay
+      # says about ITSELF instead, before the ramp perturbs it. Non-fatal: it is
+      # evidence for sizing the NEXT run, not a gate on this one.
+      - name: Baseline relay occupancy (_astats, pre-ramp)
+        run: |
+          curl -fsS -m 5 "http://$RELAY:8080/_astats" | tee astats-baseline.json || \
+            echo "::warning::_astats unreachable from this public vantage -- baseline unknown, and the candidate occupancy instrument cannot be qualified from here"
+
+      # POSITIVE CONTROL, and it gates the ramp.
+      #
+      # BLO-20175's liveness AC exists because a relay that answers NOTHING
+      # produces a clean-looking sweep: 0 tunnels, 0 drops, no stop rule ever
+      # trips, and the ramp reports "no knee through N=10000" -- i.e. maximal
+      # capacity -- for a relay that established nothing. An idle (S,G) is
+      # deliberate here (the witness is tunnel-table occupancy, not data
+      # receipt), but "idle" must not be allowed to shade into "the relay
+      # ignores this tuple". One tunnel must come up first, or the ramp is void.
+      - name: N=1 positive control (a ramp on a non-establishing tuple is void)
+        run: |
+          set +e
+          docker run --rm --network host \
+            --ulimit "nofile=$CONTAINER_NOFILE:$CONTAINER_NOFILE" \
+            $IMAGE \
+            --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
+            --tunnels 1 --keepalive "$KEEPALIVE" --hold "$HOLD" --json \
+            >control.json 2>control.log
+          status=$?
+          set -e
+          echo "control_exit=$status"; cat control.json || true
+          alive=$(jq -r '.alive // 0' control.json 2>/dev/null || echo 0)
+          if [ "$alive" != "1" ]; then
+            echo "::error::N=1 control did not establish+survive (alive=$alive). Ramp aborted: a sweep from here would report a false ceiling."
+            cat control.log || true
+            exit 1
+          fi
+
+      # Per-step UTC start/end. The relay-side join these were originally for is
+      # off the table (amt_relay_active_tunnels is dead -- see the job header),
+      # but they stay: they are what lets a step be correlated with the relay
+      # pod's own CPU/memory series, with LB behaviour, or with anything else
+      # measured later. Unrecordable after the fact, cheap now.
+      #
+      # CANDIDATE OCCUPANCY INSTRUMENT, SAMPLED UNDER QUALIFICATION.
+      #
+      # The relay serves its own stats as JSON on :8080/_astats, and that
+      # surface is NOT the dead gauge. Measured in-cluster 2026-09-12, same pod,
+      # seconds apart: _astats "amt.relay.active_tunnels"=29 while the Prometheus
+      # exporter's amt_relay_active_tunnels=0. So this one demonstrably returns a
+      # positive, which is exactly the property the gauge lacks.
+      #
+      # It is sampled here as an OBSERVATION and deliberately does NOT gate the
+      # step -- enforcing an instrument on the same run that is meant to qualify
+      # it is circular, and a 0 here would then void a ramp for the instrument's
+      # fault rather than the relay's. Qualification criterion, applied by hand
+      # to the artifact afterwards: does peak occupancy TRACK the requested N?
+      # If it moves to ~1024 while 1024 tunnels are held, it is qualified and it
+      # licenses the withheld cap steps. If it reads 0, it is a seventh dead dial.
+      #
+      # Both counters are kept because they are DIFFERENT FIELDS and were not
+      # equal when measured (relay.active_tunnels=29, interface.amtr.tunnels=47).
+      # Which of them tracks N is part of what this run establishes; assuming
+      # they are the same number is how a wrong one gets adopted.
+      #
+      # Public reachability of :8080 is unverified -- the pre-run read was via
+      # the LB IP from in-cluster, which kube-proxy may short-circuit. An
+      # unreachable endpoint records {} and costs the run nothing.
+      - name: Ramp
+        run: |
+          echo '[]' > ramp-index.json
+          for n in $(echo "$STEPS" | tr ',' ' '); do
+            t0=$(date -u +%FT%TZ)
+            echo "=== N=$n start=$t0 ==="
+            set +e
+            docker run --rm --network host \
+              --ulimit "nofile=$CONTAINER_NOFILE:$CONTAINER_NOFILE" \
+              $IMAGE \
+              --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
+              --tunnels "$n" --keepalive "$KEEPALIVE" --hold "$HOLD" --json \
+              >"step-$n.json" 2>"step-$n.log" &
+            pid=$!
+            # Sample for the whole step rather than at one guessed instant: with
+            # establishment time unknown a single sample can land before the
+            # tunnels are up and read a false 0.
+            : > "astats-$n.ndjson"
+            while kill -0 $pid 2>/dev/null; do
+              curl -fsS -m 3 "http://$RELAY:8080/_astats" >> "astats-$n.ndjson" 2>/dev/null
+              echo >> "astats-$n.ndjson"
+              sleep 2
+            done
+            wait $pid
+            rc=$?
+            set -e
+            t1=$(date -u +%FT%TZ)
+            peak_relay=$(jq -s 'map(.ats."amt.relay.active_tunnels"//empty)|max//null' "astats-$n.ndjson" 2>/dev/null || echo null)
+            peak_iface=$(jq -s 'map(.ats."amt.interface.amtr.tunnels"//empty)|max//null' "astats-$n.ndjson" 2>/dev/null || echo null)
+            echo "N=$n exit=$rc end=$t1 astats_peak_relay_active_tunnels=$peak_relay astats_peak_iface_tunnels=$peak_iface"
+            cat "step-$n.json" || true
+            jq --argjson n "$n" --arg t0 "$t0" --arg t1 "$t1" --argjson rc "$rc" \
+               --argjson pr "${peak_relay:-null}" --argjson pi "${peak_iface:-null}" \
+               --slurpfile r "step-$n.json" \
+               '. + [{requested:$n, started_utc:$t0, ended_utc:$t1, exit:$rc,
+                      astats_peak_relay_active_tunnels:$pr,
+                      astats_peak_iface_tunnels:$pi,
+                      report:($r[0] // null)}]' \
+               ramp-index.json > tmp.json && mv tmp.json ramp-index.json
+            # A degraded step IS the measurement -- it is where the knee is --
+            # so the loop does not stop on a non-zero exit. It stops only when
+            # nothing came up at all, which means every larger N is wasted.
+            est=$(jq -r '.established // 0' "step-$n.json" 2>/dev/null || echo 0)
+            if [ "$est" = "0" ]; then
+              echo "::warning::N=$n established 0 tunnels; stopping the ramp"
+              break
+            fi
+          done
+          echo '--- ramp-index.json ---'; jq . ramp-index.json
+
+      # AC 4: a clean completion at the cap is "ceiling >= cap, config-bound",
+      # NOT "no state knee". Those are different findings and only one of them
+      # is honest about what was and was not shown.
+      #
+      # `top` is the last step of the LEADING RUN of fully-alive steps, not the
+      # largest fully-alive step anywhere in the list. With a degraded step at
+      # 256 and a clean one at 1024, `max` would report a ceiling above an N
+      # that had already failed. The leading run is the only reading that says
+      # "every N up to here held", which is the claim BLO-20175 sizes against.
+      - name: Verdict
+        run: |
+          cap=$(echo "$STEPS" | tr ',' '\n' | sort -n | tail -1)
+          top=$(jq -r '
+            (map((.report.alive // -1) == .requested) | index(false)) as $i
+            | (if $i == null then . else .[0:$i] end)
+            | if length == 0 then 0 else .[-1].requested end' ramp-index.json)
+          ran=$(jq -r 'length' ramp-index.json)
+          echo "highest_fully_alive_N=$top cap=$cap steps_run=$ran"
+          # A shortfall is the RELAY's tunnel table only if its cause says so.
+          # This is a POSITIVE test for relay attribution, not a blocklist of
+          # host-side symptoms: an error string nobody has seen before must fall
+          # through to "not a relay knee", because that is the direction a capex
+          # number is safe to be wrong in. (An earlier blocklist spelling of this
+          # matched "refused" and so swallowed "relay refused: tunnel table
+          # full" -- the negative control below exists to keep that fixed.)
+          # Surfacing-without-enforcing is the fourth instance of that pattern in
+          # this file; the other three were the ramp contract, the host ceilings,
+          # and the image label.
+          causes=$(jq -r '.[]|select((.report.alive // -1) != .requested)
+            |(((.report.establish_errors // {})|keys[]?),((.report.not_alive // {})|keys[]?))' ramp-index.json)
+          n_relay=$(echo "$causes" | grep -cEi 'relay (refused|rejected)|tunnel[ -](table|limit)|no more tunnels' || true)
+          n_other=$(echo "$causes" | grep -cvEi 'relay (refused|rejected)|tunnel[ -](table|limit)|no more tunnels' || true)
+          [ -z "$causes" ] && n_relay=0 && n_other=0
+          # Does any step admit it could not tell N tunnels from one aliased N
+          # ways? This gate runs FIRST and supersedes every branch below,
+          # including the clean-to-cap one -- a ramp that sails to the cap on a
+          # single source address is the WORST case, not the best: it reports a
+          # ceiling having established one tunnel. `alive` is a send-side
+          # self-report, so nothing downstream of it can notice.
+          # `// .requested` defaults a report predating the field to "shared",
+          # i.e. an unknown fails to the safe side rather than passing the gate.
+          aliased=$(jq -r '[.[]|select(((.report.distinct_outer_sources // 1)) < .requested)]|length' ramp-index.json)
+          if [ "$aliased" -gt 0 ]; then
+            echo "verdict=WITNESS NOT ESTABLISHED ($aliased/$ran steps ran all gateways from ONE outer source address). NOT a ceiling, NOT a knee, and NOT 'no knee': linux-amt as deployed keys tunnel state on the outer ADDRESS alone, so N gateways from one address occupy ONE relay tunnel entry while every one still reads Active and sends keep-alives. An alive of N here is indistinguishable from one tunnel aliased N ways, so this run says nothing about the relay's tunnel table at any N. Do NOT size against this number. Needs distinct source addresses (linux-amt kernel/selftests/amt_capacity.sh) and/or the BLO-33636 keying fix." | tee verdict.txt
+          elif [ "$top" = "$cap" ]; then
+            echo "verdict=ceiling >= $cap, config-bound (NOT 'no state knee': the ramp ended at the configured cap, so no knee was reached or excluded above it)" | tee verdict.txt
+          elif [ "$n_relay" -gt 0 ] && [ "$n_other" -eq 0 ]; then
+            echo "verdict=knee at N>$top (first degraded step above $top; every shortfall is relay-attributed -- see ramp-index.json)" | tee verdict.txt
+          else
+            echo "verdict=degraded above N=$top, BINDER NOT ESTABLISHED ($n_other cause(s) not attributed to the relay). NOT a relay knee: a bare transport failure is equally consistent with the relay's tunnel table, public-path loss, and this runner's NAT/source-port or rate limiting. Do NOT size against this number." | tee verdict.txt
+          fi
+          jq -r '[.[]|select((.report.establish_errors // {}) != {} or (.report.not_alive // {}) != {})
+                 |{requested, establish_errors:.report.establish_errors, not_alive:.report.not_alive}]' \
+             ramp-index.json | tee -a verdict.txt
+          echo "NOTE: control-plane tunnel-table ceiling, not a loaded-state ceiling. Witness is RECEIVER-SIDE (client 'alive'); relay-side amt_relay_active_tunnels is dead and was deliberately not used. Every step report carries the caveat inline." | tee -a verdict.txt
+          # Occupancy-instrument QUALIFICATION, reported next to the verdict so
+          # the two are read together. This does not corroborate THIS ramp -- an
+          # unqualified instrument cannot corroborate anything -- it says whether
+          # _astats earned the right to corroborate the NEXT one.
+          {
+            echo "--- candidate occupancy instrument (_astats :8080), qualification ---"
+            # `jq` exits 0 and prints NOTHING on an empty file, so the old
+            # `|| echo unreachable` could never fire: an unreachable instrument
+            # was rendered as an empty string and read as "no data". Test the
+            # file has bytes first -- an instrument that was never read must not
+            # be reported in the same shape as one that answered.
+            if [ -s astats-baseline.json ]; then
+              echo "baseline_pre_ramp=$(jq -c '.ats|{relay:."amt.relay.active_tunnels",iface:."amt.interface.amtr.tunnels",limit:."amt.relay.tunnel_limit"}' astats-baseline.json 2>/dev/null || echo malformed)"
+            else
+              echo "baseline_pre_ramp=UNREACHABLE (no bytes returned; _astats is in-cluster only and this job runs from the public runner)"
+            fi
+            jq -r '.[]|"requested=\(.requested) peak_relay_active_tunnels=\(.astats_peak_relay_active_tunnels) peak_iface_tunnels=\(.astats_peak_iface_tunnels) alive=\(.report.alive // "n/a")"' ramp-index.json
+            # Three outcomes, not two. A column of nulls means the instrument was
+            # NOT SAMPLED -- it is not evidence the dial is dead, and recording it
+            # as such would condemn a counter measured live at relay=29/iface=47
+            # from in-cluster hours earlier.
+            if jq -e '[.[]|.astats_peak_relay_active_tunnels,.astats_peak_iface_tunnels]|all(.==null)' ramp-index.json >/dev/null; then
+              echo "qualification=NOT SAMPLED -- every peak is null, i.e. no reading was taken. This is NOT the 'dead dial' verdict and must not be recorded as one: it says nothing about _astats, only that this vantage could not reach it. Re-run with the sampler in-cluster."
+            else
+              echo "qualification=QUALIFIED if a peak column rises with requested N; DEAD DIAL if it stays flat at a value (that is the amt_relay_active_tunnels failure, and it would be the seventh). Read the two peak columns separately: they were NOT equal pre-ramp (relay=29, iface=47), so whichever tracks N is the occupancy counter and the other is something else."
+            fi
+          } | tee -a verdict.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: amt-tunnels-ramp
+          path: |
+            host-ceilings.txt
+            image-receipt.txt
+            astats-baseline.json
+            astats-*.ndjson
+            control.json
+            control.log
+            ramp-index.json
+            verdict.txt
+            step-*.json
+            step-*.log

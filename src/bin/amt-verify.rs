@@ -849,8 +849,24 @@ fn validate_families(
 const CONTROL_PLANE_CAVEAT: &str = "Idle tunnels: this is the relay's CONTROL-PLANE tunnel-table \
 ceiling, not a loaded-state ceiling. An idle tunnel may cost a relay less state than an active \
 one. Comparable to a configured control-plane limit (Junos tunnel-limit, Linux AMT_MAX_TUNNELS); \
-NOT comparable to a measured loaded ceiling. Client-side counts must be corroborated by relay-side \
-amt_relay_active_tunnels at each step.";
+NOT comparable to a measured loaded ceiling. WITNESS IS RECEIVER-SIDE: `alive` is how many of \
+`requested` reached Active and sustained it past a keep-alive interval, observed from this client. \
+It is NOT corroborated by relay-side amt_relay_active_tunnels, which is dead on both production \
+relays (linux: never non-zero in 30d; juniper: zero variance in 30d, pinned at 1) -- see BLO-33457. \
+ATTRIBUTION: a shortfall here is the relay's tunnel table ONLY if establish_errors and not_alive \
+are empty of host-side reasons; otherwise the binder is this rig, not the relay. \
+DISQUALIFIER -- READ BEFORE CITING ANY NUMBER FROM THIS MODE: every gateway here binds the SAME \
+outer source address (distinct ephemeral ports only), so `distinct_outer_sources` is 1 regardless \
+of `requested`. RFC 7450 s4.2.2 keys a tunnel on the (address, port) endpoint, but linux-amt as \
+deployed matches on the outer source ADDRESS alone (`tunnel->addr.ip4 == iph->saddr`, amt.c \
+amt_request_handler), overwriting `source_port` from the newest Request. So N gateways from one \
+address occupy exactly ONE relay tunnel entry while every one of them still reads Active and still \
+sends keep-alives -- `alive` is a SEND-side self-report (state == Active && keepalives_sent >= 1; \
+all three not-alive reasons are client-local) and cannot witness relay state at all. An `alive` of \
+N is therefore indistinguishable from one tunnel aliased N ways. This mode CANNOT produce a relay \
+tunnel-state ceiling; see BLO-33636 for the keying fix and linux-amt \
+kernel/selftests/amt_capacity.sh for a rig that provisions distinct source addresses and takes \
+ground truth from the relay's own admit/refuse reply.";
 
 /// Per-tunnel result. `establish_ms` is wall-clock from gateway construction to
 /// the gateway reporting `Active`.
@@ -864,6 +880,46 @@ enum TunnelOutcome {
     NotAlive { reason: &'static str },
     /// Never established.
     Failed { error: String },
+}
+
+/// Verdict for one gateway at the end of the hold. Pure so each deliberate
+/// failure mode can be driven in a unit test: an `alive` count that cannot be
+/// shown to go DOWN is indistinguishable from one hardcoded to `established`,
+/// and this whole measurement rests on it (BLO-33457 CTO condition 1).
+///
+/// Order matters. `fatal_runtime_error` is checked first because a dead socket
+/// leaves the published state stale, so a gateway whose runtime died can still
+/// read `Active` — classifying that as relay behaviour is how a ramp turns the
+/// INSTRUMENT's ceiling into a relay knee.
+fn classify_held_tunnel(
+    has_fatal: bool,
+    state: GatewayState,
+    keepalives: u64,
+    establish_ms: u64,
+    rx: u64,
+) -> TunnelOutcome {
+    if has_fatal {
+        TunnelOutcome::NotAlive {
+            reason: "fatal_runtime_error",
+        }
+    } else if state != GatewayState::Active {
+        TunnelOutcome::NotAlive {
+            reason: "state_left_active",
+        }
+    } else if keepalives == 0 {
+        // Held past one full keep-alive interval and emitted nothing: the
+        // tunnel was established but is not demonstrably maintained, so it
+        // must not be counted as live state.
+        TunnelOutcome::NotAlive {
+            reason: "no_keepalive_sent",
+        }
+    } else {
+        TunnelOutcome::Alive {
+            establish_ms,
+            keepalives,
+            rx,
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -899,6 +955,21 @@ struct TunnelsReport {
     /// recorded as a state knee, whereas `state_left_active` /
     /// `no_keepalive_sent` are the tunnel genuinely failing to survive.
     not_alive: BTreeMap<String, u32>,
+    /// How many DISTINCT outer source addresses the N gateways were spread
+    /// across. Structurally 1 here: `run_tunnels` builds every gateway with
+    /// `AsyncAmtGateway::builder(relay)`, which binds the host's default
+    /// source, so the tunnels differ only by ephemeral port.
+    ///
+    /// This is the field that makes the mode's central limitation machine-
+    /// checkable instead of prose. A relay that keys tunnel state on the outer
+    /// ADDRESS alone -- which is what linux-amt does as deployed -- collapses
+    /// all N onto one tunnel entry, and because `alive` is a send-side
+    /// self-report every aliased gateway still counts. So whenever this is
+    /// less than `requested`, no tunnel-state ceiling can be read off the run,
+    /// and the verdict must say so rather than print a number. When a rig that
+    /// provisions distinct source addresses lands, this becomes N and the gate
+    /// opens on its own.
+    distinct_outer_sources: u32,
     caveat: &'static str,
 }
 
@@ -986,6 +1057,11 @@ fn summarize(
         rx_datagrams_total: rx_total,
         establish_errors,
         not_alive,
+        // Every gateway in `run_tunnels` is built with `builder(relay)`, i.e.
+        // the host default source. Hardcoded rather than counted because there
+        // is exactly one call site and a counted-but-always-1 value would read
+        // as a measurement.
+        distinct_outer_sources: 1,
         caveat: CONTROL_PLANE_CAVEAT,
     }
 }
@@ -1092,32 +1168,13 @@ async fn run_tunnels(
     for (gw, establish_ms) in &up {
         let keepalives = gw.keepalives_sent();
         let rx = gw.rx_datagrams();
-        outcomes.push(if gw.has_fatal().await {
-            // Unrecoverable socket error in this gateway's runtime. Attributed
-            // separately from `state_left_active` because it is the INSTRUMENT
-            // failing, not the relay evicting state — reading a host-side send
-            // failure as a relay knee is how a ramp under-reports the ceiling.
-            TunnelOutcome::NotAlive {
-                reason: "fatal_runtime_error",
-            }
-        } else if gw.state() != GatewayState::Active {
-            TunnelOutcome::NotAlive {
-                reason: "state_left_active",
-            }
-        } else if keepalives == 0 {
-            // Held past one full keep-alive interval and emitted nothing: the
-            // tunnel was established but is not demonstrably maintained, so it
-            // must not be counted as live state.
-            TunnelOutcome::NotAlive {
-                reason: "no_keepalive_sent",
-            }
-        } else {
-            TunnelOutcome::Alive {
-                establish_ms: *establish_ms,
-                keepalives,
-                rx,
-            }
-        });
+        outcomes.push(classify_held_tunnel(
+            gw.has_fatal().await,
+            gw.state(),
+            keepalives,
+            *establish_ms,
+            rx,
+        ));
     }
 
     let report = summarize(
@@ -1164,8 +1221,9 @@ async fn run_tunnels(
     }
 
     // Tear down concurrently. Leaving state behind would inflate the next ramp
-    // step; confirm relay-side amt_relay_active_tunnels returns to baseline
-    // between steps rather than trusting this.
+    // step, and there is no relay-side gauge to confirm the table drained
+    // (amt_relay_active_tunnels is dead — see CONTROL_PLANE_CAVEAT), so the
+    // ramp driver must space steps rather than trust a readback.
     let mut teardown = tokio::task::JoinSet::new();
     for (gw, _) in up {
         teardown.spawn(async move { finish_gateway(gw, group, source, shutdown_mode).await });
@@ -1214,6 +1272,100 @@ mod tests {
 
     const SRC: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
     const GROUP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(232, 0, 0, 1));
+
+    // ---- POSITIVE CONTROL for the receiver-side occupancy witness ----------
+    //
+    // BLO-33457, CTO condition 1. `amt_relay_active_tunnels` was the AC's
+    // corroborating instrument and is dead on both production relays, so
+    // `alive` is now the sole witness for this measurement. An instrument that
+    // has only ever been seen to agree with `requested` is indistinguishable
+    // from `alive = established`. These drive each deliberate failure mode and
+    // assert the count goes DOWN.
+
+    fn summarize_n(outcomes: Vec<TunnelOutcome>, requested: u32) -> TunnelsReport {
+        summarize(
+            outcomes,
+            requested,
+            "127.0.0.1".parse().unwrap(),
+            "v4",
+            GROUP,
+            SRC,
+            /* hold */ 30,
+            /* keepalive */ 10,
+            /* stagger */ 0,
+        )
+    }
+
+    fn alive_one() -> TunnelOutcome {
+        classify_held_tunnel(false, GatewayState::Active, 1, 5, 0)
+    }
+
+    #[test]
+    fn a_healthy_held_tunnel_is_counted_alive() {
+        // The control's control: without this, a classifier that returned
+        // NotAlive unconditionally would "pass" every assertion below.
+        assert!(matches!(alive_one(), TunnelOutcome::Alive { .. }));
+        assert_eq!(summarize_n(vec![alive_one(), alive_one()], 2).alive, 2);
+    }
+
+    #[test]
+    fn each_deliberate_failure_mode_reduces_the_alive_count() {
+        for (label, failed) in [
+            // Socket died under us. Note `state` is still Active: a dead
+            // runtime leaves the published state stale, which is exactly the
+            // case that would otherwise be counted as live relay state.
+            (
+                "fatal_runtime_error",
+                classify_held_tunnel(true, GatewayState::Active, 3, 5, 0),
+            ),
+            // Left Active during the hold.
+            (
+                "state_left_active",
+                classify_held_tunnel(false, GatewayState::Discovering, 3, 5, 0),
+            ),
+            // Established but never maintained across a keep-alive interval.
+            (
+                "no_keepalive_sent",
+                classify_held_tunnel(false, GatewayState::Active, 0, 5, 0),
+            ),
+        ] {
+            let r = summarize_n(vec![alive_one(), alive_one(), failed], 3);
+            assert_eq!(r.established, 3, "{label}: all three did establish");
+            assert_eq!(r.alive, 2, "{label}: alive must drop below established");
+            assert_eq!(r.outcome, "degraded", "{label}");
+            assert_eq!(
+                r.not_alive.get(label),
+                Some(&1),
+                "{label} must be attributed by name, not folded into a bare shortfall: {:?}",
+                r.not_alive
+            );
+        }
+    }
+
+    #[test]
+    fn keepalives_min_exposes_a_single_unmaintained_tunnel() {
+        // The aggregate hides it: 2 alive either way. `keepalives_min` is what
+        // makes "survived an interval" a measurement rather than an assumption.
+        let r = summarize_n(
+            vec![
+                classify_held_tunnel(false, GatewayState::Active, 9, 5, 0),
+                classify_held_tunnel(false, GatewayState::Active, 1, 5, 0),
+            ],
+            2,
+        );
+        assert_eq!(r.alive, 2);
+        assert_eq!(r.keepalives_min, 1);
+    }
+
+    #[test]
+    fn the_caveat_travels_with_every_report() {
+        // AC 5, and the dead-gauge correction: the artifact must not send a
+        // reader to amt_relay_active_tunnels for corroboration.
+        let c = summarize_n(vec![alive_one()], 1).caveat;
+        assert!(c.contains("CONTROL-PLANE"), "{c}");
+        assert!(c.contains("RECEIVER-SIDE"), "{c}");
+        assert!(c.contains("ATTRIBUTION"), "{c}");
+    }
 
     // BLO-33456 review follow-up. A closed data broadcast and an expired
     // deadline both ended the data phase via the same `anyhow::Error`, so a
