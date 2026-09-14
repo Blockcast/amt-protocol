@@ -124,16 +124,33 @@ jobs:
           # Run two CONCURRENT probes (check overlap via data_started_at_ms /
           # data_ended_at_ms, NOT dispatch time), then over the two receipts:
           #
-          #   A=$(jq -S -c '[.mmtp.gap_positions[]]' a/report.json)
-          #   B=$(jq -S -c '[.mmtp.gap_positions[]]' b/report.json)
-          #   jq -n --argjson a "$A" --argjson b "$B" \
-          #     '{shared:[$a[]|select(. as $x|$b|index($x))]|length,
-          #       a_only:[$a[]|select(. as $x|($b|index($x))|not)]|length,
-          #       b_only:[$b[]|select(. as $x|($a|index($x))|not)]|length}'
+          # Compare ABSENT SEQUENCE NUMBERS, never the {pid,after,missing}
+          # objects. A burst straddling the two receivers differently yields
+          # the SAME absent range described by different triples -- e.g.
+          # {1,6435823,50} vs {1,6435824,49}, both ending at 6435873 -- so an
+          # object-equality compare scores them as disjoint on BOTH sides and
+          # invents per-receiver loss that is not there. Measured 2026-09-14 on
+          # runs 34810353292 / 34810354915: object-compare reports 4 a_only +
+          # 4 b_only events carrying 550 packets; the true divergence is
+          # 2 packets. A 275x overstatement, in the direction that manufactures
+          # a per-receiver verdict.
+          #
+          #   jq -n --slurpfile a a/report.json --slurpfile b b/report.json '
+          #     def absent: [.mmtp.gap_positions[] as $g
+          #                  | range($g.after+1; $g.after+$g.missing+1)
+          #                  | "\($g.pid):\(.)"] | sort;
+          #     ($a[0]|absent) as $A | ($b[0]|absent) as $B |
+          #     {a:($A|length), b:($B|length),
+          #      shared:(($A-($A-$B))|length),
+          #      a_only:(($A-$B)|length), b_only:(($B-$A)|length)}'
           #
           #   shared >> a_only+b_only -> stream-as-delivered (shared leg, or
           #                              source-side sequence discontinuity)
           #   mostly disjoint         -> per-receiver loss below the fan-out
+          #
+          # Both arms behind ONE relay cannot separate source-side discontinuity
+          # from loss in that relay's own ingest: both are "upstream of fan-out".
+          # Electing between them needs two receivers behind DIFFERENT relays.
           #
           # Truncation is visible as gap_positions|length < gap_events; a
           # truncated list makes `shared` a lower bound, not a verdict.
