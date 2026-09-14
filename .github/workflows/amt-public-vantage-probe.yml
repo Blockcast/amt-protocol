@@ -94,6 +94,51 @@ jobs:
           # BLO-21823 AC#3 wants the client commit alongside the artifact hash.
           echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/blockcast/amt-verify:main)"
           set +e
+          # BLO-33456. `mmtp.gaps` says packets went missing; it does NOT say
+          # where. The kernel already counts the one candidate that is cheapest
+          # to rule in or out, so read it rather than dispatching a study:
+          # `Udp: RcvbufErrors` is datagrams dropped because the socket receive
+          # buffer was full -- i.e. this receiver fell behind, not the path.
+          # `--network host` puts the container in THIS netns, so the runner's
+          # /proc/net/snmp is the container's counter.
+          #
+          # Three-way partition of a gap, none of which needs a source counter:
+          #   lagged_count > 0  -> userspace consumer behind (broadcast channel)
+          #   RcvbufErrors > 0  -> kernel socket buffer overran (reader behind)
+          #   both 0, gaps > 0  -> loss upstream of this host
+          # The known-clean sessions (gaps: 0) are the built-in negative control:
+          # attribution is by COVARIATION across lossy/clean, not by a threshold.
+          #
+          # Caveat, and it is real: this counter is netns-WIDE, not per-socket.
+          # On an otherwise-idle hosted runner ours is the only meaningful UDP
+          # traffic, but a non-zero delta is evidence about the netns, so do not
+          # read a small one as proof it was us.
+          #
+          # That partition localises a gap to THIS HOST or not. It cannot place
+          # an upstream gap on the shared leg vs. on this receiver's own leg
+          # downstream of the relay's per-tunnel fan-out -- and `gaps` /
+          # `gap_events` cannot either: BLO-33456 pair E had two receivers on
+          # different /8s report 501 / 34 identically, which fits both "they
+          # share the lossy leg" and "the source emitted a discontinuous
+          # sequence, so nothing was lost". `mmtp.gap_positions` settles it.
+          # Run two CONCURRENT probes (check overlap via data_started_at_ms /
+          # data_ended_at_ms, NOT dispatch time), then over the two receipts:
+          #
+          #   A=$(jq -S -c '[.mmtp.gap_positions[]]' a/report.json)
+          #   B=$(jq -S -c '[.mmtp.gap_positions[]]' b/report.json)
+          #   jq -n --argjson a "$A" --argjson b "$B" \
+          #     '{shared:[$a[]|select(. as $x|$b|index($x))]|length,
+          #       a_only:[$a[]|select(. as $x|($b|index($x))|not)]|length,
+          #       b_only:[$b[]|select(. as $x|($a|index($x))|not)]|length}'
+          #
+          #   shared >> a_only+b_only -> stream-as-delivered (shared leg, or
+          #                              source-side sequence discontinuity)
+          #   mostly disjoint         -> per-receiver loss below the fan-out
+          #
+          # Truncation is visible as gap_positions|length < gap_events; a
+          # truncated list makes `shared` a lower bound, not a verdict.
+          udp_counters() { awk '/^Udp:/{n++; if (n==2) print}' /proc/net/snmp; }
+          udp_before=$(udp_counters)
           t0=$(date +%s%3N)
           docker run --rm --network host ghcr.io/blockcast/amt-verify:main \
             --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
@@ -101,7 +146,40 @@ jobs:
             >report.json 2>verbose.log
           status=$?
           t1=$(date +%s%3N)
+          udp_after=$(udp_counters)
           set -e
+          # Delta, labelled off the header line so a kernel that adds a field
+          # cannot silently shift `RcvbufErrors` onto a neighbour's value.
+          #
+          # Guard on ABSENCE, not on value. If any of the three lines is short or
+          # empty -- /proc/net/snmp unreadable, `Udp:` block absent or renamed --
+          # the unguarded form prints a complete, well-formed, entirely fake
+          # `udp_delta ... RcvbufErrors=0`, because `A[i]-B[i]` on unset fields is
+          # 0-0. A consumer thresholding on `RcvbufErrors=0` cannot tell that from
+          # a real zero. So: require all three field counts to agree, else emit
+          # `udp_delta_invalid` and NO `udp_delta` line at all -- a grep for
+          # `RcvbufErrors=` then finds nothing, which is the honest answer.
+          #
+          # Deliberately does NOT exit non-zero: `set -e` is in force further down
+          # and a failed step discards report.json, re-introducing the AC1 defect
+          # this issue exists to fix. Fail closed on the counter, not on the run.
+          #
+          # This is about CAPTURE validity only. It does nothing for FIELD
+          # responsiveness: `RcvbufErrors` has never been driven non-zero on this
+          # runner, so a dead-dial reading of that specific counter is still not
+          # excluded. That needs a deliberately-starved receiver, not a width check.
+          awk -v hdr="$(awk '/^Udp:/{print; exit}' /proc/net/snmp)" \
+              -v b="$udp_before" -v a="$udp_after" '
+            BEGIN {
+              nh = split(hdr, H); nb = split(b, B); na = split(a, A)
+              if (nh < 2 || nh != nb || nh != na) {
+                printf "udp_delta_invalid hdr=%d before=%d after=%d\n", nh, nb, na
+                exit 0
+              }
+              out = ""
+              for (i = 2; i <= nh; i++) out = out sprintf(" %s=%d", H[i], A[i] - B[i])
+              printf "udp_delta%s\n", out
+            }'
           echo "amt_verify_exit=$status"
           # BLO-27413: receiver-side saturation witness. The relay fans one
           # multicast stream into N unicast tunnels, so the receiving vantage
