@@ -96,11 +96,14 @@ jobs:
           # and it distinguishes "sysfs said nothing" from "sysfs said something
           # synthetic". `nic_speed_mbps` is the only authoritative field.
           echo "egress_dev=${dev:-unknown} nic_speed_mbps=$speed nic_driver=${drv:-unknown} nic_speed_mbps_reported=${reported}"
-          # BLO-26574 Amendment 12g, Finding 1: the relay keys tunnel state on
-          # the outer source ADDRESS, so this rig's fan-out ceiling is its count
-          # of distinct PUBLIC source addresses (k), not its process count. A
-          # routable v6 /64 is the cheap way to raise k -- measure whether this
-          # vantage has one rather than assuming it in either direction.
+          # BLO-26574 Amendment 12g, Finding 1: on a PRE-7ec53567 relay (every
+          # one deployed today) tunnel state is keyed on the outer source
+          # ADDRESS, so this rig's fan-out ceiling is its count of distinct
+          # PUBLIC source addresses (k), not its process count. A routable v6
+          # /64 is the cheap way to raise k -- measure whether this vantage has
+          # one rather than assuming it in either direction. Against a relay
+          # carrying linux-amt 7ec53567 the address stops being the unit at all
+          # (see the k comment below), and v6 stops being the lever.
           # CAPABILITY ONLY: it does not raise k until a gateway actually binds
           # a distinct address, so it is recorded here and never read by the
           # verdict. `no` answers the question outright; `yes` makes relay v6
@@ -219,26 +222,47 @@ jobs:
           echo "tunnels_requested=$TUNNELS"
           echo "ulimit_n_soft=$(ulimit -Sn) ulimit_n_hard=$(ulimit -Hn)"
           echo "nproc=$(nproc)"
-          # BLO-26574 Amendment 12g, Finding 1. The relay keys tunnel state on
-          # the outer source ADDRESS only -- `amt_request_handler` compares
-          # `tunnel->addr.ip4 == iph->saddr` with no port term (amt.c:3692),
-          # `amt_update_handler` matches the same way (amt.c:3330), and on a
-          # match `send:` OVERWRITES tunnel->source_port and tunnel->nonce
-          # (amt.c:3759-3766). So a later Request from the same address steals
-          # the one tunnel, and the earlier gateway's Membership Updates are
-          # then dropped as `Invalid MAC` (amt.c:3333-3341). N processes in one
-          # `--network host` netns therefore produce ONE tunnel, not N.
-          # k is how many distinct source addresses this rig can present;
-          # N_established can never exceed it. Recorded so that a clean-looking
-          # receipt cannot be read as fan-out it never generated, and READ BY
-          # THE VERDICT below -- as telemetry alone it stopped nothing.
-          # Defaults to 1 because every container shares the runner netns via
-          # `--network host` and egresses through one NAT'd address, however
-          # many processes launch. Deliberately NOT a workflow input: a dispatch
-          # caller must not be able to declare a fan-out capability the rig does
-          # not have. A rig that really does present distinct source addresses
-          # (runner matrix, routable v6) sets it here, in the same commit that
-          # makes it true.
+          # BLO-26574 Amendment 12g, Finding 1. k is how many distinct tunnel
+          # ENDPOINTS this rig can present; N_established can never exceed it.
+          # Recorded so that a clean-looking receipt cannot be read as fan-out
+          # it never generated, and READ BY THE VERDICT below -- as telemetry
+          # alone it stopped nothing.
+          #
+          # What an endpoint is depends on the relay BUILD, so this default is
+          # version-scoped, not a timeless property of AMT. Verified from source
+          # 2026-09-18, not inferred:
+          #
+          #  - Relays built BEFORE linux-amt 7ec53567 key tunnel state on the
+          #    outer source ADDRESS alone. A later Request from the same address
+          #    steals the one tunnel (`send:` overwrites source_port and nonce)
+          #    and the earlier gateway's Membership Updates are then dropped as
+          #    `Invalid MAC`. N processes in one `--network host` netns produce
+          #    ONE tunnel, not N -- so k=1 and any tunnels>1 run is VOID.
+          #
+          #  - linux-amt 7ec53567 (2026-09-13, BLO-33636 / linux-amt#223) keys
+          #    on the (address, port) ENDPOINT per RFC 7450 s4.2.2 --
+          #    `amt_request_handler` amt.c:3736, `amt_update_handler` amt.c:3333.
+          #    Against such a relay one source address presents many endpoints
+          #    via source ports, so k is NOT 1 and fan-out from a single runner
+          #    becomes measurable.
+          #
+          # EVERY relay deployed today is still pre-fix -- prod .128
+          # `amtr:sha-f21f60e6` and staging .96 `amtr:sha-d20b2e04` are both
+          # ancestors of 7ec53567 (confirmed by `compare`, behind_by 24 and 14).
+          # So k=1 remains correct, and the VOID is the finding, not a defect:
+          # the unblock lever is a RELAY DEPLOY, not a runner topology change.
+          #
+          # ⚠ When that deploy lands, k is bounded by the relay, NOT by the rig:
+          # `AMT_MAX_TUNNELS_PER_SOURCE` defaults to 16 (amt.h:573; global
+          # `AMT_MAX_TUNNELS` 128), overridable via
+          # IFLA_AMT_MAX_TUNNELS_PER_SOURCE. A one-runner ramp that reads the
+          # 17th failure as the relay's fan-out knee would be measuring the
+          # per-source cap -- the same misattribution this VOID exists to
+          # prevent, with a different number. Set k to the deployed relay's
+          # actual per-source cap, in the same commit that deploys it.
+          #
+          # Deliberately NOT a workflow input: a dispatch caller must not be
+          # able to declare a fan-out capability the rig and relay do not have.
           K="${DISTINCT_SOURCE_IPS:-1}"
           echo "distinct_source_ips=$K"
           i=0; ok=0
@@ -358,7 +382,7 @@ jobs:
           # per-tunnel exits) stays valid as a HARNESS-ceiling reading, and
           # receipts still upload via `if: always()`.
           if [ "$TUNNELS" -gt "$K" ]; then
-            echo "::error::VOID as a relay result: rig presents k=$K distinct source address(es), $TUNNELS tunnels requested. The relay keys tunnel state on source address alone, so this run cannot establish fan-out. Harness-ceiling telemetry above is still valid."
+            echo "::error::VOID as a relay result: rig presents k=$K distinct tunnel endpoint(s), $TUNNELS tunnels requested. Relays built before linux-amt 7ec53567 key tunnel state on source address alone, so this run cannot establish fan-out; every relay deployed today is pre-fix. The lever is a relay deploy carrying 7ec53567, after which k is the deployed relay's AMT_MAX_TUNNELS_PER_SOURCE (default 16) -- not a runner topology change. Harness-ceiling telemetry above is still valid."
             exit 91
           fi
           # A probe that cannot fail is not a probe: surface the client's verdict
