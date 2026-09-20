@@ -76,6 +76,9 @@ run_case() {
   ( cd "$dir"
     export TUNNELS=$tunnels PC_LIST=$pcs EXIT_LIST=$exits DISTINCT_SOURCE_IPS=$k \
            RELAY=1.2.3.4 SOURCE=69.25.95.192 GROUP=232.1.1.60 TIMEOUT=5 PACKETS=3
+    # k=unset is the production shape: the variable is ABSENT and the `:-1`
+    # default in the workflow decides k.
+    [ "$k" = unset ] && unset DISTINCT_SOURCE_IPS
     bash "$WORK/probe.sh" ) >/dev/null 2>&1; got=$?
 
   # `want=nonzero` where the contract is only "must not pass": a corrupt receipt
@@ -108,6 +111,12 @@ run_case "N=1 unparseable receipt -> red"                1 "oops"    "1"   nonze
 # delivery. Both are now VOID (91), decided before packet_count is consulted.
 run_case "N=2 both receiving, k=1 -> void"               2 "500,500" "1,1" 91  1
 run_case "N=2 second zero-data, k=1 -> void not red"     2 "500,0"   "1,1" 91  1
+
+# Ally review of #25 (head 73c16a1), Important (1). Every case above exports
+# DISTINCT_SOURCE_IPS, so the `:-1` default -- the only value a real dispatch
+# ever uses, and the line the VOID gate hangs on -- was never exercised. Run
+# once with the variable absent; this case fails if that default drifts.
+run_case "N=2 second zero-data, k unset -> void (prod default)" 2 "500,0" "1,1" 91 unset
 
 # The aggregate verdict must still be correct for a rig that DOES present
 # distinct source addresses, or the k-gate above would silently retire the
