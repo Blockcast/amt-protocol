@@ -62,6 +62,21 @@ jobs:
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets ${{ matrix.flags }} --locked -- -D warnings
 
+  # The vantage probe's verdict is shell inside a workflow, so no cargo target
+  # covers it -- and it has already shipped two verdict bugs (exiting with
+  # tunnel 1's status; renaming the TUNNELS=1 artifacts). New job rather than a
+  # step on `lint`, whose matrix would run it three times for one answer.
+  probe-verdict:
+    name: probe verdict logic
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: tests/probe_verdict_test.sh
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+          bash tests/probe_verdict_test.sh
+
   test:
     # Keep these job names stable — they are the required-check names in branch
     # protection, and renaming a leg silently drops its gate.
