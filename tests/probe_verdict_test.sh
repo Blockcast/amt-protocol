@@ -50,13 +50,19 @@ PY
 # nothing to do with the verdict logic -- absent pyyaml, a renamed job, a step
 # that no longer carries `docker pull` -- and without `set -e` the suite then
 # runs every case against a missing probe.sh, scoring `bash: no such file`
-# (127) as the result. 17 of 18 cases go red with a want/got line that reads
-# like a verdict-logic regression, and the one `want=nonzero` case at :104
-# goes GREEN, because 127 is nonzero: that case cannot tell "probe.sh rejected
-# a corrupt receipt" from "probe.sh never ran". Abort instead of diagnosing it
-# eighteen times. (Ally review of #25, head 1e849975, Suggestion 4 -- whose
-# stated failure mode, a silent vacuous pass of the whole suite, does not
-# reproduce: measured 17 FAIL / 1 PASS. The single vacuous pass is real.)
+# (127) as the result. 16 of 17 assertions (13 cases) go red with a want/got
+# line that reads like a verdict-logic regression, and the sole `want=nonzero`
+# case, "N=1 unparseable receipt -> red", goes GREEN because 127 is nonzero:
+# that case cannot tell "probe.sh rejected a corrupt receipt" from "probe.sh
+# never ran". Abort instead of diagnosing it thirteen times. (Ally review of
+# #25, head 1e849975, Suggestion 4 -- whose stated failure mode, a silent
+# vacuous pass of the whole suite, does not reproduce: measured 16 FAIL /
+# 1 PASS, exit 1. The single vacuous pass is real.)
+#
+# Counts are assertions, not cases: 13 `run_case` calls, but the two N=1 cases
+# that pass `pcs != oops` each add two legacy-artifact assertions that emit
+# only on failure -- hence 13 healthy, 17 broken. `grep -c FAIL` returns 17
+# because it also matches the `FAILURES` summary line; the honest figure is 16.
 [ -s "$WORK/probe.sh" ] || { echo "ABORT: could not extract probe.sh from $WORKFLOW (pyyaml missing, or the 'docker pull' step moved)" >&2; exit 2; }
 
 mkdir -p "$WORK/bin"
@@ -96,8 +102,13 @@ run_case() {
 
   # `want=nonzero` where the contract is only "must not pass": a corrupt receipt
   # dies at the (S,G) guard carrying jq's own exit code, and pinning that number
-  # would freeze an implementation detail rather than the behaviour.
-  if { [ "$want" = nonzero ] && [ "$got" != 0 ]; } || [ "$got" = "$want" ]; then
+  # would freeze an implementation detail rather than the behaviour. 127 is
+  # excluded because it is the one nonzero code that means the subject never
+  # ran at all -- a "must not pass" assertion is otherwise satisfied by the
+  # harness failing to invoke probe.sh, which is the opposite of a positive
+  # control. Belt-and-braces with the extraction guard above: that one catches
+  # the known cause, this one catches any cause.
+  if { [ "$want" = nonzero ] && [ "$got" != 0 ] && [ "$got" != 127 ]; } || [ "$got" = "$want" ]; then
     echo "PASS  $name (exit $got)"
   else
     echo "FAIL  $name: want exit $want, got $got"; FAILED=1
