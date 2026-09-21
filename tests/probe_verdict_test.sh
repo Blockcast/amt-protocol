@@ -47,7 +47,10 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
 for value in 0 42 1048576; do
   is_uint "$value" || { echo "FAIL: expected unsigned integer: $value"; exit 1; }
 done
-for value in '' unavailable '42\nnope' '1x' '-1'; do
+# $'...' so the newline is real: a single-quoted '42\nnope' is the literal
+# 8-char string backslash-n and never reached the multi-line case. $'42\n42'
+# (every line numeric) is the input the old any-match grep was surest about.
+for value in '' unavailable $'42\nnope' $'42\n42' '1x' '-1'; do
   if is_uint "$value"; then
     echo "FAIL: malformed host-capacity value accepted: $value"
     exit 1
