@@ -38,6 +38,28 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WORKFLOW="$REPO_ROOT/.github/workflows/amt-public-vantage-probe.yml"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 
+# The ramp's host-capacity guard must validate every scalar before arithmetic.
+# A single numeric-looking line is not enough: the old `printf ... | grep`
+# check accepted a malformed sibling line because grep searched for *any* match.
+# Keep this small contract test next to the workflow test so that a future edit
+# cannot silently reintroduce arithmetic on `unavailable`/partial receipts.
+is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+for value in 0 42 1048576; do
+  is_uint "$value" || { echo "FAIL: expected unsigned integer: $value"; exit 1; }
+done
+for value in '' unavailable '42\nnope' '1x' '-1'; do
+  if is_uint "$value"; then
+    echo "FAIL: malformed host-capacity value accepted: $value"
+    exit 1
+  fi
+done
+grep -q 'is_uint()' "$WORKFLOW" || {
+  echo "FAIL: workflow has no fail-closed scalar validator"; exit 1;
+}
+if grep -q "printf '%s\\\\n'.*grep -Eq '^[0-9]" "$WORKFLOW"; then
+  echo "FAIL: workflow still validates a list with any-match grep"; exit 1
+fi
+
 python3 - "$WORKFLOW" "$WORK/probe.sh" <<'PY'
 import sys, yaml
 wf, out = sys.argv[1], sys.argv[2]
