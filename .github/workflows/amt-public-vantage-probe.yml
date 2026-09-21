@@ -568,16 +568,18 @@ jobs:
       #
       #   ENFORCED
       #     port range  -- the relay keys tunnels by source (IP, port), so N
-      #                    tunnels need N distinct source ports. Hard ceiling on
-      #                    N from a single vantage; exhaustion is silent.
+      #                    tunnels need N distinct source ports. We subtract
+      #                    ports already held by UDP sockets immediately before
+      #                    the ramp; the total range is not usable capacity.
       #     nofile      -- one socket per tunnel. The RUNNER's soft default is
       #                    1024, but the client runs in a container with
       #                    --ulimit nofile=$CONTAINER_NOFILE, so the container
       #                    value is the binder and is what gets compared. The
       #                    runner's own limit is recorded as context only.
-      #     conntrack   -- NAT state table; N flows need N entries. Enforced
-      #                    when readable; when not, downgraded to an observation
-      #                    rather than silently skipped.
+      #     conntrack   -- NAT state table; N flows need N entries. We subtract
+      #                    current occupancy from the table maximum. If either
+      #                    value is unreadable, the ramp fails closed instead of
+      #                    producing a non-attributable ceiling.
       #
       #   OBSERVATIONS (recorded, NOT enforced -- no defensible per-tunnel
       #   constant to compare against, so a threshold here would be invented)
@@ -600,11 +602,49 @@ jobs:
             echo "ip_local_port_range=$(cat /proc/sys/net/ipv4/ip_local_port_range)"
             lo=$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range)
             hi=$(awk '{print $2}' /proc/sys/net/ipv4/ip_local_port_range)
-            echo "source_ports_available=$((hi-lo+1))"
+            echo "source_ports_total=$((hi-lo+1))"
+            if command -v ss >/dev/null 2>&1 && ss -H -u -a -n >udp-sockets.txt 2>/dev/null; then
+              awk -v lo="$lo" -v hi="$hi" '
+                {
+                  if (NF < 4) { bad++; next }
+                  raw = $4
+                  sub(/^.*:/, "", raw)
+                  if (raw !~ /^[0-9]+$/) { bad++; next }
+                  port = raw + 0
+                  if (port >= lo && port <= hi && !seen[port]++) used++
+                }
+                END { printf "source_ports_used=%d\nsource_ports_parse_errors=%d\n", used + 0, bad + 0 }
+              ' udp-sockets.txt
+            else
+              echo "source_ports_used=unavailable"
+              echo "source_ports_parse_errors=unavailable"
+            fi
             echo "nf_conntrack_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo unavailable)"
+            echo "nf_conntrack_used=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo unavailable)"
             echo "nproc=$(nproc)                # OBSERVATION"
             echo "mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)   # OBSERVATION"
           } | tee host-ceilings.txt
+
+          ports_total=$(sed -n 's/^source_ports_total=//p' host-ceilings.txt)
+          ports_used=$(sed -n 's/^source_ports_used=//p' host-ceilings.txt)
+          ports_bad=$(sed -n 's/^source_ports_parse_errors=//p' host-ceilings.txt)
+          if ! printf '%s\n' "$ports_total" "$ports_used" "$ports_bad" | grep -Eq '^[0-9]+$' || [ "$ports_bad" -ne 0 ]; then
+            echo "::error::could not establish current UDP source-port occupancy; the ramp is non-attributable"
+            exit 1
+          fi
+          ports_available=$((ports_total - ports_used))
+          [ "$ports_available" -ge 0 ] || { echo "::error::UDP source-port occupancy exceeds the configured range"; exit 1; }
+          echo "source_ports_available=$ports_available" | tee -a host-ceilings.txt
+
+          ct=$(sed -n 's/^nf_conntrack_max=//p' host-ceilings.txt)
+          ct_used=$(sed -n 's/^nf_conntrack_used=//p' host-ceilings.txt)
+          if ! printf '%s\n' "$ct" "$ct_used" | grep -Eq '^[0-9]+$'; then
+            echo "::error::could not establish current conntrack occupancy; the ramp is non-attributable"
+            exit 1
+          fi
+          ct_available=$((ct - ct_used))
+          [ "$ct_available" -ge 0 ] || { echo "::error::conntrack occupancy exceeds nf_conntrack_max"; exit 1; }
+          echo "nf_conntrack_available=$ct_available" | tee -a host-ceilings.txt
 
           # The largest requested N must fit under every ENFORCED ceiling, or
           # the ramp is measuring this runner. Fail LOUDLY rather than produce
@@ -614,8 +654,8 @@ jobs:
           fail=0
 
           ports=$(sed -n 's/^source_ports_available=//p' host-ceilings.txt)
-          if [ "$max_n" -gt "$ports" ]; then
-            echo "::error::max N ($max_n) exceeds available source ports ($ports) -- the ramp would measure SNAT exhaustion, not relay state"
+          if [ "$max_n" -ge "$ports" ]; then
+            echo "::error::max N ($max_n) leaves no source-port headroom (only $ports currently free) -- the ramp would measure SNAT exhaustion, not relay state"
             fail=1
           fi
 
@@ -627,11 +667,9 @@ jobs:
             fail=1
           fi
 
-          ct=$(sed -n 's/^nf_conntrack_max=//p' host-ceilings.txt)
-          if [ "$ct" = "unavailable" ]; then
-            echo "::warning::nf_conntrack_max unreadable -- DOWNGRADED to an observation. If a step degrades near a round number, suspect NAT state before the relay."
-          elif [ "$max_n" -gt "$ct" ]; then
-            echo "::error::max N ($max_n) exceeds nf_conntrack_max ($ct) -- NAT state exhaustion would be recorded as a relay knee"
+          ct=$(sed -n 's/^nf_conntrack_available=//p' host-ceilings.txt)
+          if [ "$max_n" -ge "$ct" ]; then
+            echo "::error::max N ($max_n) leaves no conntrack headroom (only $ct currently free) -- NAT state exhaustion would be recorded as a relay knee"
             fail=1
           fi
 
