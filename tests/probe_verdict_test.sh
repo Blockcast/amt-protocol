@@ -46,6 +46,19 @@ block = next(s['run'] for s in steps if 'run' in s and 'docker pull' in s['run']
 open(out, 'w').write(block)
 PY
 
+# Extraction is a PRECONDITION, not a case. It fails for reasons that have
+# nothing to do with the verdict logic -- absent pyyaml, a renamed job, a step
+# that no longer carries `docker pull` -- and without `set -e` the suite then
+# runs every case against a missing probe.sh, scoring `bash: no such file`
+# (127) as the result. 17 of 18 cases go red with a want/got line that reads
+# like a verdict-logic regression, and the one `want=nonzero` case at :104
+# goes GREEN, because 127 is nonzero: that case cannot tell "probe.sh rejected
+# a corrupt receipt" from "probe.sh never ran". Abort instead of diagnosing it
+# eighteen times. (Ally review of #25, head 1e849975, Suggestion 4 -- whose
+# stated failure mode, a silent vacuous pass of the whole suite, does not
+# reproduce: measured 17 FAIL / 1 PASS. The single vacuous pass is real.)
+[ -s "$WORK/probe.sh" ] || { echo "ABORT: could not extract probe.sh from $WORKFLOW (pyyaml missing, or the 'docker pull' step moved)" >&2; exit 2; }
+
 mkdir -p "$WORK/bin"
 cat >"$WORK/bin/docker" <<'EOF'
 #!/usr/bin/env bash
