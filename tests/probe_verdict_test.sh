@@ -47,23 +47,27 @@ open(out, 'w').write(block)
 PY
 
 # Extraction is a PRECONDITION, not a case. It fails for reasons that have
-# nothing to do with the verdict logic -- absent pyyaml, a renamed job, a step
-# that no longer carries `docker pull` -- and without `set -e` the suite then
-# runs every case against a missing probe.sh, scoring `bash: no such file`
-# (127) as the result. 16 of 17 assertions (13 cases) go red with a want/got
-# line that reads like a verdict-logic regression, and the sole `want=nonzero`
-# case, "N=1 unparseable receipt -> red", goes GREEN because 127 is nonzero:
-# that case cannot tell "probe.sh rejected a corrupt receipt" from "probe.sh
-# never ran". Abort instead of diagnosing it thirteen times. (Ally review of
-# #25, head 1e849975, Suggestion 4 -- whose stated failure mode, a silent
-# vacuous pass of the whole suite, does not reproduce: measured 16 FAIL /
-# 1 PASS, exit 1. The single vacuous pass is real.)
+# nothing to do with the verdict logic -- a missing or moved workflow file, a
+# renamed `probe` job, a step that no longer carries `docker pull`, absent
+# pyyaml -- and without `set -e` the suite then runs every case against a
+# missing probe.sh, scoring `bash: no such file` (127) as the result: 17
+# assertions (13 cases) go red with a want/got line that reads like a
+# verdict-logic regression. Abort instead of diagnosing it thirteen times.
+#
+# Delete THIS guard alone and the result is 17 FAIL / 0 PASS -- the sole
+# `want=nonzero` case, "N=1 unparseable receipt -> red", is held red by the
+# `!= 127` clause below. Delete BOTH and it is 16 FAIL / 1 PASS: that case
+# goes GREEN because 127 is nonzero, and it cannot tell "probe.sh rejected a
+# corrupt receipt" from "probe.sh never ran". That vacuous pass is the real
+# defect -- Ally's review of #25 (head 1e849975, Suggestion 4) stated it as a
+# silent vacuous pass of the WHOLE suite, which does not reproduce.
 #
 # Counts are assertions, not cases: 13 `run_case` calls, but the two N=1 cases
 # that pass `pcs != oops` each add two legacy-artifact assertions that emit
-# only on failure -- hence 13 healthy, 17 broken. `grep -c FAIL` returns 17
-# because it also matches the `FAILURES` summary line; the honest figure is 16.
-[ -s "$WORK/probe.sh" ] || { echo "ABORT: could not extract probe.sh from $WORKFLOW (pyyaml missing, or the 'docker pull' step moved)" >&2; exit 2; }
+# only on failure -- hence 13 healthy, 17 broken. `grep -c FAIL` overcounts by
+# one, matching the `FAILURES` summary line too: 18 with this guard alone
+# removed, 17 with both removed.
+[ -s "$WORK/probe.sh" ] || { echo "ABORT: could not extract probe.sh from $WORKFLOW (workflow file missing, the 'probe' job renamed, the 'docker pull' step moved, or pyyaml absent)" >&2; exit 2; }
 
 mkdir -p "$WORK/bin"
 cat >"$WORK/bin/docker" <<'EOF'
@@ -104,10 +108,12 @@ run_case() {
   # dies at the (S,G) guard carrying jq's own exit code, and pinning that number
   # would freeze an implementation detail rather than the behaviour. 127 is
   # excluded because it is the one nonzero code that means the subject never
-  # ran at all -- a "must not pass" assertion is otherwise satisfied by the
-  # harness failing to invoke probe.sh, which is the opposite of a positive
-  # control. Belt-and-braces with the extraction guard above: that one catches
-  # the known cause, this one catches any cause.
+  # produced a verdict of its own -- bash returns it both when probe.sh is
+  # absent and when probe.sh runs but calls a missing binary (jq gone from the
+  # image). A "must not pass" assertion is otherwise satisfied by a broken test
+  # environment, which is the opposite of a positive control. Belt-and-braces
+  # with the extraction guard above: that one catches the known cause, this one
+  # catches any cause.
   if { [ "$want" = nonzero ] && [ "$got" != 0 ] && [ "$got" != 127 ]; } || [ "$got" = "$want" ]; then
     echo "PASS  $name (exit $got)"
   else
