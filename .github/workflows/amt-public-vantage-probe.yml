@@ -946,8 +946,11 @@ jobs:
           # single source address is the WORST case, not the best: it reports a
           # ceiling having established one tunnel. `alive` is a send-side
           # self-report, so nothing downstream of it can notice.
-          # `// .requested` defaults a report predating the field to "shared",
-          # i.e. an unknown fails to the safe side rather than passing the gate.
+          # `// 1` defaults a report predating the field to ONE distinct
+          # source, so an unknown fires this gate rather than passing it:
+          # 1 < requested holds for every N > 1. (`// .requested` would read
+          # N < N, false, and skip the gate for exactly the legacy reports it
+          # exists to catch.)
           aliased=$(jq -r '[.[]|select(((.report.distinct_outer_sources // 1)) < .requested)]|length' ramp-index.json)
           if [ "$aliased" -gt 0 ]; then
             echo "verdict=WITNESS NOT ESTABLISHED ($aliased/$ran steps ran all gateways from ONE outer source address). NOT a ceiling, NOT a knee, and NOT 'no knee': linux-amt as deployed keys tunnel state on the outer ADDRESS alone, so N gateways from one address occupy ONE relay tunnel entry while every one still reads Active and sends keep-alives. An alive of N here is indistinguishable from one tunnel aliased N ways, so this run says nothing about the relay's tunnel table at any N. Do NOT size against this number. Needs distinct source addresses (linux-amt kernel/selftests/amt_capacity.sh) and/or the BLO-33636 keying fix." | tee verdict.txt
