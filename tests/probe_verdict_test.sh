@@ -157,4 +157,53 @@ run_case "tunnels=abc rejected"                          abc   "0" "1" 92
 run_case "tunnels=257 over documented cap rejected"      257   "0" "1" 92
 run_case "tunnels='' rejected"                           ""    "0" "1" 92
 
+
+# Ally review of #22 (head d3896d3), Important (1). The tunnels-ramp Verdict
+# step derived `cap` from the raw STEPS text while `top` came from `jq -r`, and
+# compared them as strings: `1, 8, 1024` (accepted by `Validate ramp steps`,
+# which word-splits) left a leading blank in `cap`, so a fully clean ramp fell
+# through to "degraded ... BINDER NOT ESTABLISHED (0 cause(s))". Drive the real
+# Verdict run-block against synthetic ramp-index.json fixtures. It needs only
+# `jq` and `tee`, so no docker stub.
+python3 - "$WORKFLOW" "$WORK/verdict.sh" <<'PY'
+import sys, yaml
+wf, out = sys.argv[1], sys.argv[2]
+steps = yaml.safe_load(open(wf))['jobs']['tunnels-ramp']['steps']
+open(out, 'w').write(next(s['run'] for s in steps if s.get('name') == 'Verdict'))
+PY
+bash -n "$WORK/verdict.sh" || { echo "FAIL  tunnels-ramp Verdict step does not parse"; FAILED=1; }
+
+run_ramp_case() {
+  local name=$1 steps=$2 index=$3 want=$4
+  local dir; dir=$(mktemp -d -p "$WORK")
+  printf '%s' "$index" >"$dir/ramp-index.json"
+  ( cd "$dir" && STEPS=$steps bash "$WORK/verdict.sh" ) >/dev/null 2>&1
+  if grep -qF "$want" "$dir/verdict.txt" 2>/dev/null; then
+    echo "PASS  $name"
+  else
+    echo "FAIL  $name: want '$want', got: $(head -c 200 "$dir/verdict.txt" 2>/dev/null)"; FAILED=1
+  fi
+  rm -rf "$dir"
+}
+
+CLEAN='[{"requested":1,"report":{"alive":1,"distinct_outer_sources":1}},{"requested":8,"report":{"alive":8,"distinct_outer_sources":8}},{"requested":1024,"report":{"alive":1024,"distinct_outer_sources":1024}}]'
+run_ramp_case "clean ramp, bare steps -> config-bound" "1,8,1024" "$CLEAN" \
+  "verdict=ceiling >= 1024, config-bound"
+# Negative control for the string-compare regression: the validator accepts
+# this spelling, so the verdict must read it identically.
+run_ramp_case "clean ramp, comma-space steps -> config-bound (regression: cap kept leading blank)" "1, 8, 1024" "$CLEAN" \
+  "verdict=ceiling >= 1024, config-bound"
+run_ramp_case "aliased step supersedes clean cap" "1,8,1024" \
+  '[{"requested":1,"report":{"alive":1,"distinct_outer_sources":1}},{"requested":8,"report":{"alive":8,"distinct_outer_sources":8}},{"requested":1024,"report":{"alive":1024,"distinct_outer_sources":1}}]' \
+  "verdict=WITNESS NOT ESTABLISHED"
+run_ramp_case "legacy report without distinct_outer_sources -> aliased" "1,8,1024" \
+  '[{"requested":1,"report":{"alive":1,"distinct_outer_sources":1}},{"requested":8,"report":{"alive":8}},{"requested":1024,"report":{"alive":1024,"distinct_outer_sources":1024}}]' \
+  "verdict=WITNESS NOT ESTABLISHED (1/3"
+run_ramp_case "degraded relay-attributed -> knee" "1,8,1024" \
+  '[{"requested":1,"report":{"alive":1,"distinct_outer_sources":1}},{"requested":8,"report":{"alive":8,"distinct_outer_sources":8}},{"requested":1024,"report":{"alive":900,"distinct_outer_sources":1024,"establish_errors":{"relay refused: tunnel table full":124}}}]' \
+  "verdict=knee at N>8"
+run_ramp_case "degraded unknown cause -> binder not established" "1,8,1024" \
+  '[{"requested":1,"report":{"alive":1,"distinct_outer_sources":1}},{"requested":8,"report":{"alive":8,"distinct_outer_sources":8}},{"requested":1024,"report":{"alive":900,"distinct_outer_sources":1024,"establish_errors":{"connection reset":124}}}]' \
+  "verdict=degraded above N=8, BINDER NOT ESTABLISHED (1 cause(s)"
+
 [ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }
