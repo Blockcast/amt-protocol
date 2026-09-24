@@ -90,11 +90,13 @@ PY
 # Counts are assertions, not cases: 13 `run_case` calls, but the two N=1 cases
 # that pass `pcs != oops` each add two legacy-artifact assertions that emit
 # only on failure -- hence 17 broken from 13 cases. Figures above are the
-# probe cases only. Whole-suite totals also carry the 6 `run_ramp_case` calls
-# #22 added, which never read probe.sh and pass either way: healthy is 19
-# PASS / 0 FAIL, and the two broken rows are 6 PASS / 17 FAIL and 7 PASS /
-# 16 FAIL. `grep -c FAIL` overcounts by one, matching the `FAILURES` summary
-# line too: 18 with this guard alone removed, 17 with both removed.
+# probe cases only. Healthy whole-suite is 19 PASS / 0 FAIL. The 6
+# `run_ramp_case` calls #22 added never read probe.sh, but they do read
+# verdict.sh, extracted the same way, so a broken precondition fails them too.
+# With the verdict.sh guard below present the suite aborts before them: the
+# whole-suite broken rows are the probe figures above (0 PASS / 17 FAIL and
+# 1 PASS / 16 FAIL), exit 2, and `grep -c FAIL` returns 17 and 16 (the
+# `FAILURES` summary line is never reached).
 [ -s "$WORK/probe.sh" ] || { echo "ABORT: could not extract probe.sh from $WORKFLOW (workflow file missing, the 'probe' job renamed, the 'docker pull' step moved, or pyyaml absent)" >&2; exit 2; }
 
 mkdir -p "$WORK/bin"
@@ -205,8 +207,11 @@ steps = yaml.safe_load(open(wf))['jobs']['tunnels-ramp']['steps']
 open(out, 'w').write(next(s['run'] for s in steps if s.get('name') == 'Verdict'))
 PY
 # Same precondition contract as the probe.sh guard above, and `bash -n` is NOT
-# it: `open(out,'w')` runs before `next()` raises, so a renamed job or step
+# it: `open(out,'w')` runs before `next()` raises, so a renamed `Verdict` step
 # leaves an EMPTY verdict.sh, which parses cleanly and takes that check GREEN.
+# (A renamed job raises KeyError on the lookup line before `open()` and leaves
+# no file; `-s` catches both. The probe block cannot leave an empty file: its
+# `next()` runs on its own line, before `open()`.)
 # The 6 ramp cases below then go red with `want '...', got:` lines that read
 # like a verdict-logic regression. Measured on the merged head: rename the
 # `Verdict` step and the suite reports 13 PASS / 6 FAIL with zero "does not
