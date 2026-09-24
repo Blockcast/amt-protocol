@@ -75,8 +75,46 @@ on:
           gateways to measure control-plane tunnel-table occupancy and is
           documented as NOT receiving data. That arm is BLO-33457.
         default: "1"
+      route_failure:
+        description: >-
+          BLO-33585. Normally OFF for dispatch. The scheduled detector files a
+          GitHub issue when a probe receives zero data; a DISPATCHED probe must
+          not, because dispatch is how measurements are taken and several of
+          them fail by design (exit 91 VOID, deliberate zero-forwarding
+          controls). Set true only to exercise the routing path itself -- which
+          is what the AC's "positive control showing it firing" requires, and
+          the reason this is an input rather than a bare
+          `github.event_name == 'schedule'` test that can never be run on
+          demand.
+        type: boolean
+        default: false
   push:
     branches: [blo-21823-public-amt-probe]
+  # BLO-33585. The relay stopped forwarding for >=51 min on 2026-09-12 and NOT
+  # ONE relay-side instrument witnessed it: nine series were checked and all
+  # nine are dead for this purpose (amt_relay_drops_total, _gateway_overflow_total,
+  # _active_tunnels, container_cpu_*, container_network_transmit_* (absent),
+  # node_network_receive_*/transmit_* (relay's ~11 Mbps inside a +-80 Mbps
+  # node-shared noise band, S/N ~0.27), node_network_receive_multicast_total,
+  # and the relay log's `Kernel mode - Stats: RX` (control traffic, ~44 B/pkt --
+  # it sat frozen while 340,953 packets were delivered). The ONLY thing that
+  # saw the outage was receiver-side data receipt from this very workflow --
+  # run by hand. So the missing half of the detector was never the instrument.
+  # It was the cron.
+  #
+  # Off-the-hour on purpose: GitHub documents that scheduled workflows on the
+  # hour are the most contended slots and are delayed or dropped under load,
+  # which on a detector reads as "no failure" -- the one failure direction that
+  # must never be silent.
+  #
+  # Deliberately runs with the DISPATCH DEFAULTS (timeout=30, packet_count=3,
+  # tunnels=1) rather than the heavy AC2 verification parameters
+  # (timeout=90, packet_count=99999999). Detection asks "is this relay
+  # forwarding to a public gateway AT ALL", which 3 packets answer in about a
+  # second; the 90s full-rate sample is a MEASUREMENT and belongs on dispatch.
+  # Keeps a 15-minute cadence affordable in runner minutes.
+  schedule:
+    - cron: "7,22,37,52 * * * *"
 
 permissions:
   contents: read
@@ -111,6 +149,14 @@ jobs:
   probe:
     if: ${{ (inputs.mode || 'oneshot') == 'oneshot' }}
     runs-on: ubuntu-latest
+    # Job-scoped so `issues: write` reaches only this job and not tunnels-ramp.
+    # Job-level permissions REPLACE the workflow block rather than merging, so
+    # contents/packages are restated here -- dropping either breaks checkout or
+    # the ghcr pull.
+    permissions:
+      contents: read
+      packages: read
+      issues: write
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
       SOURCE: ${{ inputs.source || '69.25.95.192' }}
@@ -473,6 +519,61 @@ jobs:
           path: |
             report*.json
             verbose*.log
+      # BLO-33585. A red run in a list nobody reads is not a detection path.
+      # Scheduled-workflow failures email only the account that last touched the
+      # cron -- here a bot -- so without this step the detector is silent by
+      # construction, which is the exact failure this issue is about.
+      #
+      # DEDUPED, and that is not tidiness. A forwarding stop lasts tens of
+      # minutes and this cron fires every 15, so the naive version files N
+      # issues for ONE fault -- the cardinality mistake that turned 343 alert
+      # rows into 334 distinct pods on BLO-28616. One open issue per fault,
+      # comments thereafter, so the row count tracks FAULTS and not minutes.
+      #
+      # Matched on a title prefix rather than a label: a label that does not
+      # exist makes `gh issue create --label` fail, and a detector whose
+      # notification step errors is worse than one that never fires, because the
+      # run is already red and the second failure is invisible underneath it.
+      #
+      # ⚠ `inputs.route_failure`, NEVER `github.event.inputs.route_failure`.
+      # The latter is always a STRING, so the literal "false" is truthy and
+      # every dispatched measurement failure would file an issue -- the spam
+      # this input exists to prevent, reintroduced by a one-word edit. Only the
+      # `inputs` context honours `type: boolean`.
+      - name: Route zero-data failure
+        if: ${{ failure() && (github.event_name == 'schedule' || inputs.route_failure) }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE: ${{ inputs.source || '69.25.95.192' }}
+          GROUP: ${{ inputs.group || '232.1.1.60' }}
+          RELAY: ${{ inputs.relay || '69.25.95.128' }}
+        run: |
+          set -euo pipefail
+          body="Scheduled public-vantage probe received **zero data** from \`$RELAY:2268\` for (\`$SOURCE\`, \`$GROUP\`).
+
+          - Run: $RUN_URL
+          - Detected at: $(date -u +%FT%TZ)
+
+          The verdict is \`packet_count == 0\` on the receipt, **not** the run
+          conclusion -- \`outcome: timeout\` is the normal end of a bounded
+          sample, so conclusion alone cannot separate a healthy probe from a
+          dead one (BLO-33585).
+
+          Runbook: BLO-33585 findings. Nine relay-side series are dead for this
+          purpose; do not re-key this detector to any of them."
+          n=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+                --json number,title \
+                --jq '[.[]|select(.title|startswith("[amt-probe]"))]|.[0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
+            echo "routed=comment issue=$n"
+          else
+            url=$(gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "[amt-probe] relay not forwarding to public gateways ($SOURCE,$GROUP)" \
+              --body "$body")
+            echo "routed=created issue=$url"
+          fi
 
   # BLO-33457. Tunnel-STATE occupancy ramp: how many concurrent AMT tunnels can
   # the linux relay hold in its tunnel table? This is the MX301-M leg of
