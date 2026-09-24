@@ -113,6 +113,29 @@ on:
   # forwarding to a public gateway AT ALL", which 3 packets answer in about a
   # second; the 90s full-rate sample is a MEASUREMENT and belongs on dispatch.
   # Keeps a 15-minute cadence affordable in runner minutes.
+  #
+  # HOW TO RE-VERIFY THIS DETECTOR (all three run against production .128):
+  #
+  #   negative (must exit 0, detector silent when healthy):
+  #     -f source=69.25.95.192 -f group=232.1.1.60 -f timeout=90 \
+  #     -f packet_count=99999999
+  #   positive (must exit 1 on the VERDICT, not an earlier guard):
+  #     -f source=69.25.95.192 -f group=232.1.1.99 -f timeout=60 -f packet_count=3
+  #   positive, full chain (must also print `routed=created`):
+  #     ...as above, plus -f route_failure=true
+  #
+  # 232.1.1.99 carries no source traffic, so it replays the BLO-33585 shape:
+  # tunnel established, membership accepted, zero data. CHECK `sg_guard=ok` IS
+  # PRESENT in the positive receipt -- without it the run may have died on the
+  # (S,G) guard (exit 90) or the fan-out VOID (exit 91), which look like a
+  # working detector and prove nothing.
+  #
+  # ⚠ DISPATCH THE CONTROLS FROM `main`, NOT FROM A PR BRANCH. A dispatched run
+  # attaches a check-run to whatever SHA it ran against, so a deliberate red
+  # control fired from a PR branch lands a permanent `probe: failure` row on
+  # that PR's head -- and the merge-gate reader keys on (name, run id), so a
+  # later green probe does NOT supersede it. That head can then never satisfy
+  # "every check-run at head is success". Measured on this PR at 88739bb.
   schedule:
     - cron: "7,22,37,52 * * * *"
 
