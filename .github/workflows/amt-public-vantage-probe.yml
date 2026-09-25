@@ -532,6 +532,12 @@ jobs:
           # rather than the run conclusion.
           if [ "$ok" -ne "$TUNNELS" ]; then
             echo "::error::$((TUNNELS - ok)) of $TUNNELS tunnel(s) received no data (packet_count=0)"
+            # The routing step keys on THIS verdict, not on failure(): exits
+            # 90/91/92, an ipify blip or a login error also fail the job, and
+            # filing those as "relay not forwarding" would open a false
+            # [amt-probe] issue that swallows the next real alert as a comment.
+            # $GITHUB_ENV is processed after the step whatever its exit code.
+            echo "ZERO_DATA=1" >> "$GITHUB_ENV"
             exit 1
           fi
           exit 0
@@ -564,7 +570,7 @@ jobs:
       # this input exists to prevent, reintroduced by a one-word edit. Only the
       # `inputs` context honours `type: boolean`.
       - name: Route zero-data failure
-        if: ${{ failure() && (github.event_name == 'schedule' || inputs.route_failure) }}
+        if: ${{ !cancelled() && env.ZERO_DATA == '1' && (github.event_name == 'schedule' || inputs.route_failure) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -585,17 +591,27 @@ jobs:
 
           Runbook: BLO-33585 findings. Nine relay-side series are dead for this
           purpose; do not re-key this detector to any of them."
+          # A failed lookup falls through to create: a duplicate issue is a far
+          # better failure than silence for a detector. Under `set -e` a bare
+          # gh failure here would abort before either branch, which is the
+          # invisible-notification mode the no-`--label` choice above avoids.
           n=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
                 --json number,title \
-                --jq '[.[]|select(.title|startswith("[amt-probe]"))]|.[0].number // empty')
+                --jq '[.[]|select(.title|startswith("[amt-probe]"))]|.[0].number // empty' || true)
           if [ -n "$n" ]; then
-            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
-            echo "routed=comment issue=$n"
+            if gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"; then
+              echo "routed=comment issue=$n"
+            else
+              echo "::error::routing failed: could not comment on [amt-probe] issue #$n"
+            fi
           else
-            url=$(gh issue create --repo "$GITHUB_REPOSITORY" \
+            if url=$(gh issue create --repo "$GITHUB_REPOSITORY" \
               --title "[amt-probe] relay not forwarding to public gateways ($SOURCE,$GROUP)" \
-              --body "$body")
-            echo "routed=created issue=$url"
+              --body "$body"); then
+              echo "routed=created issue=$url"
+            else
+              echo "::error::routing failed: could not create the [amt-probe] issue"
+            fi
           fi
 
   # BLO-33457. Tunnel-STATE occupancy ramp: how many concurrent AMT tunnels can
