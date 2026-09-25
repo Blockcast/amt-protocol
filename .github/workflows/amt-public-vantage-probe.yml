@@ -123,6 +123,9 @@ on:
   #     -f source=69.25.95.192 -f group=232.1.1.99 -f timeout=60 -f packet_count=3
   #   positive, full chain (must also print `routed=created`):
   #     ...as above, plus -f route_failure=true
+  #   The row it files is titled with (source,group), and routing dedups on
+  #   the exact title, so an open .99 control row cannot absorb .60 alerts.
+  #   Close it afterwards anyway.
   #
   # 232.1.1.99 carries no source traffic, so it replays the BLO-33585 shape:
   # tunnel established, membership accepted, zero data. CHECK `sg_guard=ok` IS
@@ -559,18 +562,27 @@ jobs:
       # rows into 334 distinct pods on BLO-28616. One open issue per fault,
       # comments thereafter, so the row count tracks FAULTS and not minutes.
       #
-      # Matched on a title prefix rather than a label: a label that does not
+      # Matched on the exact title rather than a label: a label that does not
       # exist makes `gh issue create --label` fail, and a detector whose
       # notification step errors is worse than one that never fires, because the
       # run is already red and the second failure is invisible underneath it.
+      # Exact, not a prefix: the title carries (source,group), and a prefix match
+      # let the positive control's open .99 row swallow every production alert.
+      #
+      # TWO causes, two rows. ZERO_DATA is the relay verdict. Any other failure
+      # on a scheduled run (checkout, registry login, the vantage receipt,
+      # amt-verify's guard exits 90/91/92) means the DETECTOR stopped, which is
+      # indistinguishable from a healthy relay unless it is filed too. It gets
+      # its own `[amt-probe][infra]` title so the two diagnoses never share a
+      # dedup row.
       #
       # ⚠ `inputs.route_failure`, NEVER `github.event.inputs.route_failure`.
       # The latter is always a STRING, so the literal "false" is truthy and
       # every dispatched measurement failure would file an issue -- the spam
       # this input exists to prevent, reintroduced by a one-word edit. Only the
       # `inputs` context honours `type: boolean`.
-      - name: Route zero-data failure
-        if: ${{ !cancelled() && env.ZERO_DATA == '1' && (github.event_name == 'schedule' || inputs.route_failure) }}
+      - name: Route probe failure
+        if: ${{ !cancelled() && ((env.ZERO_DATA == '1' && (github.event_name == 'schedule' || inputs.route_failure)) || (failure() && env.ZERO_DATA != '1' && github.event_name == 'schedule')) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -579,6 +591,19 @@ jobs:
           RELAY: ${{ inputs.relay || '69.25.95.128' }}
         run: |
           set -euo pipefail
+          if [ "${ZERO_DATA:-}" != 1 ]; then
+            title="[amt-probe][infra] detector failed before a verdict ($SOURCE,$GROUP)"
+            body="Scheduled public-vantage probe **failed before reaching a verdict** for (\`$SOURCE\`, \`$GROUP\`) via \`$RELAY:2268\`.
+
+          - Run: $RUN_URL
+          - Detected at: $(date -u +%FT%TZ)
+
+          This is not a relay finding: checkout, registry login, the vantage
+          receipt, or an amt-verify guard (exit 90/91/92) failed. While it
+          persists the detector is not running, and a stopped detector reads as
+          a healthy relay (BLO-33585). Fix the run, then close this row."
+          else
+          title="[amt-probe] relay not forwarding to public gateways ($SOURCE,$GROUP)"
           body="Scheduled public-vantage probe received **zero data** from \`$RELAY:2268\` for (\`$SOURCE\`, \`$GROUP\`).
 
           - Run: $RUN_URL
@@ -591,26 +616,25 @@ jobs:
 
           Runbook: BLO-33585 findings. Nine relay-side series are dead for this
           purpose; do not re-key this detector to any of them."
+          fi
           # A failed lookup falls through to create: a duplicate issue is a far
           # better failure than silence for a detector. Under `set -e` a bare
           # gh failure here would abort before either branch, which is the
           # invisible-notification mode the no-`--label` choice above avoids.
           n=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
                 --json number,title \
-                --jq '[.[]|select(.title|startswith("[amt-probe]"))]|.[0].number // empty' || true)
+                | jq -r --arg t "$title" '[.[]|select(.title == $t)]|.[0].number // empty' || true)
           if [ -n "$n" ]; then
             if gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"; then
               echo "routed=comment issue=$n"
             else
-              echo "::error::routing failed: could not comment on [amt-probe] issue #$n"
+              echo "::error::routing failed: could not comment on issue #$n ($title)"
             fi
           else
-            if url=$(gh issue create --repo "$GITHUB_REPOSITORY" \
-              --title "[amt-probe] relay not forwarding to public gateways ($SOURCE,$GROUP)" \
-              --body "$body"); then
+            if url=$(gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"); then
               echo "routed=created issue=$url"
             else
-              echo "::error::routing failed: could not create the [amt-probe] issue"
+              echo "::error::routing failed: could not create issue: $title"
             fi
           fi
 
