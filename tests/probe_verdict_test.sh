@@ -71,6 +71,34 @@ block = next(s['run'] for s in steps if 'run' in s and 'docker pull' in s['run']
 open(out, 'w').write(block)
 PY
 
+# Extraction is a PRECONDITION, not a case. It fails for reasons that have
+# nothing to do with the verdict logic -- a missing or moved workflow file, a
+# renamed `probe` job, a step that no longer carries `docker pull`, absent
+# pyyaml -- and without `set -e` the suite then runs every case against a
+# missing probe.sh, scoring `bash: no such file` (127) as the result: 17
+# assertions (13 cases) go red with a want/got line that reads like a
+# verdict-logic regression. Abort instead of diagnosing it thirteen times.
+#
+# Delete THIS guard alone and the 13 probe cases go 17 FAIL / 0 PASS -- the
+# sole `want=nonzero` case, "N=1 unparseable receipt -> red", is held red by
+# the `!= 127` clause below. Delete BOTH and it is 16 FAIL / 1 PASS: that case
+# goes GREEN because 127 is nonzero, and it cannot tell "probe.sh rejected a
+# corrupt receipt" from "probe.sh never ran". That vacuous pass is the real
+# defect -- Ally's review of #25 (head 1e849975, Suggestion 4) stated it as a
+# silent vacuous pass of the WHOLE suite, which does not reproduce.
+#
+# Counts are assertions, not cases: 13 `run_case` calls, but the two N=1 cases
+# that pass `pcs != oops` each add two legacy-artifact assertions that emit
+# only on failure -- hence 17 broken from 13 cases. Figures above are the
+# probe cases only. Healthy whole-suite is 19 PASS / 0 FAIL. The 6
+# `run_ramp_case` calls #22 added never read probe.sh, but they do read
+# verdict.sh, extracted the same way, so a broken precondition fails them too.
+# With the verdict.sh guard below present the suite aborts before them: the
+# whole-suite broken rows are the probe figures above (0 PASS / 17 FAIL and
+# 1 PASS / 16 FAIL), exit 2, and `grep -c FAIL` returns 17 and 16 (the
+# `FAILURES` summary line is never reached).
+[ -s "$WORK/probe.sh" ] || { echo "ABORT: could not extract probe.sh from $WORKFLOW (workflow file missing, the 'probe' job renamed, the 'docker pull' step moved, or pyyaml absent)" >&2; exit 2; }
+
 mkdir -p "$WORK/bin"
 cat >"$WORK/bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -108,8 +136,15 @@ run_case() {
 
   # `want=nonzero` where the contract is only "must not pass": a corrupt receipt
   # dies at the (S,G) guard carrying jq's own exit code, and pinning that number
-  # would freeze an implementation detail rather than the behaviour.
-  if { [ "$want" = nonzero ] && [ "$got" != 0 ]; } || [ "$got" = "$want" ]; then
+  # would freeze an implementation detail rather than the behaviour. 127 is
+  # excluded because it is the one nonzero code that means the subject never
+  # produced a verdict of its own -- bash returns it both when probe.sh is
+  # absent and when probe.sh runs but calls a missing binary (jq gone from the
+  # image). A "must not pass" assertion is otherwise satisfied by a broken test
+  # environment, which is the opposite of a positive control. Belt-and-braces
+  # with the extraction guard above: that one catches the known cause, this one
+  # catches any cause.
+  if { [ "$want" = nonzero ] && [ "$got" != 0 ] && [ "$got" != 127 ]; } || [ "$got" = "$want" ]; then
     echo "PASS  $name (exit $got)"
   else
     echo "FAIL  $name: want exit $want, got $got"; FAILED=1
@@ -171,6 +206,17 @@ wf, out = sys.argv[1], sys.argv[2]
 steps = yaml.safe_load(open(wf))['jobs']['tunnels-ramp']['steps']
 open(out, 'w').write(next(s['run'] for s in steps if s.get('name') == 'Verdict'))
 PY
+# Same precondition contract as the probe.sh guard above, and `bash -n` is NOT
+# it: `open(out,'w')` runs before `next()` raises, so a renamed `Verdict` step
+# leaves an EMPTY verdict.sh, which parses cleanly and takes that check GREEN.
+# (A renamed job raises KeyError on the lookup line before `open()` and leaves
+# no file; `-s` catches both. The probe block cannot leave an empty file: its
+# `next()` runs on its own line, before `open()`.)
+# The 6 ramp cases below then go red with `want '...', got:` lines that read
+# like a verdict-logic regression. Measured on the merged head: rename the
+# `Verdict` step and the suite reports 13 PASS / 6 FAIL with zero "does not
+# parse", i.e. the one assertion meant to catch this is the one that passes.
+[ -s "$WORK/verdict.sh" ] || { echo "ABORT: could not extract the tunnels-ramp Verdict step from $WORKFLOW (workflow file missing, the 'tunnels-ramp' job or 'Verdict' step renamed, or pyyaml absent)" >&2; exit 2; }
 bash -n "$WORK/verdict.sh" || { echo "FAIL  tunnels-ramp Verdict step does not parse"; FAILED=1; }
 
 run_ramp_case() {
