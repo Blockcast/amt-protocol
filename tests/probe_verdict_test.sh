@@ -206,4 +206,132 @@ run_ramp_case "degraded unknown cause -> binder not established" "1,8,1024" \
   '[{"requested":1,"report":{"alive":1,"distinct_outer_sources":1}},{"requested":8,"report":{"alive":8,"distinct_outer_sources":8}},{"requested":1024,"report":{"alive":900,"distinct_outer_sources":1024,"establish_errors":{"connection reset":124}}}]' \
   "verdict=degraded above N=8, BINDER NOT ESTABLISHED (1 cause(s)"
 
+# Ally review at head 50f03ee, Important (1). The infra arm routes a
+# flake-prone class -- ipify, checkout, the ghcr login, upload-artifact -- into
+# a row that nothing closed, so the first blip filed `[amt-probe][infra] ...`
+# permanently and the exact-title dedup then demoted every LATER genuine
+# detector death to a comment on that stale row. `Clear probe failure rows`
+# closes both rows on a green scheduled run.
+#
+# THE SILENT WAY THIS ROTS IS TITLE DRIFT. The clear step looks its rows up by
+# exact string, so editing a title in one step and not the other leaves a step
+# that runs, exits 0, prints clear=absent, and clears nothing forever -- the
+# same never-closes state, reached with the fix apparently in place. So this
+# does NOT assert the titles equal some literal copied into the test (which
+# would drift with them). It runs BOTH real run-blocks and feeds the clear step
+# a list built from the titles the ROUTE step actually emitted.
+python3 - "$WORKFLOW" "$WORK/route.sh" "$WORK/clear.sh" <<'PY'
+import sys, yaml
+wf, route, clear = sys.argv[1:4]
+steps = {s.get('name'): s for s in yaml.safe_load(open(wf))['jobs']['probe']['steps']}
+for name, out in (('Route probe failure', route), ('Clear probe failure rows', clear)):
+    assert name in steps, f'step missing from workflow: {name}'
+    open(out, 'w').write(steps[name]['run'])
+PY
+bash -n "$WORK/route.sh"  || { echo "FAIL  Route probe failure does not parse"; FAILED=1; }
+bash -n "$WORK/clear.sh"  || { echo "FAIL  Clear probe failure rows does not parse"; FAILED=1; }
+
+cat >"$WORK/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+verb=$2; shift 2
+case "$verb" in
+  list) cat "$GH_LIST" ;;
+  create)
+    while [ $# -gt 0 ]; do
+      [ "$1" = --title ] && printf '%s\n' "$2" >>"$GH_OUT.titles"
+      shift
+    done
+    echo "https://example.invalid/issues/0" ;;
+  comment) printf 'comment %s\n' "$1" >>"$GH_OUT.acts" ;;
+  close)   printf 'close %s\n'   "$1" >>"$GH_OUT.acts" ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/bin/gh"
+
+probe_env() {
+  # GITHUB_REPOSITORY is load-bearing, not decoration: both run-blocks are
+  # `set -u`, so omitting it aborts them before the first gh call and this
+  # file's real assertions all pass vacuously on zero observations.
+  export RELAY=1.2.3.4 SOURCE=69.25.95.192 GROUP=232.1.1.60 \
+         RUN_URL=https://example.invalid/run GH_TOKEN=stub \
+         GITHUB_REPOSITORY=Blockcast/amt-protocol
+}
+
+# 1. Harvest the two titles the route step really builds, one per arm.
+echo '[]' >"$WORK/empty.json"
+: >"$WORK/routed.titles"
+for arm in zero infra; do
+  ( probe_env
+    export GH_LIST="$WORK/empty.json" GH_OUT="$WORK/routed"
+    [ "$arm" = zero ] && export ZERO_DATA=1
+    bash "$WORK/route.sh" ) >/dev/null 2>&1
+done
+mapfile -t ROUTED_TITLES <"$WORK/routed.titles"
+if [ "${#ROUTED_TITLES[@]}" -ne 2 ]; then
+  echo "FAIL  route step emitted ${#ROUTED_TITLES[@]} titles, want 2 (one per arm)"; FAILED=1
+fi
+
+# 2. Offer the clear step exactly those rows. Matching titles => both closed.
+python3 - "$WORK/routed.titles" "$WORK/open.json" <<'PY'
+import json, sys
+titles = [t.rstrip('\n') for t in open(sys.argv[1]) if t.strip()]
+json.dump([{'number': 101 + i, 'title': t} for i, t in enumerate(titles)], open(sys.argv[2], 'w'))
+PY
+: >"$WORK/clear.acts"
+( probe_env
+  export GH_LIST="$WORK/open.json" GH_OUT="$WORK/clear"
+  bash "$WORK/clear.sh" ) >/dev/null 2>&1
+closed=$(grep -c '^close ' "$WORK/clear.acts" || true)
+closed=${closed:-0}
+if [ "$closed" = "${#ROUTED_TITLES[@]}" ] && [ "$closed" != 0 ]; then
+  echo "PASS  green scheduled run closes both routed rows (titles agree across steps)"
+else
+  echo "FAIL  clear step closed $closed of ${#ROUTED_TITLES[@]} rows the route step files."
+  echo "      Titles have drifted between 'Route probe failure' and 'Clear probe failure rows';"
+  echo "      the rows would never close. Route emitted:"
+  printf '        %s\n' "${ROUTED_TITLES[@]}"
+  FAILED=1
+fi
+
+# 3. Negative control: nothing open must close nothing. Without this, a clear
+# step that closed whatever it found first would pass case 2 for free.
+: >"$WORK/none.acts"
+( probe_env
+  export GH_LIST="$WORK/empty.json" GH_OUT="$WORK/none"
+  bash "$WORK/clear.sh" ) >/dev/null 2>&1
+if [ -s "$WORK/none.acts" ]; then
+  echo "FAIL  clear step acted with no matching row open: $(cat "$WORK/none.acts")"; FAILED=1
+else
+  echo "PASS  clear step is a no-op when neither row is open"
+fi
+
+# 4. The clear step must be gated on BOTH a green run and a scheduled one: a
+# dispatch may target a different (S,G) or the .99 positive control, and
+# clearing a production row off a control run is the silent direction of wrong.
+CLEAR_IF=$(python3 -c "
+import sys, yaml
+steps = {s.get('name'): s for s in yaml.safe_load(open(sys.argv[1]))['jobs']['probe']['steps']}
+print(steps['Clear probe failure rows'].get('if', ''))
+" "$WORKFLOW")
+case "$CLEAR_IF" in
+  *success\(\)*schedule*) echo "PASS  clear step gated on success() and event_name == schedule" ;;
+  *) echo "FAIL  clear step gate must require success() and a scheduled event, got: $CLEAR_IF"; FAILED=1 ;;
+esac
+
+# Ally review at head 50f03ee, Suggestion (1). An EXCEEDED job timeout CANCELS
+# the job, so `Route probe failure` never runs and a wedged probe files nothing
+# at all -- the one failure direction this whole workflow exists to remove.
+# The default is 360 min against a 15-minute cron.
+PROBE_TIMEOUT=$(python3 -c "
+import sys, yaml
+print(yaml.safe_load(open(sys.argv[1]))['jobs']['probe'].get('timeout-minutes', 0))
+" "$WORKFLOW")
+if [ "$PROBE_TIMEOUT" -gt 0 ] && [ "$PROBE_TIMEOUT" -le 15 ]; then
+  echo "PASS  probe job bounded at ${PROBE_TIMEOUT}m, inside the 15m cron interval"
+else
+  echo "FAIL  probe job timeout-minutes=$PROBE_TIMEOUT: must be 1..15 so a wedge cannot"
+  echo "      outlive its cron interval and be cancelled before it can route"; FAILED=1
+fi
+
 [ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }

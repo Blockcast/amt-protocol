@@ -139,6 +139,13 @@ on:
   # that PR's head -- and the merge-gate reader keys on (name, run id), so a
   # later green probe does NOT supersede it. That head can then never satisfy
   # "every check-run at head is success". Measured on this PR at 88739bb.
+  #
+  # ⚠ GitHub DISABLES a scheduled workflow on a PUBLIC repo after 60 days of
+  # *repository* inactivity (this repo is public). That is a silent off-switch
+  # thrown by unrelated inactivity, on a detector whose whole thesis is that
+  # silence is the one unacceptable failure direction -- and nothing in this
+  # file can detect it, because a workflow that never runs files nothing. If
+  # this repo ever goes quiet for two months, re-enable the schedule by hand.
   schedule:
     - cron: "7,22,37,52 * * * *"
 
@@ -175,6 +182,13 @@ jobs:
   probe:
     if: ${{ (inputs.mode || 'oneshot') == 'oneshot' }}
     runs-on: ubuntu-latest
+    # An EXCEEDED job timeout CANCELS the job, so `Route probe failure` below
+    # never runs and a wedged probe (docker pull stall, client not returning)
+    # files nothing at all -- leaving only a row in the Actions list, which is
+    # precisely what the cron comment says is not a detection path. The default
+    # is 360 min against a 15-minute cron, i.e. one wedge spans ~24 firings.
+    # A bounded sample here is seconds; 10 min is slack, not a budget.
+    timeout-minutes: 10
     # Job-scoped so `issues: write` reaches only this job and not tunnels-ramp.
     # Job-level permissions REPLACE the workflow block rather than merging, so
     # contents/packages are restated here -- dropping either breaks checkout or
@@ -637,6 +651,64 @@ jobs:
               echo "::error::routing failed: could not create issue: $title"
             fi
           fi
+
+      # BLO-33585. NOTHING CLOSED THESE ROWS, and for the infra arm that is not
+      # untidiness -- it disarms the arm after its first flake.
+      #
+      # `failure() && env.ZERO_DATA != '1'` is true for any non-verdict step
+      # failure, and those are third-party-network steps: ipify in the vantage
+      # receipt, actions/checkout, the ghcr login, upload-artifact. The cron
+      # fires 96x/day on hosted runners, so a blip inside the first few days is
+      # close to certain. Once one files `[amt-probe][infra] ...`, the exact
+      # title dedup above routes every LATER detector death to `gh issue
+      # comment` on that stale row -- so a persistent death (ghcr token expiry,
+      # runner-image change) shows up as another comment on a weeks-old row
+      # that reads as known-flaky, and a stopped detector is indistinguishable
+      # from a healthy relay. That is this issue's own failure mode, re-entering
+      # through the arm added to prevent it.
+      #
+      # A green scheduled run resolves BOTH diagnoses at once and is the only
+      # thing that can: data arrived, so the relay is forwarding; a verdict was
+      # reached, so the detector ran. Closing restores "the row count tracks
+      # FAULTS and not minutes" for the infra arm too, and makes a newly
+      # CREATED row the signal again rather than a comment nobody is subscribed
+      # to. It also retires the asymmetry that the infra body ends with "Fix the
+      # run, then close this row" while the zero-data body has no equivalent.
+      #
+      # SCHEDULE-ONLY, matching the arms that open these rows. A dispatch may
+      # target a different (S,G) or the .99 positive control, and closing a
+      # production row off a control run is the silent direction of wrong.
+      #
+      # `success()` is false if ANY earlier step failed, including the
+      # always()-gated upload -- so a partial run never clears a row.
+      - name: Clear probe failure rows
+        if: ${{ success() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE: ${{ inputs.source || '69.25.95.192' }}
+          GROUP: ${{ inputs.group || '232.1.1.60' }}
+        run: |
+          set -euo pipefail
+          # Titles must stay byte-identical to the two built above, or this
+          # clears nothing and says so only by printing clear=absent forever.
+          for title in \
+            "[amt-probe] relay not forwarding to public gateways ($SOURCE,$GROUP)" \
+            "[amt-probe][infra] detector failed before a verdict ($SOURCE,$GROUP)"; do
+            # Same `|| true` as the routing lookup: a gh failure here must not
+            # abort the loop, or one flaky list call leaves the other row open.
+            n=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+                  --json number,title \
+                  | jq -r --arg t "$title" '[.[]|select(.title == $t)]|.[0].number // empty' || true)
+            if [ -z "$n" ]; then
+              echo "clear=absent title=$title"
+            elif gh issue close "$n" --repo "$GITHUB_REPOSITORY" \
+                   --comment "Recovered at $(date -u +%FT%TZ): a scheduled public-vantage probe reached a verdict and received data. Run: $RUN_URL"; then
+              echo "clear=closed issue=$n"
+            else
+              echo "::error::clearing failed: could not close issue #$n ($title)"
+            fi
+          done
 
   # BLO-33457. Tunnel-STATE occupancy ramp: how many concurrent AMT tunnels can
   # the linux relay hold in its tunnel table? This is the MX301-M leg of
