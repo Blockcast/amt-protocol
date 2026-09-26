@@ -272,12 +272,34 @@ if [ "${#ROUTED_TITLES[@]}" -ne 2 ]; then
   echo "FAIL  route step emitted ${#ROUTED_TITLES[@]} titles, want 2 (one per arm)"; FAILED=1
 fi
 
-# 2. Offer the clear step exactly those rows. Matching titles => both closed.
+# 2. The dedup path. Case 1 drove the route step with an empty list, so only
+# `gh issue create` was covered; `gh issue comment` on an already-open row is
+# what "the row count tracks FAULTS and not minutes" actually rests on. Feed
+# the titles it just emitted straight back in: each arm must comment on its OWN
+# row, and a create here would mean the exact-title lookup missed a row it had
+# itself filed one call earlier.
 python3 - "$WORK/routed.titles" "$WORK/open.json" <<'PY'
 import json, sys
 titles = [t.rstrip('\n') for t in open(sys.argv[1]) if t.strip()]
 json.dump([{'number': 101 + i, 'title': t} for i, t in enumerate(titles)], open(sys.argv[2], 'w'))
 PY
+for arm in zero infra; do
+  : >"$WORK/dedup-$arm.acts"; : >"$WORK/dedup-$arm.titles"
+  ( probe_env
+    export GH_LIST="$WORK/open.json" GH_OUT="$WORK/dedup-$arm"
+    [ "$arm" = zero ] && export ZERO_DATA=1
+    bash "$WORK/route.sh" ) >/dev/null 2>&1
+  # routed.titles is written zero-arm first, so #101 is zero and #102 is infra.
+  want=101; [ "$arm" = infra ] && want=102
+  if [ "$(cat "$WORK/dedup-$arm.acts")" = "comment $want" ] && [ ! -s "$WORK/dedup-$arm.titles" ]; then
+    echo "PASS  route step dedups the $arm arm onto its own open row (#$want)"
+  else
+    echo "FAIL  route step $arm arm: want 'comment $want' and no create, got"
+    echo "      acts=$(cat "$WORK/dedup-$arm.acts") created=$(cat "$WORK/dedup-$arm.titles")"; FAILED=1
+  fi
+done
+
+# 3. Offer the clear step exactly those rows. Matching titles => both closed.
 : >"$WORK/clear.acts"
 ( probe_env
   export GH_LIST="$WORK/open.json" GH_OUT="$WORK/clear"
@@ -294,8 +316,8 @@ else
   FAILED=1
 fi
 
-# 3. Negative control: nothing open must close nothing. Without this, a clear
-# step that closed whatever it found first would pass case 2 for free.
+# 4. Negative control: nothing open must close nothing. Without this, a clear
+# step that closed whatever it found first would pass case 3 for free.
 : >"$WORK/none.acts"
 ( probe_env
   export GH_LIST="$WORK/empty.json" GH_OUT="$WORK/none"
@@ -306,7 +328,7 @@ else
   echo "PASS  clear step is a no-op when neither row is open"
 fi
 
-# 4. The clear step must be gated on BOTH a green run and a scheduled one: a
+# 5. The clear step must be gated on BOTH a green run and a scheduled one: a
 # dispatch may target a different (S,G) or the .99 positive control, and
 # clearing a production row off a control run is the silent direction of wrong.
 CLEAR_IF=$(python3 -c "
@@ -319,10 +341,38 @@ case "$CLEAR_IF" in
   *) echo "FAIL  clear step gate must require success() and a scheduled event, got: $CLEAR_IF"; FAILED=1 ;;
 esac
 
-# Ally review at head 50f03ee, Suggestion (1). An EXCEEDED job timeout CANCELS
-# the job, so `Route probe failure` never runs and a wedged probe files nothing
-# at all -- the one failure direction this whole workflow exists to remove.
-# The default is 360 min against a 15-minute cron.
+# 6. Ally review at head 1678771, Important (1). The bound in case 7 frees the
+# runner but does NOT make a wedge file anything -- that depends on which job
+# status a timeout produces, which the GitHub docs do not state. MEASURED in
+# run 36207352472 (`timeout-minutes: 1` vs `sleep 300`): the job ends
+# CANCELLED, `if: failure()` is SKIPPED, and `always()` / `cancelled()` steps
+# still run with `job.status == 'cancelled'`. So a `failure()`-gated router is
+# blind to exactly the wedge it exists to catch, and the fix has to be in the
+# gate. Assert the mechanism, not the string: a status FUNCTION must be present
+# or the runner prepends an implicit `success() &&`, the non-verdict arm must
+# key on `job.status` rather than `failure()`, and `failure()` must be gone
+# from the expression entirely -- reintroducing it anywhere re-arms the hole.
+ROUTE_IF=$(python3 -c "
+import sys, yaml
+steps = {s.get('name'): s for s in yaml.safe_load(open(sys.argv[1]))['jobs']['probe']['steps']}
+print(steps['Route probe failure'].get('if', ''))
+" "$WORKFLOW")
+route_gate_ok=1
+case "$ROUTE_IF" in *'always()'*) ;; *) route_gate_ok=0 ;; esac
+case "$ROUTE_IF" in *"job.status != 'success'"*) ;; *) route_gate_ok=0 ;; esac
+case "$ROUTE_IF" in *'failure()'*) route_gate_ok=0 ;; esac
+if [ "$route_gate_ok" = 1 ]; then
+  echo "PASS  route step survives a job-timeout cancellation (always() + job.status, no failure())"
+else
+  echo "FAIL  route step gate must be always()-anchored and key the non-verdict arm on"
+  echo "      job.status != 'success'; failure() is FALSE on a timeout cancellation"
+  echo "      (measured, run 36207352472) so a wedge would file nothing. Got: $ROUTE_IF"
+  FAILED=1
+fi
+
+# 7. Ally review at head 50f03ee, Suggestion (1). The default job timeout is
+# 360 min against a 15-minute cron, so one wedge spans ~24 firings and runs
+# overlap. Anything under the interval also removes the overlap.
 PROBE_TIMEOUT=$(python3 -c "
 import sys, yaml
 print(yaml.safe_load(open(sys.argv[1]))['jobs']['probe'].get('timeout-minutes', 0))
@@ -331,7 +381,7 @@ if [ "$PROBE_TIMEOUT" -gt 0 ] && [ "$PROBE_TIMEOUT" -le 15 ]; then
   echo "PASS  probe job bounded at ${PROBE_TIMEOUT}m, inside the 15m cron interval"
 else
   echo "FAIL  probe job timeout-minutes=$PROBE_TIMEOUT: must be 1..15 so a wedge cannot"
-  echo "      outlive its cron interval and be cancelled before it can route"; FAILED=1
+  echo "      outlive its cron interval"; FAILED=1
 fi
 
 [ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }

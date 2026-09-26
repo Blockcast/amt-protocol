@@ -182,12 +182,27 @@ jobs:
   probe:
     if: ${{ (inputs.mode || 'oneshot') == 'oneshot' }}
     runs-on: ubuntu-latest
-    # An EXCEEDED job timeout CANCELS the job, so `Route probe failure` below
-    # never runs and a wedged probe (docker pull stall, client not returning)
-    # files nothing at all -- leaving only a row in the Actions list, which is
-    # precisely what the cron comment says is not a detection path. The default
-    # is 360 min against a 15-minute cron, i.e. one wedge spans ~24 firings.
-    # A bounded sample here is seconds; 10 min is slack, not a budget.
+    # An EXCEEDED job timeout CANCELS the job. MEASURED, not inferred -- the
+    # docs do not state it, and it decides how `Route probe failure` must be
+    # gated, so it was settled by experiment rather than by reading:
+    #
+    #   run 36207352472, `timeout-minutes: 1` against `sleep 300`
+    #     job conclusion ........................ cancelled
+    #     step `if: failure()` .................. SKIPPED
+    #     step `if: cancelled()` ................ ran
+    #     step `if: always() && job.status != 'success'` ... ran, job.status=cancelled
+    #
+    # Two consequences, both load-bearing below. A `failure()`-gated router
+    # cannot see a wedge, which is why the gate at `Route probe failure` is
+    # `always() && job.status != 'success'` and must not be reverted to
+    # `failure()`. And the runner DOES execute always()/cancelled() steps after
+    # a timeout, so a wedge can still file -- the router is reachable, it just
+    # has to ask for a status the cancellation path actually sets.
+    #
+    # The bound itself is separate and is a resource fix: the default is
+    # 360 min against a 15-minute cron, i.e. one wedge spans ~24 firings and
+    # (at 10 < 15) runs can no longer overlap. A bounded sample here is
+    # seconds; 10 min is slack, not a budget.
     timeout-minutes: 10
     # Job-scoped so `issues: write` reaches only this job and not tunnels-ramp.
     # Job-level permissions REPLACE the workflow block rather than merging, so
@@ -583,9 +598,10 @@ jobs:
       # Exact, not a prefix: the title carries (source,group), and a prefix match
       # let the positive control's open .99 row swallow every production alert.
       #
-      # TWO causes, two rows. ZERO_DATA is the relay verdict. Any other failure
+      # TWO causes, two rows. ZERO_DATA is the relay verdict. Any other bad end
       # on a scheduled run (checkout, registry login, the vantage receipt,
-      # amt-verify's guard exits 90/91/92) means the DETECTOR stopped, which is
+      # amt-verify's guard exits 90/91/92, or the job cancelled by its own
+      # `timeout-minutes`) means the DETECTOR stopped, which is
       # indistinguishable from a healthy relay unless it is filed too. It gets
       # its own `[amt-probe][infra]` title so the two diagnoses never share a
       # dedup row.
@@ -595,8 +611,21 @@ jobs:
       # every dispatched measurement failure would file an issue -- the spam
       # this input exists to prevent, reintroduced by a one-word edit. Only the
       # `inputs` context honours `type: boolean`.
+      # ⚠ `always() && job.status != 'success'`, NEVER `failure()`. A job that
+      # exceeds `timeout-minutes` ends CANCELLED, not failed, so `failure()` is
+      # false and a `failure()`-gated router is SKIPPED -- which is exactly the
+      # wedge (docker pull stall, client not returning) that files nothing and
+      # leaves a stopped detector looking like a healthy relay. Measured at
+      # `timeout-minutes` above, run 36207352472. `job.status` is a context and
+      # not a status function, so the `always()` is load-bearing too: without a
+      # status function anywhere in the expression the runner prepends an
+      # implicit `success() &&` and the step never runs on a bad end at all.
+      #
+      # The event guard is what makes `always()` safe: a SCHEDULED run has no
+      # human to hand-cancel, so on `schedule` a cancellation is a timeout.
+      # A hand-cancelled dispatch still routes nothing.
       - name: Route probe failure
-        if: ${{ !cancelled() && ((env.ZERO_DATA == '1' && (github.event_name == 'schedule' || inputs.route_failure)) || (failure() && env.ZERO_DATA != '1' && github.event_name == 'schedule')) }}
+        if: ${{ always() && ((env.ZERO_DATA == '1' && job.status != 'cancelled' && (github.event_name == 'schedule' || inputs.route_failure)) || (job.status != 'success' && env.ZERO_DATA != '1' && github.event_name == 'schedule')) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -613,7 +642,8 @@ jobs:
           - Detected at: $(date -u +%FT%TZ)
 
           This is not a relay finding: checkout, registry login, the vantage
-          receipt, or an amt-verify guard (exit 90/91/92) failed. While it
+          receipt, or an amt-verify guard (exit 90/91/92) failed -- or the job
+          was cancelled by its own \`timeout-minutes\`, i.e. it wedged. While it
           persists the detector is not running, and a stopped detector reads as
           a healthy relay (BLO-33585). Fix the run, then close this row."
           else
@@ -655,9 +685,10 @@ jobs:
       # BLO-33585. NOTHING CLOSED THESE ROWS, and for the infra arm that is not
       # untidiness -- it disarms the arm after its first flake.
       #
-      # `failure() && env.ZERO_DATA != '1'` is true for any non-verdict step
-      # failure, and those are third-party-network steps: ipify in the vantage
-      # receipt, actions/checkout, the ghcr login, upload-artifact. The cron
+      # `job.status != 'success' && env.ZERO_DATA != '1'` is true for any
+      # non-verdict bad end, and those are third-party-network steps: ipify in
+      # the vantage receipt, actions/checkout, the ghcr login, upload-artifact.
+      # The cron
       # fires 96x/day on hosted runners, so a blip inside the first few days is
       # close to certain. Once one files `[amt-probe][infra] ...`, the exact
       # title dedup above routes every LATER detector death to `gh issue
