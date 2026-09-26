@@ -384,4 +384,80 @@ else
   echo "      outlive its cron interval"; FAILED=1
 fi
 
+# 8. Ally review at head d1c80d2, Important (1). Case 6 asserts TOKENS in the
+# route gate -- `always()` present, `job.status != 'success'` present,
+# `failure()` absent. That is documentation, not a guard: it passed green while
+# `job.status != 'cancelled'` on the zero-data arm made (cancelled,
+# ZERO_DATA=1, schedule) satisfy NEITHER arm, so a verdict that was actually
+# reached routed nothing. A token test cannot express exhaustiveness, which is
+# the property that matters, so evaluate the gate instead of grepping it.
+#
+# The invariant: on a SCHEDULED run every non-success end must route exactly
+# one row -- either diagnosis is actionable, silence is not. This case would
+# also have gone red on the original `!cancelled()` gate, i.e. on both
+# instances of this bug rather than only the second.
+python3 - "$WORKFLOW" <<'PY' || FAILED=1
+import re, sys, yaml
+
+steps = {s.get('name'): s for s in yaml.safe_load(open(sys.argv[1]))['jobs']['probe']['steps']}
+expr = steps['Route probe failure']['if'].strip()
+expr = re.sub(r'^\$\{\{|\}\}$', '', expr).strip()
+
+def gate(status, zero, event, route_failure):
+    """Evaluate the GitHub Actions `if:` expression for one context tuple."""
+    e = expr
+    # Status functions are exactly their job.status equivalents. Substituting
+    # all three (rather than only always()) keeps this evaluator valid for the
+    # whole grammar this gate can legally use, so a future `!cancelled()` or
+    # `success()` fails the EXHAUSTIVENESS check below on its merits instead of
+    # dying in a SyntaxError that reads as a broken test.
+    e = e.replace('always()', 'True')
+    e = re.sub(r'\bsuccess\(\)', repr(status == 'success'), e)
+    e = re.sub(r'\bfailure\(\)', repr(status == 'failure'), e)
+    e = re.sub(r'\bcancelled\(\)', repr(status == 'cancelled'), e)
+    e = re.sub(r'\bjob\.status\b', repr(status), e)
+    e = re.sub(r'\benv\.ZERO_DATA\b', repr(zero), e)
+    e = re.sub(r'\bgithub\.event_name\b', repr(event), e)
+    e = re.sub(r'\binputs\.route_failure\b', repr(route_failure), e)
+    e = e.replace('&&', ' and ').replace('||', ' or ')
+    e = re.sub(r'!(?![=])', ' not ', e)
+    # Any context or status function we did not substitute would silently
+    # NameError; surface it as a failure rather than a crash.
+    return bool(eval(e, {'__builtins__': {}}, {}))
+
+bad = []
+try:
+    # A. THE ONE THAT MATTERS. Arms exhaustive over every non-success end of a
+    #    scheduled run. ZERO_DATA=1 is the relay verdict, '' is a detector
+    #    death; `cancelled` is what `timeout-minutes` produces (run
+    #    36207352472) and `failure` is every other bad exit.
+    for status in ('failure', 'cancelled'):
+        for zero in ('1', ''):
+            if not gate(status, zero, 'schedule', False):
+                bad.append(f"scheduled job.status={status} ZERO_DATA={zero!r}: routes NOTHING")
+    # B. A green scheduled run must stay silent, or the detector cries wolf.
+    if gate('success', '', 'schedule', False):
+        bad.append("green scheduled run routes an alert")
+    # C. An unopted dispatch must stay silent -- this is the spam guard
+    #    `route_failure` exists for, and every measurement run trips it.
+    for status in ('failure', 'cancelled'):
+        if gate(status, '1', 'workflow_dispatch', False):
+            bad.append(f"dispatch route_failure=false job.status={status}: routes an alert")
+    # D. An opted dispatch with a real zero-data verdict must route, including
+    #    after a cancellation: the verdict precedes it and is not retracted.
+    for status in ('failure', 'cancelled'):
+        if not gate(status, '1', 'workflow_dispatch', True):
+            bad.append(f"dispatch route_failure=true job.status={status} ZERO_DATA=1: routes NOTHING")
+except Exception as exc:
+    bad.append(f"gate is not evaluable ({exc.__class__.__name__}: {exc}); unsubstituted context?")
+
+if bad:
+    print("FAIL  route gate arms are not exhaustive over job.status != 'success'")
+    for b in bad:
+        print(f"      - {b}")
+    print(f"      gate: {expr}")
+    sys.exit(1)
+print("PASS  route gate routes exactly one row for every non-success scheduled end")
+PY
+
 [ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }

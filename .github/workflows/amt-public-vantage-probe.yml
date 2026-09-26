@@ -623,9 +623,29 @@ jobs:
       #
       # The event guard is what makes `always()` safe: a SCHEDULED run has no
       # human to hand-cancel, so on `schedule` a cancellation is a timeout.
-      # A hand-cancelled dispatch still routes nothing.
+      # An unopted dispatch (`route_failure` false) still routes nothing.
+      #
+      # ⚠ NO `job.status != 'cancelled'` ON THE ZERO-DATA ARM. Ally review at
+      # head d1c80d2, Important (1). The arms are mutually exclusive on
+      # ZERO_DATA alone, so such a clause prevents no double-filing -- and
+      # because arm 2 excludes `ZERO_DATA == '1'`, it is not a carve-out but a
+      # HOLE: (cancelled, ZERO_DATA=1, schedule) satisfies neither arm, the
+      # step is skipped, and a verdict that WAS reached routes nothing at all.
+      # Reachable: ZERO_DATA is written at the verdict and the job then runs
+      # `upload-artifact` on `always()`, so a slow receipt upload can carry the
+      # job past `timeout-minutes` AFTER the relay has been judged -- dropping
+      # the highest-value alert this detector exists to raise, which is the one
+      # direction the header calls unacceptable.
+      # The clause was never a design choice: it is the `!cancelled()` gate
+      # this step used to carry, mechanically re-applied to arm 1 when that
+      # gate was replaced by `always()` at d1c80d2. Fixing a shared guard by
+      # pushing its old semantics onto one arm relocates the bug, it does not
+      # remove it. ZERO_DATA is only ever set AFTER the aggregate verdict, so
+      # its presence already proves the verdict was reached and trustworthy;
+      # a later cancellation does not retract it. Case 8 pins the arms
+      # exhaustive over `job.status != 'success'` on a scheduled run.
       - name: Route probe failure
-        if: ${{ always() && ((env.ZERO_DATA == '1' && job.status != 'cancelled' && (github.event_name == 'schedule' || inputs.route_failure)) || (job.status != 'success' && env.ZERO_DATA != '1' && github.event_name == 'schedule')) }}
+        if: ${{ always() && ((env.ZERO_DATA == '1' && (github.event_name == 'schedule' || inputs.route_failure)) || (job.status != 'success' && env.ZERO_DATA != '1' && github.event_name == 'schedule')) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
