@@ -252,4 +252,258 @@ run_ramp_case "degraded unknown cause -> binder not established" "1,8,1024" \
   '[{"requested":1,"report":{"alive":1,"distinct_outer_sources":1}},{"requested":8,"report":{"alive":8,"distinct_outer_sources":8}},{"requested":1024,"report":{"alive":900,"distinct_outer_sources":1024,"establish_errors":{"connection reset":124}}}]' \
   "verdict=degraded above N=8, BINDER NOT ESTABLISHED (1 cause(s)"
 
+# Ally review at head 50f03ee, Important (1). The infra arm routes a
+# flake-prone class -- ipify, checkout, the ghcr login, upload-artifact -- into
+# a row that nothing closed, so the first blip filed `[amt-probe][infra] ...`
+# permanently and the exact-title dedup then demoted every LATER genuine
+# detector death to a comment on that stale row. `Clear probe failure rows`
+# closes both rows on a green scheduled run.
+#
+# THE SILENT WAY THIS ROTS IS TITLE DRIFT. The clear step looks its rows up by
+# exact string, so editing a title in one step and not the other leaves a step
+# that runs, exits 0, prints clear=absent, and clears nothing forever -- the
+# same never-closes state, reached with the fix apparently in place. So this
+# does NOT assert the titles equal some literal copied into the test (which
+# would drift with them). It runs BOTH real run-blocks and feeds the clear step
+# a list built from the titles the ROUTE step actually emitted.
+python3 - "$WORKFLOW" "$WORK/route.sh" "$WORK/clear.sh" <<'PY'
+import sys, yaml
+wf, route, clear = sys.argv[1:4]
+steps = {s.get('name'): s for s in yaml.safe_load(open(wf))['jobs']['probe']['steps']}
+for name, out in (('Route probe failure', route), ('Clear probe failure rows', clear)):
+    assert name in steps, f'step missing from workflow: {name}'
+    open(out, 'w').write(steps[name]['run'])
+PY
+bash -n "$WORK/route.sh"  || { echo "FAIL  Route probe failure does not parse"; FAILED=1; }
+bash -n "$WORK/clear.sh"  || { echo "FAIL  Clear probe failure rows does not parse"; FAILED=1; }
+
+cat >"$WORK/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+verb=$2; shift 2
+case "$verb" in
+  list) cat "$GH_LIST" ;;
+  create)
+    while [ $# -gt 0 ]; do
+      [ "$1" = --title ] && printf '%s\n' "$2" >>"$GH_OUT.titles"
+      shift
+    done
+    echo "https://example.invalid/issues/0" ;;
+  comment) printf 'comment %s\n' "$1" >>"$GH_OUT.acts" ;;
+  close)   printf 'close %s\n'   "$1" >>"$GH_OUT.acts" ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/bin/gh"
+
+probe_env() {
+  # GITHUB_REPOSITORY is load-bearing, not decoration: both run-blocks are
+  # `set -u`, so omitting it aborts them before the first gh call and this
+  # file's real assertions all pass vacuously on zero observations.
+  export RELAY=1.2.3.4 SOURCE=69.25.95.192 GROUP=232.1.1.60 \
+         RUN_URL=https://example.invalid/run GH_TOKEN=stub \
+         GITHUB_REPOSITORY=Blockcast/amt-protocol
+}
+
+# 1. Harvest the two titles the route step really builds, one per arm.
+echo '[]' >"$WORK/empty.json"
+: >"$WORK/routed.titles"
+for arm in zero infra; do
+  ( probe_env
+    export GH_LIST="$WORK/empty.json" GH_OUT="$WORK/routed"
+    [ "$arm" = zero ] && export ZERO_DATA=1
+    bash "$WORK/route.sh" ) >/dev/null 2>&1
+done
+mapfile -t ROUTED_TITLES <"$WORK/routed.titles"
+if [ "${#ROUTED_TITLES[@]}" -ne 2 ]; then
+  echo "FAIL  route step emitted ${#ROUTED_TITLES[@]} titles, want 2 (one per arm)"; FAILED=1
+fi
+
+# 2. The dedup path. Case 1 drove the route step with an empty list, so only
+# `gh issue create` was covered; `gh issue comment` on an already-open row is
+# what "the row count tracks FAULTS and not minutes" actually rests on. Feed
+# the titles it just emitted straight back in: each arm must comment on its OWN
+# row, and a create here would mean the exact-title lookup missed a row it had
+# itself filed one call earlier.
+python3 - "$WORK/routed.titles" "$WORK/open.json" <<'PY'
+import json, sys
+titles = [t.rstrip('\n') for t in open(sys.argv[1]) if t.strip()]
+json.dump([{'number': 101 + i, 'title': t} for i, t in enumerate(titles)], open(sys.argv[2], 'w'))
+PY
+for arm in zero infra; do
+  : >"$WORK/dedup-$arm.acts"; : >"$WORK/dedup-$arm.titles"
+  ( probe_env
+    export GH_LIST="$WORK/open.json" GH_OUT="$WORK/dedup-$arm"
+    [ "$arm" = zero ] && export ZERO_DATA=1
+    bash "$WORK/route.sh" ) >/dev/null 2>&1
+  # routed.titles is written zero-arm first, so #101 is zero and #102 is infra.
+  want=101; [ "$arm" = infra ] && want=102
+  if [ "$(cat "$WORK/dedup-$arm.acts")" = "comment $want" ] && [ ! -s "$WORK/dedup-$arm.titles" ]; then
+    echo "PASS  route step dedups the $arm arm onto its own open row (#$want)"
+  else
+    echo "FAIL  route step $arm arm: want 'comment $want' and no create, got"
+    echo "      acts=$(cat "$WORK/dedup-$arm.acts") created=$(cat "$WORK/dedup-$arm.titles")"; FAILED=1
+  fi
+done
+
+# 3. Offer the clear step exactly those rows. Matching titles => both closed.
+: >"$WORK/clear.acts"
+( probe_env
+  export GH_LIST="$WORK/open.json" GH_OUT="$WORK/clear"
+  bash "$WORK/clear.sh" ) >/dev/null 2>&1
+closed=$(grep -c '^close ' "$WORK/clear.acts" || true)
+closed=${closed:-0}
+if [ "$closed" = "${#ROUTED_TITLES[@]}" ] && [ "$closed" != 0 ]; then
+  echo "PASS  green scheduled run closes both routed rows (titles agree across steps)"
+else
+  echo "FAIL  clear step closed $closed of ${#ROUTED_TITLES[@]} rows the route step files."
+  echo "      Titles have drifted between 'Route probe failure' and 'Clear probe failure rows';"
+  echo "      the rows would never close. Route emitted:"
+  printf '        %s\n' "${ROUTED_TITLES[@]}"
+  FAILED=1
+fi
+
+# 4. Negative control: nothing open must close nothing. Without this, a clear
+# step that closed whatever it found first would pass case 3 for free.
+: >"$WORK/none.acts"
+( probe_env
+  export GH_LIST="$WORK/empty.json" GH_OUT="$WORK/none"
+  bash "$WORK/clear.sh" ) >/dev/null 2>&1
+if [ -s "$WORK/none.acts" ]; then
+  echo "FAIL  clear step acted with no matching row open: $(cat "$WORK/none.acts")"; FAILED=1
+else
+  echo "PASS  clear step is a no-op when neither row is open"
+fi
+
+# 5. The clear step must be gated on BOTH a green run and a scheduled one: a
+# dispatch may target a different (S,G) or the .99 positive control, and
+# clearing a production row off a control run is the silent direction of wrong.
+CLEAR_IF=$(python3 -c "
+import sys, yaml
+steps = {s.get('name'): s for s in yaml.safe_load(open(sys.argv[1]))['jobs']['probe']['steps']}
+print(steps['Clear probe failure rows'].get('if', ''))
+" "$WORKFLOW")
+case "$CLEAR_IF" in
+  *success\(\)*schedule*) echo "PASS  clear step gated on success() and event_name == schedule" ;;
+  *) echo "FAIL  clear step gate must require success() and a scheduled event, got: $CLEAR_IF"; FAILED=1 ;;
+esac
+
+# 6. Ally review at head 1678771, Important (1). The bound in case 7 frees the
+# runner but does NOT make a wedge file anything -- that depends on which job
+# status a timeout produces, which the GitHub docs do not state. MEASURED in
+# run 36207352472 (`timeout-minutes: 1` vs `sleep 300`): the job ends
+# CANCELLED, `if: failure()` is SKIPPED, and `always()` / `cancelled()` steps
+# still run with `job.status == 'cancelled'`. So a `failure()`-gated router is
+# blind to exactly the wedge it exists to catch, and the fix has to be in the
+# gate. Assert the mechanism, not the string: a status FUNCTION must be present
+# or the runner prepends an implicit `success() &&`, the non-verdict arm must
+# key on `job.status` rather than `failure()`, and `failure()` must be gone
+# from the expression entirely -- reintroducing it anywhere re-arms the hole.
+ROUTE_IF=$(python3 -c "
+import sys, yaml
+steps = {s.get('name'): s for s in yaml.safe_load(open(sys.argv[1]))['jobs']['probe']['steps']}
+print(steps['Route probe failure'].get('if', ''))
+" "$WORKFLOW")
+route_gate_ok=1
+case "$ROUTE_IF" in *'always()'*) ;; *) route_gate_ok=0 ;; esac
+case "$ROUTE_IF" in *"job.status != 'success'"*) ;; *) route_gate_ok=0 ;; esac
+case "$ROUTE_IF" in *'failure()'*) route_gate_ok=0 ;; esac
+if [ "$route_gate_ok" = 1 ]; then
+  echo "PASS  route step survives a job-timeout cancellation (always() + job.status, no failure())"
+else
+  echo "FAIL  route step gate must be always()-anchored and key the non-verdict arm on"
+  echo "      job.status != 'success'; failure() is FALSE on a timeout cancellation"
+  echo "      (measured, run 36207352472) so a wedge would file nothing. Got: $ROUTE_IF"
+  FAILED=1
+fi
+
+# 7. Ally review at head 50f03ee, Suggestion (1). The default job timeout is
+# 360 min against a 15-minute cron, so one wedge spans ~24 firings and runs
+# overlap. Anything under the interval also removes the overlap.
+PROBE_TIMEOUT=$(python3 -c "
+import sys, yaml
+print(yaml.safe_load(open(sys.argv[1]))['jobs']['probe'].get('timeout-minutes', 0))
+" "$WORKFLOW")
+if [ "$PROBE_TIMEOUT" -gt 0 ] && [ "$PROBE_TIMEOUT" -le 15 ]; then
+  echo "PASS  probe job bounded at ${PROBE_TIMEOUT}m, inside the 15m cron interval"
+else
+  echo "FAIL  probe job timeout-minutes=$PROBE_TIMEOUT: must be 1..15 so a wedge cannot"
+  echo "      outlive its cron interval"; FAILED=1
+fi
+
+# 8. Ally review at head d1c80d2, Important (1). Case 6 asserts TOKENS in the
+# route gate -- `always()` present, `job.status != 'success'` present,
+# `failure()` absent. That is documentation, not a guard: it passed green while
+# `job.status != 'cancelled'` on the zero-data arm made (cancelled,
+# ZERO_DATA=1, schedule) satisfy NEITHER arm, so a verdict that was actually
+# reached routed nothing. A token test cannot express exhaustiveness, which is
+# the property that matters, so evaluate the gate instead of grepping it.
+#
+# The invariant: on a SCHEDULED run every non-success end must route exactly
+# one row -- either diagnosis is actionable, silence is not. This case would
+# also have gone red on the original `!cancelled()` gate, i.e. on both
+# instances of this bug rather than only the second.
+python3 - "$WORKFLOW" <<'PY' || FAILED=1
+import re, sys, yaml
+
+steps = {s.get('name'): s for s in yaml.safe_load(open(sys.argv[1]))['jobs']['probe']['steps']}
+expr = steps['Route probe failure']['if'].strip()
+expr = re.sub(r'^\$\{\{|\}\}$', '', expr).strip()
+
+def gate(status, zero, event, route_failure):
+    """Evaluate the GitHub Actions `if:` expression for one context tuple."""
+    e = expr
+    # Status functions are exactly their job.status equivalents. Substituting
+    # all three (rather than only always()) keeps this evaluator valid for the
+    # whole grammar this gate can legally use, so a future `!cancelled()` or
+    # `success()` fails the EXHAUSTIVENESS check below on its merits instead of
+    # dying in a SyntaxError that reads as a broken test.
+    e = e.replace('always()', 'True')
+    e = re.sub(r'\bsuccess\(\)', repr(status == 'success'), e)
+    e = re.sub(r'\bfailure\(\)', repr(status == 'failure'), e)
+    e = re.sub(r'\bcancelled\(\)', repr(status == 'cancelled'), e)
+    e = re.sub(r'\bjob\.status\b', repr(status), e)
+    e = re.sub(r'\benv\.ZERO_DATA\b', repr(zero), e)
+    e = re.sub(r'\bgithub\.event_name\b', repr(event), e)
+    e = re.sub(r'\binputs\.route_failure\b', repr(route_failure), e)
+    e = e.replace('&&', ' and ').replace('||', ' or ')
+    e = re.sub(r'!(?![=])', ' not ', e)
+    # Any context or status function we did not substitute would silently
+    # NameError; surface it as a failure rather than a crash.
+    return bool(eval(e, {'__builtins__': {}}, {}))
+
+bad = []
+try:
+    # A. THE ONE THAT MATTERS. Arms exhaustive over every non-success end of a
+    #    scheduled run. ZERO_DATA=1 is the relay verdict, '' is a detector
+    #    death; `cancelled` is what `timeout-minutes` produces (run
+    #    36207352472) and `failure` is every other bad exit.
+    for status in ('failure', 'cancelled'):
+        for zero in ('1', ''):
+            if not gate(status, zero, 'schedule', False):
+                bad.append(f"scheduled job.status={status} ZERO_DATA={zero!r}: routes NOTHING")
+    # B. A green scheduled run must stay silent, or the detector cries wolf.
+    if gate('success', '', 'schedule', False):
+        bad.append("green scheduled run routes an alert")
+    # C. An unopted dispatch must stay silent -- this is the spam guard
+    #    `route_failure` exists for, and every measurement run trips it.
+    for status in ('failure', 'cancelled'):
+        if gate(status, '1', 'workflow_dispatch', False):
+            bad.append(f"dispatch route_failure=false job.status={status}: routes an alert")
+    # D. An opted dispatch with a real zero-data verdict must route, including
+    #    after a cancellation: the verdict precedes it and is not retracted.
+    for status in ('failure', 'cancelled'):
+        if not gate(status, '1', 'workflow_dispatch', True):
+            bad.append(f"dispatch route_failure=true job.status={status} ZERO_DATA=1: routes NOTHING")
+except Exception as exc:
+    bad.append(f"gate is not evaluable ({exc.__class__.__name__}: {exc}); unsubstituted context?")
+
+if bad:
+    print("FAIL  route gate arms are not exhaustive over job.status != 'success'")
+    for b in bad:
+        print(f"      - {b}")
+    print(f"      gate: {expr}")
+    sys.exit(1)
+print("PASS  route gate routes exactly one row for every non-success scheduled end")
+PY
+
 [ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }
