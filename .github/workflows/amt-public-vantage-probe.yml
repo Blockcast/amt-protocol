@@ -621,9 +621,14 @@ jobs:
       # status function anywhere in the expression the runner prepends an
       # implicit `success() &&` and the step never runs on a bad end at all.
       #
-      # The event guard is what makes `always()` safe: a SCHEDULED run has no
-      # human to hand-cancel, so on `schedule` a cancellation is a timeout.
-      # An unopted dispatch (`route_failure` false) still routes nothing.
+      # The event guard is what makes `always()` safe. On `schedule` a
+      # cancellation is EITHER a timeout or a deliberate cancel (the Actions
+      # UI, `gh run cancel`, and a bulk cancel during an incident all reach a
+      # scheduled run), and filing on both is the conservative direction: the
+      # spurious case is one `[amt-probe][infra]` row that the next green
+      # scheduled run closes ~15 min later, against a wedged detector that
+      # would otherwise file nothing. An unopted dispatch (`route_failure`
+      # false) still routes nothing.
       #
       # ⚠ NO `job.status != 'cancelled'` ON THE ZERO-DATA ARM. Ally review at
       # head d1c80d2, Important (1). The arms are mutually exclusive on
@@ -708,9 +713,8 @@ jobs:
       # `job.status != 'success' && env.ZERO_DATA != '1'` is true for any
       # non-verdict bad end, and those are third-party-network steps: ipify in
       # the vantage receipt, actions/checkout, the ghcr login, upload-artifact.
-      # The cron
-      # fires 96x/day on hosted runners, so a blip inside the first few days is
-      # close to certain. Once one files `[amt-probe][infra] ...`, the exact
+      # The cron fires 96x/day on hosted runners, so a blip inside the first
+      # few days is close to certain. Once one files `[amt-probe][infra] ...`, the exact
       # title dedup above routes every LATER detector death to `gh issue
       # comment` on that stale row -- so a persistent death (ghcr token expiry,
       # runner-image change) shows up as another comment on a weeks-old row
