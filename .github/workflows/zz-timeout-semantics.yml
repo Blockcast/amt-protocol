@@ -1,0 +1,18 @@
+name: zz timeout semantics (throwaway)
+on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: stall past the job timeout
+        run: sleep 300
+      - name: arm failure()
+        if: ${{ failure() }}
+        run: echo "ARM=failure job.status=${{ job.status }}"
+      - name: arm cancelled()
+        if: ${{ cancelled() }}
+        run: echo "ARM=cancelled job.status=${{ job.status }}"
+      - name: arm always()+job.status!=success
+        if: ${{ always() && job.status != 'success' }}
+        run: echo "ARM=always-notsuccess job.status=${{ job.status }}"
