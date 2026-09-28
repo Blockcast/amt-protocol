@@ -407,11 +407,16 @@ jobs:
           #    via source ports, so k is NOT 1 and fan-out from a single runner
           #    becomes measurable.
           #
-          # EVERY relay deployed today is still pre-fix -- prod .128
-          # `amtr:sha-f21f60e6` and staging .96 `amtr:sha-d20b2e04` are both
-          # ancestors of 7ec53567 (confirmed by `compare`, behind_by 24 and 14).
-          # So k=1 remains correct, and the VOID is the finding, not a defect:
-          # the unblock lever is a RELAY DEPLOY, not a runner topology change.
+          # ⚠ THE "every relay is pre-fix" PREMISE EXPIRED 2026-09-28. Prod .128
+          # was rolled onto the endpoint-key module at 18:57Z (BLO-34416; amt
+          # srcversion 816FB7EE48A5DB9F6081D0D on k8s-data-2), and run
+          # 36474867098 then took 68,487 / 68,487 / 68,462 packets on THREE
+          # concurrent tunnels from ONE public address -- i.e. k=3, measured.
+          # Staging .96 is NOT known rolled, and the prod relay pod can
+          # reschedule onto a still-unrolled node (data-1/3/4 are relay-eligible
+          # and unrolled as of 2026-09-28), so k is a per-run property now, not
+          # a constant. K below therefore stays 1 as a TELEMETRY floor only; the
+          # VOID verdict is taken from what the run measured, not from it.
           #
           # ⚠ When that deploy lands, k is bounded by the relay, NOT by the rig:
           # `AMT_MAX_TUNNELS_PER_SOURCE` defaults to 16 (amt.h:573; global
@@ -542,8 +547,24 @@ jobs:
           # The launch telemetry above (tunnels_requested, ulimit_n_*, nproc,
           # per-tunnel exits) stays valid as a HARNESS-ceiling reading, and
           # receipts still upload via `if: always()`.
-          if [ "$TUNNELS" -gt "$K" ]; then
-            echo "::error::VOID as a relay result: rig presents k=$K distinct tunnel endpoint(s), $TUNNELS tunnels requested. Relays built before linux-amt 7ec53567 key tunnel state on source address alone, so this run cannot establish fan-out; every relay deployed today is pre-fix. The lever is a relay deploy carrying 7ec53567, after which k is the deployed relay's AMT_MAX_TUNNELS_PER_SOURCE (default 16) -- not a runner topology change. Harness-ceiling telemetry above is still valid."
+          # ⚠ VOID is now decided by MEASUREMENT, not by a hardcoded k. The old
+          # form was `TUNNELS -gt K` with K pinned to 1, which encoded the
+          # premise "every deployed relay is pre-fix". That premise died on
+          # 2026-09-28 and the guard then failed the very run that disproved it:
+          # 36474867098 printed `tunnels_receiving=3/3` and still exited 91,
+          # citing a pre-fix relay, against data showing the relay is not.
+          #
+          # `ok` is the count of tunnels that actually received data, so ok >= 2
+          # IS the demonstration that one source address presented more than one
+          # endpoint -- no version lookup, no per-relay table, nothing to rot.
+          # VOID now fires only when fan-out was NOT demonstrated (ok <= 1 with
+          # TUNNELS > 1), which is exactly the case where "harness ceiling" and
+          # "relay keys on address alone" are indistinguishable and the
+          # misattribution below is possible. Where ok is 2..TUNNELS-1 there is
+          # a real partial knee, and the packet_count verdict downstream is the
+          # honest report of it.
+          if [ "$TUNNELS" -gt 1 ] && [ "$ok" -le 1 ]; then
+            echo "::error::VOID as a relay result: $TUNNELS tunnels requested from k=$K source address(es), but only $ok received data -- so no fan-out was established and this run cannot distinguish a harness ceiling from a relay that keys tunnel state on source ADDRESS alone (pre-linux-amt-7ec53567 behaviour). Check the relay the pod is actually on: an unrolled node reproduces exactly this. Harness-ceiling telemetry above is still valid."
             exit 91
           fi
           # A probe that cannot fail is not a probe: surface the client's verdict
