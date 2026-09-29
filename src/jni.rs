@@ -390,6 +390,35 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeSendTeardown<
     }
 }
 
+/// Teardown owed after a Membership Query that reported a new gateway endpoint
+///
+/// JNI signature: (J)[B
+/// Returns the encoded Teardown RFC 7450 §5.2.3.7.1 requires once the relay's
+/// Query reports a gateway endpoint other than the one the last Membership
+/// Update was sent from, or null when none is owed. Call after
+/// nativeHandleQuery and before the nativeSendUpdate answering that Query,
+/// and send the Teardown to the relay first. The gateway state is unchanged.
+#[no_mangle]
+pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeRebindTeardown<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+) -> jbyteArray {
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+
+    let gw = unsafe { from_handle(handle) };
+
+    match gw.rebind_teardown() {
+        Some(msg) => match env.byte_array_from_slice(&msg.encode()) {
+            Ok(arr) => arr.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Reset gateway to idle state
 ///
 /// JNI signature: (J)V

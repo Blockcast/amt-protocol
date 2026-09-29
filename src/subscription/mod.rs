@@ -300,6 +300,20 @@ impl<P: Platform> SubscriptionManager<P> {
             self.out_queue.push_back(Event::Warning(e));
             return Ok(());
         }
+        // RFC 7450 §5.2.3.7.1: a Query reporting a gateway endpoint other than
+        // the one the last Update was sent from means the relay still forwards
+        // to the tunnel at the old one. Tear it down ahead of the Update that
+        // creates the tunnel at the new one (Figure 8), and before building
+        // that Update, which makes this Query the one a Teardown copies.
+        if let Some(teardown) = self.inner.rebind_teardown() {
+            let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
+            self.out_queue.push_back(Event::Transmit {
+                dst: relay,
+                port: self.inner.relay_port(),
+                payload: teardown.encode(),
+                keepalive: false,
+            });
+        }
         if initial_handshake {
             // Flush pending into groups map only when the tunnel first becomes active.
             while let Some(key) = self.pending.pop_front() {
@@ -313,7 +327,9 @@ impl<P: Platform> SubscriptionManager<P> {
         // already enqueued the Update for transmission by the time they see
         // the signal. Consumers that want "tunnel is up AND Update sent"
         // semantics get exactly that. Flipping this order would let a consumer
-        // gate on HandshakeComplete and then drop the Update.
+        // gate on HandshakeComplete and then drop the Update. A Teardown owed
+        // above precedes the Update, but is never owed on the initial
+        // handshake: no Update was sent before it, so no tunnel exists yet.
         //
         // Nothing else depends on this order. In particular the keep-alive
         // witness does not: the Update carries its own `keepalive` label.
@@ -962,6 +978,12 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, Event::HandshakeComplete)));
+        assert!(
+            !events.iter().any(
+                |event| matches!(event, Event::Transmit { payload, .. } if payload[0] == 0x07)
+            ),
+            "a Query from the same endpoint owes no Teardown: {events:?}"
+        );
         let update = events
             .iter()
             .find_map(|event| match event {
@@ -982,6 +1004,91 @@ mod tests {
             }
             _ => panic!("Expected MembershipUpdate"),
         }
+    }
+
+    /// RFC 7450 §5.2.3.7.1, Figure 8 [5]-[7]: a Query while Active that
+    /// reports a new gateway endpoint gets a Teardown for the tunnel at the
+    /// old one -- the nonce, MAC and endpoint of the Query the last Update
+    /// answered -- sent to the relay ahead of the Update answering the new
+    /// Query, and no second HandshakeComplete. The shutdown Teardown after
+    /// that names the new endpoint, where the tunnel now is.
+    #[test]
+    fn active_query_reporting_a_new_endpoint_tears_down_the_old_one_first() {
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        let request_nonce = drive_to_active(&mut m, key);
+        let moved = GatewayAddress::from(
+            "198.51.100.7:40002"
+                .parse::<std::net::SocketAddr>()
+                .unwrap(),
+        );
+        let moved_mac = [6, 5, 4, 3, 2, 1];
+        let query = AmtMessage::MembershipQuery {
+            request_nonce,
+            response_mac: moved_mac,
+            query_data: vec![0x11; 12],
+            gateway_address: Some(moved),
+        };
+
+        m.handle_datagram(&query.encode(), 1300).unwrap();
+
+        assert_eq!(m.state(), GatewayState::Active);
+        let events = drain(&mut m);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::HandshakeComplete)));
+        let sent: Vec<AmtMessage> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Transmit {
+                    dst,
+                    port,
+                    payload,
+                    keepalive,
+                } => {
+                    assert_eq!(*dst, m.relay_address().unwrap());
+                    assert_eq!(*port, m.relay_port());
+                    assert_eq!(*keepalive, payload[0] == 0x05, "{payload:?}");
+                    Some(AmtMessage::decode(payload).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent.len(), 2, "a Teardown, then the Update: {sent:?}");
+        assert_eq!(
+            sent[0],
+            AmtMessage::Teardown {
+                request_nonce,
+                response_mac: [0; 6],
+                gateway_address: relay_observed_gateway(),
+            }
+        );
+        match &sent[1] {
+            AmtMessage::MembershipUpdate { response_mac, .. } => {
+                assert_eq!(*response_mac, moved_mac)
+            }
+            other => panic!("Expected MembershipUpdate, got {other:?}"),
+        }
+
+        m.shutdown(1400).unwrap();
+        let teardown = drain(&mut m)
+            .into_iter()
+            .find_map(|event| match event {
+                Event::Transmit { payload, .. } if payload[0] == 0x07 => Some(payload),
+                _ => None,
+            })
+            .expect("expected the shutdown Teardown");
+        assert_eq!(
+            AmtMessage::decode(&teardown).unwrap(),
+            AmtMessage::Teardown {
+                request_nonce,
+                response_mac: moved_mac,
+                gateway_address: moved,
+            }
+        );
     }
 
     fn synth_v4_udp_packet(

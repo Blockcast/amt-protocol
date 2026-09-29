@@ -620,6 +620,50 @@ pub unsafe extern "C" fn amt_gateway_send_teardown(
     }
 }
 
+/// Teardown owed after a Membership Query that reported a new gateway
+/// endpoint
+///
+/// RFC 7450 §5.2.3.7.1: when the relay's Query reports a gateway endpoint
+/// other than the one the last Membership Update was sent from (a NAT
+/// rebinding, say), the relay still forwards to the tunnel at the old one.
+/// The Teardown returned here names that endpoint, with the nonce and MAC of
+/// the Query behind the last Update, so the relay stops that tunnel and not
+/// the one the next Update creates. Call this after `amt_gateway_handle_query`
+/// and before the `amt_gateway_send_update` answering that Query, and send
+/// the Teardown, if any, to the relay first. The gateway state is unchanged.
+///
+/// # Arguments
+/// - `handle`: Gateway handle
+/// - `out_message`: Pointer to receive the encoded Teardown, or a null buffer
+///   (`data` null, `len` 0) when none is owed
+///
+/// # Returns
+/// `Ok` whether or not a Teardown is owed
+///
+/// # Safety
+/// `handle` must be a valid handle returned by this library, and `out_message`
+/// must be valid for writing one buffer.
+#[no_mangle]
+pub unsafe extern "C" fn amt_gateway_rebind_teardown(
+    handle: AmtGatewayHandle,
+    out_message: *mut AmtBuffer,
+) -> AmtResult {
+    if handle.is_null() || out_message.is_null() {
+        return AmtResult::NullPointer;
+    }
+
+    let gateway = unsafe { &*(handle as *const AmtGateway<FfiPlatform>) };
+    let teardown = match gateway.rebind_teardown() {
+        Some(msg) => AmtBuffer::from_vec(msg.encode()),
+        None => AmtBuffer::null(),
+    };
+
+    unsafe {
+        *out_message = teardown;
+    }
+    AmtResult::Ok
+}
+
 /// Reset gateway to idle state
 ///
 /// # Arguments
@@ -870,4 +914,112 @@ pub unsafe extern "C" fn amt_igmp_ssm_join_multi(
 pub extern "C" fn amt_version() -> *const c_char {
     static VERSION: &[u8] = b"0.1.0\0";
     VERSION.as_ptr() as *const c_char
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::messages::GatewayAddress;
+
+    /// The bytes of a buffer this library returned, freeing it; `None` for a
+    /// null buffer.
+    fn take(buffer: AmtBuffer) -> Option<Vec<u8>> {
+        if buffer.data.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        unsafe { amt_buffer_free(buffer) };
+        Some(bytes)
+    }
+
+    fn call(f: impl FnOnce(*mut AmtBuffer) -> AmtResult) -> Option<Vec<u8>> {
+        let mut out = AmtBuffer::null();
+        assert_eq!(f(&mut out), AmtResult::Ok);
+        take(out)
+    }
+
+    fn query(nonce: u32, mac: [u8; 6], gateway_address: GatewayAddress) -> Vec<u8> {
+        AmtMessage::MembershipQuery {
+            request_nonce: nonce,
+            response_mac: mac,
+            query_data: vec![0x11; 12],
+            gateway_address: Some(gateway_address),
+        }
+        .encode()
+    }
+
+    /// go-amt's keepalive cycle (Request, Query, Update) over the C ABI. After
+    /// a Query that reports a new endpoint, `amt_gateway_rebind_teardown`
+    /// returns the RFC 7450 §5.2.3.7.1 Teardown for the old one until the
+    /// Update answering that Query is built, and a null buffer otherwise.
+    #[test]
+    fn rebind_teardown_over_the_c_abi() {
+        let relay = CString::new("192.0.2.1").unwrap();
+        let mut handle: AmtGatewayHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { amt_gateway_new(relay.as_ptr(), 0, false, &mut handle) },
+            AmtResult::Ok
+        );
+
+        let request = call(|out| unsafe { amt_gateway_request_membership(handle, false, out) })
+            .expect("a Request");
+        let nonce = match AmtMessage::decode(&request).unwrap() {
+            AmtMessage::Request { request_nonce, .. } => request_nonce,
+            other => panic!("Expected Request, got {other:?}"),
+        };
+
+        let tunnel =
+            GatewayAddress::from("203.0.113.9:40001".parse::<std::net::SocketAddr>().unwrap());
+        let tunnel_mac = [1, 2, 3, 4, 5, 6];
+        let initial = query(nonce, tunnel_mac, tunnel);
+        call(|out| unsafe {
+            amt_gateway_handle_query(handle, initial.as_ptr(), initial.len(), out)
+        });
+        assert_eq!(
+            call(|out| unsafe { amt_gateway_rebind_teardown(handle, out) }),
+            None,
+            "no tunnel before the first Update"
+        );
+        let report = [0x22];
+        call(|out| unsafe { amt_gateway_send_update(handle, report.as_ptr(), report.len(), out) });
+
+        call(|out| unsafe { amt_gateway_request_membership(handle, false, out) });
+        let moved =
+            GatewayAddress::from("203.0.113.9:40002".parse::<std::net::SocketAddr>().unwrap());
+        let moved_query = query(nonce, [6, 5, 4, 3, 2, 1], moved);
+        call(|out| unsafe {
+            amt_gateway_handle_query(handle, moved_query.as_ptr(), moved_query.len(), out)
+        });
+        let teardown = call(|out| unsafe { amt_gateway_rebind_teardown(handle, out) })
+            .expect("a Teardown for the old endpoint");
+        assert_eq!(
+            AmtMessage::decode(&teardown).unwrap(),
+            AmtMessage::Teardown {
+                request_nonce: nonce,
+                response_mac: tunnel_mac,
+                gateway_address: tunnel,
+            }
+        );
+        assert_eq!(
+            unsafe { amt_gateway_state(handle) },
+            AmtGatewayState::Querying
+        );
+
+        call(|out| unsafe { amt_gateway_send_update(handle, report.as_ptr(), report.len(), out) });
+        assert_eq!(
+            call(|out| unsafe { amt_gateway_rebind_teardown(handle, out) }),
+            None,
+            "nothing owed once the Update from the new endpoint is built"
+        );
+
+        assert_eq!(
+            unsafe { amt_gateway_rebind_teardown(ptr::null_mut(), &mut AmtBuffer::null()) },
+            AmtResult::NullPointer
+        );
+        assert_eq!(
+            unsafe { amt_gateway_rebind_teardown(handle, ptr::null_mut()) },
+            AmtResult::NullPointer
+        );
+        unsafe { amt_gateway_free(handle) };
+    }
 }

@@ -33,6 +33,31 @@ pub enum GatewayState {
     Closed,
 }
 
+/// The Request Nonce, Response MAC and Gateway Address fields of one
+/// Membership Query: what a later Membership Update or Teardown copies from it
+/// (RFC 7450 §5.2.3.5.4). `gateway_address` is `None` when that Query left the
+/// G flag unset.
+#[derive(Debug, Clone, Copy)]
+struct QueryFields {
+    request_nonce: u32,
+    response_mac: [u8; 6],
+    gateway_address: Option<GatewayAddress>,
+}
+
+impl QueryFields {
+    /// The Teardown that copies this Query (RFC 7450 §5.2.3.7.2), or `None`
+    /// when it lacked the Gateway Address fields the relay authenticates a
+    /// Teardown against (§5.3.3.5).
+    fn teardown(&self) -> Option<AmtMessage> {
+        self.gateway_address
+            .map(|gateway_address| AmtMessage::Teardown {
+                request_nonce: self.request_nonce,
+                response_mac: self.response_mac,
+                gateway_address,
+            })
+    }
+}
+
 /// Multicast group identifier
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GroupKey {
@@ -93,6 +118,14 @@ pub struct AmtGateway<P: Platform> {
     /// §5.2.3.7.2), and the relay authenticates the three together.
     gateway_address: Option<GatewayAddress>,
 
+    /// The fields of the Membership Query that provided the Response MAC for
+    /// the last Membership Update sent, recorded by `send_update`. A Teardown
+    /// copies these (§5.2.3.7.2), not the latest Query's. The two differ from
+    /// `handle_query` until the `send_update` answering it: then the latest
+    /// Query may report a new gateway endpoint while the relay still forwards
+    /// to the tunnel these name, which is what `rebind_teardown` tears down.
+    last_update_query: Option<QueryFields>,
+
     /// Active multicast group memberships
     groups: HashMap<GroupKey, GroupInfo>,
 
@@ -113,6 +146,7 @@ impl<P: Platform> AmtGateway<P> {
             request_nonce: None,
             response_mac: None,
             gateway_address: None,
+            last_update_query: None,
             groups: HashMap::new(),
             p_flag: false,
         }
@@ -238,16 +272,17 @@ impl<P: Platform> AmtGateway<P> {
     /// indefinitely once started"* as licensing reuse. It does not — that
     /// sentence is about the cycle persisting, not about nonce identity.)
     ///
-    /// We deviate because `request_nonce` is a single slot with three
-    /// readers: `handle_query` matches the incoming Query against it, and
-    /// `send_update` and `send_teardown` stamp outgoing messages with it.
-    /// §4.2.1.2 step 5 and §5.2.3.5.4 require those two to carry the
-    /// nonce/MAC of the *last Membership Query received*, so minting here
-    /// would invalidate any Update built between this Request and the Query
-    /// answering it. Reuse is the lesser wrong until the field is split into
-    /// a pending request nonce (matched by `handle_query`) plus the
-    /// last-confirmed nonce/MAC pair that Updates and Teardowns keep using.
-    /// That split is the real fix, tracked in BLO-29418.
+    /// We deviate because `request_nonce` is a single slot with two readers:
+    /// `handle_query` matches the incoming Query against it, and
+    /// `send_update` stamps outgoing Updates with it. (A Teardown copies the
+    /// nonce the last Update carried, recorded in `last_update_query`, so it
+    /// is unaffected by what the slot holds.) §4.2.1.2 step 5 and §5.2.3.5.4
+    /// require an Update to carry the nonce/MAC of the *last Membership Query
+    /// received*, so minting here would invalidate any Update built between
+    /// this Request and the Query answering it. Reuse is the lesser wrong
+    /// until the field is split into a pending request nonce (matched by
+    /// `handle_query`) plus the last-received Query's nonce/MAC pair that
+    /// Updates keep using. That split is the real fix, tracked in BLO-29418.
     ///
     /// # Data during the round trip
     ///
@@ -304,7 +339,10 @@ impl<P: Platform> AmtGateway<P> {
     /// `gateway_address` is the Query's Gateway Address fields, `None` when
     /// its G flag is unset. It replaces the stored value together with the
     /// MAC, so a Query without the fields also clears any a previous Query
-    /// supplied: they described a different MAC.
+    /// supplied: they described a different MAC. What the last Update was
+    /// built from is kept apart, so a Query reporting a new endpoint leaves
+    /// the old one available to `rebind_teardown`: call that next, before the
+    /// `send_update` answering this Query.
     pub fn handle_query(
         &mut self,
         request_nonce: u32,
@@ -360,6 +398,13 @@ impl<P: Platform> AmtGateway<P> {
         let request_nonce = self.request_nonce.ok_or(AmtError::InvalidState)?;
         let response_mac = self.response_mac.ok_or(AmtError::NoResponseMac)?;
 
+        // This Query now provides the MAC for the last Update sent: from here
+        // on a Teardown copies it (§5.2.3.7.2).
+        self.last_update_query = Some(QueryFields {
+            request_nonce,
+            response_mac,
+            gateway_address: self.gateway_address,
+        });
         self.state = GatewayState::Active;
 
         Ok(AmtMessage::MembershipUpdate {
@@ -407,8 +452,9 @@ impl<P: Platform> AmtGateway<P> {
     /// Returns the Teardown to send to the relay (RFC 7450 §5.2.3.7.2). It
     /// copies the Request Nonce, Response MAC and Gateway Address fields of
     /// the Membership Query that provided the MAC for the last Membership
-    /// Update -- the Query `handle_query` stored last, since reaching `Active`
-    /// takes a `send_update` after it.
+    /// Update, as `send_update` recorded them. Reaching `Active` takes a
+    /// `send_update` after the latest Query, so here that is also the latest
+    /// Query.
     ///
     /// Fails with [`AmtError::NoGatewayAddress`] when that Query did not carry
     /// the Gateway Address fields. The relay authenticates a Teardown against
@@ -421,17 +467,54 @@ impl<P: Platform> AmtGateway<P> {
             return Err(AmtError::InvalidState);
         }
 
-        let request_nonce = self.request_nonce.ok_or(AmtError::InvalidState)?;
-        let response_mac = self.response_mac.ok_or(AmtError::NoResponseMac)?;
-        let gateway_address = self.gateway_address.ok_or(AmtError::NoGatewayAddress)?;
+        let behind_last_update = self.last_update_query.ok_or(AmtError::InvalidState)?;
+        let teardown = behind_last_update
+            .teardown()
+            .ok_or(AmtError::NoGatewayAddress)?;
 
         self.state = GatewayState::Closed;
 
-        Ok(AmtMessage::Teardown {
-            request_nonce,
-            response_mac,
-            gateway_address,
-        })
+        Ok(teardown)
+    }
+
+    /// The Teardown owed once a Membership Query reports a gateway endpoint
+    /// other than the one the last Membership Update was sent from (RFC 7450
+    /// §5.2.3.7.1), or `None` when none is owed.
+    ///
+    /// A relay that supports Teardown reports, in every Query with the G flag
+    /// set, the source address and port of the Request that Query answers
+    /// (§5.1.4.9). A different value means this gateway's endpoint moved --
+    /// a NAT rebinding, or an interface or address change -- while the relay
+    /// still forwards to the tunnel the last Update created at the old one
+    /// (§4.2.1.3). This Teardown copies the Query behind that Update
+    /// (§5.2.3.7.2), so the relay authenticates it against the old endpoint
+    /// and stops that tunnel, not the one the next Update creates.
+    ///
+    /// Call it after `handle_query` and before the `send_update` answering
+    /// the Query, and send the Teardown to the relay first (Figure 8). It
+    /// changes no state, so asking again returns the same Teardown, which may
+    /// be resent (§5.2.3.7.2). `send_update` records the new Query as the one
+    /// behind the last Update, and from then on nothing is owed.
+    ///
+    /// The comparison is with the Query behind the last Update. That is the
+    /// previous Query §5.2.3.7.1 names whenever each Query is answered by an
+    /// Update, and it is the endpoint the relay is forwarding to. Nothing is
+    /// owed when either Query lacks the Gateway Address fields: without the
+    /// old ones no Teardown could pass the relay's check (§5.3.3.5), and one
+    /// without the new ones has no G flag, which §5.2.3.7.1 requires.
+    /// §5.2.3.7.1 also limits the MUST to a gateway that "has reported active
+    /// group subscriptions". Reports are opaque here, so a Teardown is owed
+    /// after any Update; where that Update reported none, the relay processes
+    /// it as a report deleting every group record of an endpoint that has
+    /// none (§5.3.3.5), which changes nothing.
+    pub fn rebind_teardown(&self) -> Option<AmtMessage> {
+        let behind_last_update = self.last_update_query?;
+        let tunnel_endpoint = behind_last_update.gateway_address?;
+        let reported_endpoint = self.gateway_address?;
+        if reported_endpoint == tunnel_endpoint {
+            return None;
+        }
+        behind_last_update.teardown()
     }
 
     /// Reset gateway to idle state
@@ -441,6 +524,7 @@ impl<P: Platform> AmtGateway<P> {
         self.request_nonce = None;
         self.response_mac = None;
         self.gateway_address = None;
+        self.last_update_query = None;
         self.groups.clear();
     }
 }
@@ -942,11 +1026,14 @@ mod tests {
         assert_eq!(result, ip_packet);
     }
 
-    /// RFC 7450 §5.2.3.7.2: a Teardown copies the Request Nonce, Response MAC
-    /// and Gateway Address fields of the Query that provided the MAC for the
-    /// LAST Membership Update. After a NAT rebind the relay re-Queries with the
-    /// new endpoint and a new MAC; pairing either with the first Query's values
-    /// would fail the relay's check (§5.3.3.5).
+    /// RFC 7450 §5.2.3.7.2, at shutdown: a Teardown copies the Request Nonce,
+    /// Response MAC and Gateway Address fields of the Query that provided the
+    /// MAC for the LAST Membership Update. Once the Update answering a Query
+    /// that reported a new endpoint has gone out, the tunnel lives at that
+    /// endpoint and its Query is the one to copy; pairing either value with
+    /// the first Query's would fail the relay's check (§5.3.3.5). Tearing
+    /// down the old endpoint when the move is reported is a different
+    /// Teardown: `a_query_reporting_a_new_endpoint_owes_a_teardown_for_the_old_one`.
     #[test]
     fn teardown_copies_the_query_behind_the_last_update() {
         let mut gw = AmtGateway::new(test_config(), test_platform());
@@ -1002,5 +1089,110 @@ mod tests {
         gw.send_update(vec![0x44]).unwrap();
 
         assert_eq!(gw.send_teardown(), Err(AmtError::NoGatewayAddress));
+    }
+
+    /// RFC 7450 §5.2.3.7.1, Figure 8 [5]-[7]: a Query reporting a different
+    /// Gateway IP Address or Port Number means the relay still forwards to
+    /// the tunnel at the old endpoint. The Teardown owed names that endpoint
+    /// with the nonce and MAC of the Query behind the last Update -- what the
+    /// relay authenticates it against (§5.3.3.5) -- and is owed until the
+    /// Update answering the new Query is built, which it leaves untouched.
+    #[test]
+    fn a_query_reporting_a_new_endpoint_owes_a_teardown_for_the_old_one() {
+        let tunnel = relay_observed("203.0.113.9:40001");
+        // A NAT rebinding usually keeps the address and moves the port; an
+        // interface change moves the address. §5.2.3.7.1 covers "either".
+        for moved in [
+            relay_observed("203.0.113.9:40002"),
+            relay_observed("[2001:db8::9]:40001"),
+        ] {
+            let mut gw = AmtGateway::new(test_config(), test_platform());
+            let tunnel_mac = [1, 2, 3, 4, 5, 6];
+            let request_nonce = drive_to_active(&mut gw, tunnel_mac, Some(tunnel));
+            assert_eq!(gw.rebind_teardown(), None, "no Query has reported a move");
+
+            gw.request_membership(false).unwrap();
+            let moved_mac = [6, 5, 4, 3, 2, 1];
+            gw.handle_query(request_nonce, moved_mac, vec![0x33], Some(moved))
+                .unwrap();
+
+            let owed = Some(AmtMessage::Teardown {
+                request_nonce,
+                response_mac: tunnel_mac,
+                gateway_address: tunnel,
+            });
+            assert_eq!(gw.rebind_teardown(), owed, "moved to {moved:?}");
+            assert_eq!(gw.rebind_teardown(), owed, "asking again changes nothing");
+            assert_eq!(gw.state(), GatewayState::Querying);
+
+            match gw.send_update(vec![0x44]).unwrap() {
+                AmtMessage::MembershipUpdate { response_mac, .. } => {
+                    assert_eq!(response_mac, moved_mac, "the Update answers the new Query")
+                }
+                other => panic!("Expected MembershipUpdate, got {other:?}"),
+            }
+            assert_eq!(
+                gw.rebind_teardown(),
+                None,
+                "the tunnel is at the new endpoint once its Update is built"
+            );
+        }
+    }
+
+    /// Only a changed Gateway IP Address or Port Number owes a Teardown
+    /// (§5.2.3.7.1): not a new MAC from the same endpoint, and not a pair of
+    /// Queries either of which lacks the fields. Without the old ones no
+    /// Teardown could pass the relay's check (§5.3.3.5); a Query without the
+    /// new ones has no G flag, which §5.2.3.7.1 requires.
+    #[test]
+    fn no_teardown_is_owed_unless_a_query_reports_a_move() {
+        let endpoint = relay_observed("203.0.113.9:40001");
+        for (before, after) in [
+            (Some(endpoint), Some(endpoint)),
+            (None, Some(endpoint)),
+            (Some(endpoint), None),
+        ] {
+            let mut gw = AmtGateway::new(test_config(), test_platform());
+            let request_nonce = drive_to_active(&mut gw, [1, 2, 3, 4, 5, 6], before);
+
+            gw.request_membership(false).unwrap();
+            gw.handle_query(request_nonce, [6, 5, 4, 3, 2, 1], vec![0x33], after)
+                .unwrap();
+            assert_eq!(gw.rebind_teardown(), None, "{before:?} then {after:?}");
+        }
+    }
+
+    /// Before any Update there is no tunnel to tear down, whatever the Query
+    /// reports, and `reset` forgets the last one.
+    #[test]
+    fn no_teardown_is_owed_without_an_update_behind_it() {
+        let mut gw = AmtGateway::new(test_config(), test_platform());
+        let request_nonce = match gw.request_membership(false).unwrap() {
+            AmtMessage::Request { request_nonce, .. } => request_nonce,
+            _ => panic!("Expected Request"),
+        };
+        gw.handle_query(
+            request_nonce,
+            [1, 2, 3, 4, 5, 6],
+            vec![0x11],
+            Some(relay_observed("203.0.113.9:40001")),
+        )
+        .unwrap();
+        assert_eq!(gw.rebind_teardown(), None, "first Query of the tunnel");
+
+        gw.send_update(vec![0x22]).unwrap();
+        gw.reset();
+        let request_nonce = match gw.request_membership(false).unwrap() {
+            AmtMessage::Request { request_nonce, .. } => request_nonce,
+            _ => panic!("Expected Request"),
+        };
+        gw.handle_query(
+            request_nonce,
+            [6, 5, 4, 3, 2, 1],
+            vec![0x11],
+            Some(relay_observed("203.0.113.9:40002")),
+        )
+        .unwrap();
+        assert_eq!(gw.rebind_teardown(), None, "first Query after reset");
     }
 }

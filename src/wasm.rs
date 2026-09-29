@@ -271,6 +271,20 @@ impl JsAmtGateway {
         Ok(msg.encode())
     }
 
+    /// Teardown owed after a Membership Query that reported a new gateway
+    /// endpoint
+    ///
+    /// Returns the encoded Teardown RFC 7450 §5.2.3.7.1 requires as a
+    /// Uint8Array once the relay's Query reports a gateway endpoint other than
+    /// the one the last Membership Update was sent from, or undefined when
+    /// none is owed. Call after `handleQuery` and before the `sendUpdate`
+    /// answering that Query, and send the Teardown to the relay first. The
+    /// gateway state is unchanged.
+    #[wasm_bindgen(js_name = rebindTeardown)]
+    pub fn rebind_teardown(&self) -> Option<Vec<u8>> {
+        self.inner.rebind_teardown().map(|msg| msg.encode())
+    }
+
     /// Reset gateway to idle state
     #[wasm_bindgen]
     pub fn reset(&mut self) {
