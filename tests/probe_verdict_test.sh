@@ -125,9 +125,23 @@ ec=$(echo "$EXIT_LIST" | cut -d, -f"$n")
 #   reorder = a REORDERING receipt: clean implausible, clean numeric
 #          loss_ratio, correct source/group, full packet_count -- and
 #          in_sequence at half of it. Every other guard passes, so the
-#          in_sequence ratio guard is the only one that can fire. Shaped after
-#          the live receipt on run 36613263318 (BLO-33636), which reported
-#          loss_ratio 0.3242 while receiving MORE packets than its peers.
+#          in_sequence ratio guard is the only one that can fire. It is the
+#          live receipt on run 36613263318 (BLO-33636, artifact
+#          amt-verify-receipt) verbatim: loss_ratio 0.32420171254357943, 9
+#          tracks, in_sequence 34115, received 46328 -- pair it with
+#          packet_count 67248, MORE than its peers received.
+#   clean<T> = a perfectly clean T-track stream: in_sequence = packet_count - T,
+#          because a track's first arrival is never in-sequence (amt-verify
+#          SeqTracker::observe), and received = packet_count. The shape a
+#          short sample really has.
+#   lost<G> = one track, G single-packet gaps: received = packet_count (a
+#          gap-ending arrival IS received), in_sequence = packet_count - 1 - G,
+#          loss_ratio = G / (G + received) as amt-verify computes it.
+#   inseq<I> = 9 tracks, in_sequence I, received 9 + I, loss 0: a REORDERING
+#          receipt whose other arrivals were behind the mark (in packet_count,
+#          not in received). Sets in_sequence exactly, for the bar's boundary.
+#   bigtracks = tracks > received, which no genuine receipt can carry.
+#   notracks = otherwise clean mmtp with NO tracks field.
 #   noinseq = mmtp with a clean loss_ratio and NO in_sequence at all. An absent
 #          field must fail CLOSED; `null >= x` is false in jq, so the ratio
 #          test would already refuse it -- the `type == "number"` conjunct is
@@ -140,29 +154,43 @@ loss=$(echo "${LOSS_LIST:-}" | cut -d, -f"$n")
 # carrying ZERO values -- it does not error, the leg's array is simply one
 # element short. That is what the `length == $n` count guard is for.
 if [ "$pc" = empty ]; then echo "handshake trace" >&2; exit "$ec"; fi
-# Healthy receipts carry in_sequence ~= packet_count (0.996..1.000 measured
-# across 15 live receipts). Emit that by default so the ratio guard is a no-op
-# for every pre-existing case, and let the sentinels below break it on purpose.
+# Healthy receipts carry in_sequence ~= packet_count (0.996..1.000 of
+# packet_count, measured across 15 live receipts). Emit that by default so the
+# ratio guard is a no-op for every pre-existing case, and let the sentinels
+# below break it on purpose.
+#
+# received is DECOUPLED from packet_count on every sentinel: $rcv, above the
+# sample floor (received >= 500 at THRESH 0.002), whatever packet_count says.
+# A sentinel exists to be refused by ONE guard; a realistic received (<= its
+# packet_count of 1) would have the floor refuse it too and hold nothing -- the
+# zero-data case's `packet_count > 0` guard first of all. Only clean/lost/inseq,
+# whose job is the floor and the bar, carry a received consistent with the rest.
+rcv=1000
 case "$loss" in
   ''|none) mmtp= ;;
-  imp)     mmtp=',"mmtp":{"implausible":1,"loss_ratio":0,"in_sequence":'"$pc"'}' ;;
-  noloss)  mmtp=',"mmtp":{"implausible":0,"in_sequence":'"$pc"'}' ;;
-  reorder) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.3242,"in_sequence":'"$((pc / 2))"'}' ;;
-  noinseq) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015}' ;;
+  imp)     mmtp=',"mmtp":{"implausible":1,"loss_ratio":0,"tracks":1,"received":'"$rcv"',"in_sequence":'"$pc"'}' ;;
+  noloss)  mmtp=',"mmtp":{"implausible":0,"tracks":1,"received":'"$rcv"',"in_sequence":'"$pc"'}' ;;
+  reorder) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.32420171254357943,"tracks":9,"received":46328,"in_sequence":34115}' ;;
+  noinseq) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"tracks":1,"received":'"$rcv"'}' ;;
   # in_sequence PRESENT but not a number. jq orders string > number, so
   # `"n/a" >= 60300` is TRUE and the ratio conjunct waves this through -- the
   # `type == "number"` conjunct is the only one that can refuse it. Absence
   # (noinseq) cannot hold that conjunct, because `null >= number` is false and
   # the ratio test catches it first. Two sentinels because two conjuncts.
-  strinseq) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"in_sequence":"n/a"}' ;;
+  strinseq) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"tracks":1,"received":'"$rcv"',"in_sequence":"n/a"}' ;;
   # A receipt for a DIFFERENT source, or a DIFFERENT group, with an otherwise
   # clean mmtp block, so one conjunct of the per-leg `.source == $s and
   # .group == $g` clause is the only guard that sees it. Two sentinels, not one
   # that varies both: a receipt wrong in both fields fails each conjunct, so
   # either conjunct alone would still void it and the other would go unheld.
-  badsrc)  SOURCE=198.51.100.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"in_sequence":'"$pc"'}' ;;
-  badgrp)  GROUP=232.9.9.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"in_sequence":'"$pc"'}' ;;
-  *)       mmtp=",\"mmtp\":{\"implausible\":0,\"loss_ratio\":$loss,\"in_sequence\":$pc}" ;;
+  badsrc)  SOURCE=198.51.100.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"tracks":1,"received":'"$rcv"',"in_sequence":'"$pc"'}' ;;
+  badgrp)  GROUP=232.9.9.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"tracks":1,"received":'"$rcv"',"in_sequence":'"$pc"'}' ;;
+  clean*)  t=${loss#clean}; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0,"tracks":'"$t"',"received":'"$pc"',"in_sequence":'"$((pc - t))"'}' ;;
+  lost*)   g=${loss#lost}; mmtp=',"mmtp":{"implausible":0,"loss_ratio":'"$(jq -n "$g / ($g + $pc)")"',"tracks":1,"received":'"$pc"',"in_sequence":'"$((pc - 1 - g))"'}' ;;
+  inseq*)  i=${loss#inseq}; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0,"tracks":9,"received":'"$((9 + i))"',"in_sequence":'"$i"'}' ;;
+  bigtracks) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"tracks":'"$((rcv + 1))"',"received":'"$rcv"',"in_sequence":'"$pc"'}' ;;
+  notracks) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"received":'"$rcv"',"in_sequence":'"$pc"'}' ;;
+  *)       mmtp=",\"mmtp\":{\"implausible\":0,\"loss_ratio\":$loss,\"tracks\":1,\"received\":$rcv,\"in_sequence\":$pc}" ;;
 esac
 echo "{\"source\":\"$SOURCE\",\"group\":\"$GROUP\",\"packet_count\":$pc,\"outcome\":\"timeout\"$mmtp}"
 echo "handshake trace" >&2
@@ -616,7 +644,10 @@ open(out, 'w').write(block)
 PY
 [ -s "$WORK/delta.sh" ] || { echo "ABORT: could not extract delta.sh from $WORKFLOW (the 'loss-delta' job renamed, or its 'docker pull' step moved)" >&2; exit 2; }
 
-# run_delta_case <name> <N> <pcs> <losses> <timeout> <want>
+# run_delta_case <name> <N> <pcs> <losses> <timeout> <want> [<reason>]
+#
+# <reason>, when given, must appear in the output: two VOIDs share exit 91, and
+# a case about one cause must not go green on the other.
 #
 # PC_LIST/LOSS_LIST are FLAT across all three legs, in leg order: index 1 is
 # leg 1 (N=1), 2..N+1 are the middle leg, N+2 is leg 3. Within the middle leg
@@ -624,7 +655,7 @@ PY
 # here is order-independent by construction -- a mean does not care, and one
 # bad receipt invalidates the leg whichever slot it lands in.
 run_delta_case() {
-  local name=$1 n=$2 pcs=$3 losses=$4 tmo=$5 want=$6 got
+  local name=$1 n=$2 pcs=$3 losses=$4 tmo=$5 want=$6 reason=${7:-} got
   local dir; dir=$(mktemp -d -p "$WORK"); rm -rf "$WORK"/.claim.*
   ( cd "$dir"
     export TUNNELS=$n PC_LIST=$pcs LOSS_LIST=$losses EXIT_LIST=1,1,1,1,1,1,1,1 \
@@ -632,11 +663,14 @@ run_delta_case() {
            TIMEOUT=$tmo PACKETS=3
     bash "$WORK/delta.sh" >out.log 2>&1
   ); got=$?
-  if [ "$got" = "$want" ]; then
-    echo "PASS  $name (exit $got)"
-  else
+  if [ "$got" != "$want" ]; then
     echo "FAIL  $name: want exit $want, got $got"; FAILED=1
     sed -n '1,40p' "$dir/out.log" | sed 's/^/      /'
+  elif [ -n "$reason" ] && ! grep -qF "$reason" "$dir/out.log"; then
+    echo "FAIL  $name: exit $got, but no '$reason' in the output"; FAILED=1
+    grep -F '::error::' "$dir/out.log" | sed 's/^/      /'
+  else
+    echo "PASS  $name (exit $got)"
   fi
 }
 
@@ -732,8 +766,8 @@ run_delta_case "implausible sequence numbers -> VOID" \
 # peers on the live run, in fact -- and loss_ratio is a clean float. It is just
 # a wrong one: 0.3242, because the sequence space was read twice rather than a
 # third of the stream being lost. in_sequence is the only field that dissents,
-# at half of packet_count against 0.996..1.000 on every healthy receipt.
-# Shaped after run 36613263318.
+# at half of packet_count against 0.996..1.000 of packet_count on every healthy
+# receipt. It is run 36613263318's receipt.
 #
 # ⚠ BOTH floor legs carry it, and that is the whole point of the case. With the
 # corruption in ONE leg the noise term blows past the threshold and the run
@@ -745,7 +779,7 @@ run_delta_case "implausible sequence numbers -> VOID" \
 # That is the shape a shared upstream reordering episode actually produces,
 # and it is the one that is dangerous rather than merely noisy.
 run_delta_case "reordering receipts fake a quiet floor -> VOID, not PASS" \
-  3 67000,67000,67000,67000,67000 reorder,0.0015,0.0015,0.0015,reorder 30 91
+  3 67248,67000,67000,67000,67248 reorder,0.0015,0.0015,0.0015,reorder 30 91
 
 # The same guard's other half, and it needs its own sentinel because the two
 # conjuncts mask each other under mutation: a missing in_sequence is refused by
@@ -755,10 +789,70 @@ run_delta_case "reordering receipts fake a quiet floor -> VOID, not PASS" \
 run_delta_case "non-numeric in_sequence -> VOID" \
   3 67000,67000,67000,67000,67000 0.001,0.0015,strinseq,0.0015,0.001 30 91
 
-# And the plain absent-field case, which the ratio conjunct holds. Keeping both
-# is what makes each conjunct independently mutation-testable.
+# And the plain absent-field case. It holds NEITHER conjunct alone -- revert
+# either one and the other still refuses it -- so it guards only against both
+# going at once. The conjuncts' own witnesses are `reorder` (ratio) and
+# `strinseq` (type).
 run_delta_case "receipt with no in_sequence field -> VOID" \
   3 67000,67000,67000,67000,67000 0.001,0.0015,noinseq,0.0015,0.001 30 91
+
+# Ally review of #49 (head fd9591ea), Important. Clean SHORT samples, the shape
+# a default dispatch (PACKETS=3) produces: in_sequence is packet_count - tracks
+# exactly, because no track's first arrival is in-sequence. The in_sequence
+# bar now clears them (the old 0.9 x packet_count refused both, 3 < 3.6 and
+# 3 < 5.4) -- but they are still VOID, for the right reason. One lost packet in
+# 4 reads as 1/5 = 0.2, a hundred times THRESH, and a lossy short leg failed
+# the bar besides (a gap-ending arrival is not in-sequence): short samples
+# returned PASS or VOID and never FAIL. The sample floor refuses them by name,
+# before they can PASS. Same figures as amt-verify's own fixtures
+# contiguous_sequence_is_zero_loss and tracks_are_counted_independently.
+run_delta_case "clean short sample, 4 packets / 1 track -> VOID, too short" \
+  3 4,4,4,4,4 clean1,clean1,clean1,clean1,clean1 30 91 "sample too short"
+run_delta_case "clean short sample, 6 packets / 3 tracks -> VOID, too short" \
+  3 6,6,6,6,6 clean3,clean3,clean3,clean3,clean3 30 91 "sample too short"
+
+# The floor's own boundary, derived from THRESH = 0.002: one lost packet reads
+# as 1/(received + 1), so received 499 reads 0.002 (not below) and 500 reads
+# 0.001996. Kills an off-by-one in either direction.
+run_delta_case "received 499, one short of the floor -> VOID, too short" \
+  3 499,499,499,499,499 clean1,clean1,clean1,clean1,clean1 30 91 "sample too short"
+run_delta_case "received 500, at the floor -> PASS" \
+  3 500,500,500,500,500 clean1,clean1,clean1,clean1,clean1 30 0
+
+# Above the floor, the bar must still subtract tracks. 100 tracks at 600
+# packets: in_sequence is 500, which clears 0.9 x (600 - 100) = 450 and would
+# be refused by 0.9 x 600 = 540. tracks has to exceed a tenth of packet_count
+# for the subtraction to decide anything, which the floor makes 56+ tracks.
+run_delta_case "clean 600 packets / 100 tracks -> PASS (bar subtracts tracks)" \
+  3 600,600,600,600,600 clean100,clean100,clean100,clean100,clean100 30 0
+
+# And FAIL is reachable once the sample can resolve it -- the verdict a short
+# sample could never return. Clean N=1 floors at 1000 packets; each N-leg
+# receipt lost 3 of 1003, loss 0.00299. signal 0.00299 >= 0.002 over noise 0.
+run_delta_case "above the floor, fan-out loses packets -> FAIL" \
+  3 1000,1000,1000,1000,1000 clean1,lost3,lost3,lost3,clean1 30 1
+
+# The bar's boundary at the live receipt's 9 tracks: 0.9 x (1009 - 9) = 900.
+# 899 VOIDs, 900 passes. Kills the loosening mutants (0.9 -> 0.51 reads 510;
+# 2 x tracks reads 891.9) with the first, and dropping tracks (908.1) with the
+# second. received is 9 + in_sequence, so both clear the floor.
+run_delta_case "in_sequence 899 against a bar of 900 -> VOID" \
+  3 1009,1009,1009,1009,1009 inseq899,inseq899,inseq899,inseq899,inseq899 30 91 "no usable mean"
+run_delta_case "in_sequence 900 against a bar of 900 -> PASS" \
+  3 1009,1009,1009,1009,1009 inseq900,inseq900,inseq900,inseq900,inseq900 30 0
+
+# tracks > received. No genuine receipt carries it, since every track's first
+# arrival is received, and it drives the bar negative: 0.9 x (1 - 1001) waves
+# any in_sequence through. `tracks <= received` is the only guard that sees it.
+run_delta_case "tracks exceeds received -> VOID" \
+  3 1,1,1,1,1 0.001,0.0015,bigtracks,0.0015,0.001 30 91 "no usable mean"
+
+# The bar subtracts tracks, so tracks must be a number. Absent, `// 0` restores
+# the strict packet_count bar -- which this receipt (in_sequence = packet_count)
+# clears -- so the `tracks | type == "number"` conjunct is the only thing that
+# refuses it.
+run_delta_case "receipt with no tracks field -> VOID" \
+  3 67000,67000,67000,67000,67000 0.001,0.0015,notracks,0.0015,0.001 30 91
 
 # A corrupt receipt: `oops` lands in the JSON verbatim, so the file will not
 # parse and the leg has no usable mean.
