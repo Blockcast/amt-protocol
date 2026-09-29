@@ -176,6 +176,7 @@ impl JsAmtGateway {
                 request_nonce,
                 response_mac,
                 query_data,
+                gateway_address,
             } => {
                 // Debug logging via platform
                 web_sys::console::log_1(
@@ -187,7 +188,7 @@ impl JsAmtGateway {
                 );
 
                 self.inner
-                    .handle_query(request_nonce, response_mac, query_data)
+                    .handle_query(request_nonce, response_mac, query_data, gateway_address)
                     .map_err(|e| JsValue::from_str(&format!("{:?}", e)))
             }
             _ => Err(JsValue::from_str("Expected MembershipQuery message")),
@@ -257,7 +258,9 @@ impl JsAmtGateway {
 
     /// Send teardown message
     ///
-    /// Returns encoded Teardown message as Uint8Array
+    /// Returns encoded Teardown message as Uint8Array. Throws `NoGatewayAddress`
+    /// when the relay's last Membership Query did not set the G flag: it does
+    /// not support Teardown, so there is nothing to send (RFC 7450 §5.2.3.7).
     #[wasm_bindgen(js_name = sendTeardown)]
     pub fn send_teardown(&mut self) -> Result<Vec<u8>, JsValue> {
         let msg = self
@@ -266,6 +269,20 @@ impl JsAmtGateway {
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
         Ok(msg.encode())
+    }
+
+    /// Teardown owed after a Membership Query that reported a new gateway
+    /// endpoint
+    ///
+    /// Returns the encoded Teardown RFC 7450 §5.2.3.7.1 requires as a
+    /// Uint8Array once the relay's Query reports a gateway endpoint other than
+    /// the one the last Membership Update was sent from, or undefined when
+    /// none is owed. Call after `handleQuery` and before the `sendUpdate`
+    /// answering that Query, and send the Teardown to the relay first. The
+    /// gateway state is unchanged.
+    #[wasm_bindgen(js_name = rebindTeardown)]
+    pub fn rebind_teardown(&self) -> Option<Vec<u8>> {
+        self.inner.rebind_teardown().map(|msg| msg.encode())
     }
 
     /// Reset gateway to idle state

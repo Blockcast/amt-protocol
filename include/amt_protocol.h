@@ -55,6 +55,8 @@ typedef enum {
     AMT_RESULT_ALLOCATION_ERROR = 6,
     /** Null pointer provided */
     AMT_RESULT_NULL_POINTER = 7,
+    /** No Gateway Address fields from the relay, so no Teardown can be built */
+    AMT_RESULT_NO_GATEWAY_ADDRESS = 8,
     /** Unknown error */
     AMT_RESULT_UNKNOWN = 99,
 } amt_result_t;
@@ -230,11 +232,39 @@ amt_result_t amt_gateway_handle_data(
 /**
  * Send teardown message.
  *
+ * The 30-byte RFC 7450 section 5.1.7 Teardown, copying the Request Nonce,
+ * Response MAC and Gateway Address fields of the Membership Query behind the
+ * last Membership Update (section 5.2.3.7.2).
+ *
  * @param handle Gateway handle
  * @param out_message Pointer to receive encoded message buffer
- * @return AMT_RESULT_OK on success
+ * @return AMT_RESULT_OK on success; AMT_RESULT_NO_GATEWAY_ADDRESS when that
+ *         Query did not set the G flag, i.e. the relay does not support
+ *         Teardown and there is nothing to send
  */
 amt_result_t amt_gateway_send_teardown(
+    amt_gateway_handle_t handle,
+    amt_buffer_t* out_message
+);
+
+/**
+ * Teardown owed after a Membership Query that reported a new gateway endpoint.
+ *
+ * RFC 7450 section 5.2.3.7.1: when the relay's Membership Query reports a
+ * gateway endpoint other than the one the last Membership Update was sent
+ * from (a NAT rebinding, say), the relay still forwards to the tunnel at the
+ * old one. The returned Teardown names that endpoint, with the nonce and MAC
+ * of the Query behind the last Update, so the relay stops that tunnel and not
+ * the one the next Update creates. Call after amt_gateway_handle_query and
+ * before the amt_gateway_send_update answering that Query, and send the
+ * Teardown, if any, to the relay first. The gateway state is unchanged.
+ *
+ * @param handle Gateway handle
+ * @param out_message Pointer to receive the encoded Teardown, or a null
+ *        buffer (data NULL, len 0) when none is owed
+ * @return AMT_RESULT_OK whether or not a Teardown is owed
+ */
+amt_result_t amt_gateway_rebind_teardown(
     amt_gateway_handle_t handle,
     amt_buffer_t* out_message
 );

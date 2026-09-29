@@ -81,6 +81,7 @@ async fn default_shutdown_sends_leave_then_teardown() {
 
     assert_eq!(count(&types, MessageType::MembershipUpdate), 2, "{types:?}");
     assert_eq!(count(&types, MessageType::Teardown), 1, "{types:?}");
+    assert_eq!(authenticated_teardowns(&relay).await, 1, "{types:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -90,6 +91,22 @@ async fn no_graceful_leave_sends_teardown_without_leave_update() {
 
     assert_eq!(count(&types, MessageType::MembershipUpdate), 1, "{types:?}");
     assert_eq!(count(&types, MessageType::Teardown), 1, "{types:?}");
+    assert_eq!(authenticated_teardowns(&relay).await, 1, "{types:?}");
+}
+
+// A relay that leaves the G flag unset does not support Teardown (RFC 7450
+// §5.1.4.5) and hands out no Gateway Address fields to build one from. The
+// gateway still leaves gracefully and exits 0, but sends no Teardown.
+#[tokio::test(flavor = "current_thread")]
+async fn relay_without_teardown_support_gets_no_teardown() {
+    let relay = FakeRelay::bind("v4").await;
+    let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
+    relay.spawn_without_teardown_support(inner);
+    verify_against(&relay, &[]).await;
+    let types = captured_types(&relay).await;
+
+    assert_eq!(count(&types, MessageType::MembershipUpdate), 2, "{types:?}");
+    assert_eq!(count(&types, MessageType::Teardown), 0, "{types:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -244,7 +261,12 @@ async fn run_verify(extra_args: &[&str]) -> FakeRelay {
     let relay = FakeRelay::bind("v4").await;
     let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
     relay.spawn(inner);
+    verify_against(&relay, extra_args).await;
+    relay
+}
 
+/// Run amt-verify against an already-spawned `relay` and require exit 0.
+async fn verify_against(relay: &FakeRelay, extra_args: &[&str]) {
     let bin = env!("CARGO_BIN_EXE_amt-verify");
     let mut args = vec![
         "--relay".to_string(),
@@ -268,12 +290,25 @@ async fn run_verify(extra_args: &[&str]) -> FakeRelay {
         .await
         .expect("spawn amt-verify");
     assert!(status.success(), "exit code: {status}");
-    relay
 }
 
 async fn captured_types(relay: &FakeRelay) -> Vec<u8> {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     relay.captured.lock().await.message_types.clone()
+}
+
+/// Teardowns the relay parsed and authenticated (RFC 7450 §5.3.3.5), as
+/// opposed to datagrams that merely started with the Teardown type byte.
+/// Waits for the first. The bound only turns a Teardown that never arrives
+/// into a failure instead of a hang; it matches tests/native_runtime.rs.
+async fn authenticated_teardowns(relay: &FakeRelay) -> usize {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.teardown_authenticated.notified(),
+    )
+    .await
+    .expect("the relay never authenticated a Teardown");
+    relay.captured.lock().await.authenticated_teardowns.len()
 }
 
 fn count(types: &[u8], msg_type: MessageType) -> usize {

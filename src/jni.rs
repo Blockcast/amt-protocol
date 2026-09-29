@@ -276,7 +276,8 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleQuery<'
             request_nonce,
             response_mac,
             query_data,
-        } => match gw.handle_query(request_nonce, response_mac, query_data) {
+            gateway_address,
+        } => match gw.handle_query(request_nonce, response_mac, query_data, gateway_address) {
             Ok(data) => match env.byte_array_from_slice(&data) {
                 Ok(arr) => arr.into_raw(),
                 Err(_) => std::ptr::null_mut(),
@@ -363,7 +364,8 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleData<'l
 /// Send teardown
 ///
 /// JNI signature: (J)[B
-/// Returns encoded Teardown message or null on error
+/// Returns encoded Teardown message or null on error, including when the
+/// relay never sent Gateway Address fields (no Teardown it could accept)
 #[no_mangle]
 pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeSendTeardown<'local>(
     env: JNIEnv<'local>,
@@ -385,6 +387,35 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeSendTeardown<
             }
         }
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Teardown owed after a Membership Query that reported a new gateway endpoint
+///
+/// JNI signature: (J)[B
+/// Returns the encoded Teardown RFC 7450 §5.2.3.7.1 requires once the relay's
+/// Query reports a gateway endpoint other than the one the last Membership
+/// Update was sent from, or null when none is owed. Call after
+/// nativeHandleQuery and before the nativeSendUpdate answering that Query,
+/// and send the Teardown to the relay first. The gateway state is unchanged.
+#[no_mangle]
+pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeRebindTeardown<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+) -> jbyteArray {
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+
+    let gw = unsafe { from_handle(handle) };
+
+    match gw.rebind_teardown() {
+        Some(msg) => match env.byte_array_from_slice(&msg.encode()) {
+            Ok(arr) => arr.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
     }
 }
 

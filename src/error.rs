@@ -11,6 +11,9 @@ pub enum AmtError {
     InvalidNonce,
     UnexpectedMessage,
     NoResponseMac,
+    /// The relay's Membership Query carried no Gateway Address fields (G flag
+    /// unset, RFC 7450 §5.1.4.5), so no Teardown it could authenticate exists.
+    NoGatewayAddress,
     IoError(String),
     // Subscription-layer additions (M1 — BLO-3457 follow-up)
     FamilyMismatch,
@@ -29,6 +32,10 @@ impl fmt::Display for AmtError {
             AmtError::InvalidNonce => write!(f, "Nonce mismatch"),
             AmtError::UnexpectedMessage => write!(f, "Unexpected message type"),
             AmtError::NoResponseMac => write!(f, "No response MAC available"),
+            AmtError::NoGatewayAddress => write!(
+                f,
+                "No gateway address available: the relay's Membership Query did not set the G flag"
+            ),
             AmtError::IoError(msg) => write!(f, "IO error: {}", msg),
             AmtError::FamilyMismatch => {
                 write!(f, "IP family mismatch between relay, group, and source")
@@ -75,6 +82,10 @@ mod tests {
         assert_eq!(
             format!("{}", AmtError::ShutdownInProgress),
             "Operation rejected: manager is shutting down or closed"
+        );
+        assert_eq!(
+            format!("{}", AmtError::NoGatewayAddress),
+            "No gateway address available: the relay's Membership Query did not set the G flag"
         );
     }
 }
