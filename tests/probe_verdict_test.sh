@@ -122,6 +122,16 @@ ec=$(echo "$EXIT_LIST" | cut -d, -f"$n")
 #          exercises the `loss_ratio | type == "number"` guard. An absent field
 #          arrives as null and a null must NOT be allowed to read as 0.
 #   imp  = emit mmtp with implausible=1, the sequence-validity guard.
+#   reorder = a REORDERING receipt: clean implausible, clean numeric
+#          loss_ratio, correct source/group, full packet_count -- and
+#          in_sequence at half of it. Every other guard passes, so the
+#          in_sequence ratio guard is the only one that can fire. Shaped after
+#          the live receipt on run 36613263318 (BLO-33636), which reported
+#          loss_ratio 0.3242 while receiving MORE packets than its peers.
+#   noinseq = mmtp with a clean loss_ratio and NO in_sequence at all. An absent
+#          field must fail CLOSED; `null >= x` is false in jq, so the ratio
+#          test would already refuse it -- the `type == "number"` conjunct is
+#          what makes that refusal deliberate rather than incidental.
 # A non-numeric token otherwise lands in the JSON verbatim and corrupts the
 # receipt, which is the same `oops` mechanism PC_LIST already uses.
 loss=$(echo "${LOSS_LIST:-}" | cut -d, -f"$n")
@@ -130,18 +140,29 @@ loss=$(echo "${LOSS_LIST:-}" | cut -d, -f"$n")
 # carrying ZERO values -- it does not error, the leg's array is simply one
 # element short. That is what the `length == $n` count guard is for.
 if [ "$pc" = empty ]; then echo "handshake trace" >&2; exit "$ec"; fi
+# Healthy receipts carry in_sequence ~= packet_count (0.996..1.000 measured
+# across 15 live receipts). Emit that by default so the ratio guard is a no-op
+# for every pre-existing case, and let the sentinels below break it on purpose.
 case "$loss" in
   ''|none) mmtp= ;;
-  imp)     mmtp=',"mmtp":{"implausible":1,"loss_ratio":0}' ;;
-  noloss)  mmtp=',"mmtp":{"implausible":0}' ;;
+  imp)     mmtp=',"mmtp":{"implausible":1,"loss_ratio":0,"in_sequence":'"$pc"'}' ;;
+  noloss)  mmtp=',"mmtp":{"implausible":0,"in_sequence":'"$pc"'}' ;;
+  reorder) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.3242,"in_sequence":'"$((pc / 2))"'}' ;;
+  noinseq) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015}' ;;
+  # in_sequence PRESENT but not a number. jq orders string > number, so
+  # `"n/a" >= 60300` is TRUE and the ratio conjunct waves this through -- the
+  # `type == "number"` conjunct is the only one that can refuse it. Absence
+  # (noinseq) cannot hold that conjunct, because `null >= number` is false and
+  # the ratio test catches it first. Two sentinels because two conjuncts.
+  strinseq) mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"in_sequence":"n/a"}' ;;
   # A receipt for a DIFFERENT source, or a DIFFERENT group, with an otherwise
   # clean mmtp block, so one conjunct of the per-leg `.source == $s and
   # .group == $g` clause is the only guard that sees it. Two sentinels, not one
   # that varies both: a receipt wrong in both fields fails each conjunct, so
   # either conjunct alone would still void it and the other would go unheld.
-  badsrc)  SOURCE=198.51.100.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015}' ;;
-  badgrp)  GROUP=232.9.9.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015}' ;;
-  *)       mmtp=",\"mmtp\":{\"implausible\":0,\"loss_ratio\":$loss}" ;;
+  badsrc)  SOURCE=198.51.100.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"in_sequence":'"$pc"'}' ;;
+  badgrp)  GROUP=232.9.9.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015,"in_sequence":'"$pc"'}' ;;
+  *)       mmtp=",\"mmtp\":{\"implausible\":0,\"loss_ratio\":$loss,\"in_sequence\":$pc}" ;;
 esac
 echo "{\"source\":\"$SOURCE\",\"group\":\"$GROUP\",\"packet_count\":$pc,\"outcome\":\"timeout\"$mmtp}"
 echo "handshake trace" >&2
@@ -705,6 +726,39 @@ run_delta_case "receipt echoes a different group -> VOID" \
 # a loss ratio derived from them.
 run_delta_case "implausible sequence numbers -> VOID" \
   3 1,1,1,1,1 0.001,0.0015,imp,0.0015,0.001 30 91
+
+# BLO-33636. A REORDERING receipt: every existing guard passes it. implausible
+# is 0, the source and group are right, packet_count is FULL -- higher than its
+# peers on the live run, in fact -- and loss_ratio is a clean float. It is just
+# a wrong one: 0.3242, because the sequence space was read twice rather than a
+# third of the stream being lost. in_sequence is the only field that dissents,
+# at half of packet_count against 0.996..1.000 on every healthy receipt.
+# Shaped after run 36613263318.
+#
+# ⚠ BOTH floor legs carry it, and that is the whole point of the case. With the
+# corruption in ONE leg the noise term blows past the threshold and the run
+# VOIDs anyway -- exit 91 with or without the guard, so the case is green on a
+# reverted guard and holds nothing. Mutation testing caught exactly that here,
+# on a case whose own comment had already noticed the exit codes collide and
+# shipped it regardless. Corrupt BOTH floors with the SAME value and the noise
+# term goes to ZERO: the run then reports a confident PASS off a 32% baseline.
+# That is the shape a shared upstream reordering episode actually produces,
+# and it is the one that is dangerous rather than merely noisy.
+run_delta_case "reordering receipts fake a quiet floor -> VOID, not PASS" \
+  3 67000,67000,67000,67000,67000 reorder,0.0015,0.0015,0.0015,reorder 30 91
+
+# The same guard's other half, and it needs its own sentinel because the two
+# conjuncts mask each other under mutation: a missing in_sequence is refused by
+# the ratio test (`null >= number` is false) whichever conjunct you revert. A
+# STRING is not -- jq orders string > number, so the ratio test says true and
+# only `type == "number"` can refuse it.
+run_delta_case "non-numeric in_sequence -> VOID" \
+  3 67000,67000,67000,67000,67000 0.001,0.0015,strinseq,0.0015,0.001 30 91
+
+# And the plain absent-field case, which the ratio conjunct holds. Keeping both
+# is what makes each conjunct independently mutation-testable.
+run_delta_case "receipt with no in_sequence field -> VOID" \
+  3 67000,67000,67000,67000,67000 0.001,0.0015,noinseq,0.0015,0.001 30 91
 
 # A corrupt receipt: `oops` lands in the JSON verbatim, so the file will not
 # parse and the leg has no usable mean.

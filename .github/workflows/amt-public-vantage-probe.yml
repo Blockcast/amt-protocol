@@ -1510,6 +1510,7 @@ jobs:
             for i in $(seq 1 "$n"); do
               jq -rc --argjson l "$leg" --argjson i "$i" \
                 '{leg:$l,tunnel:$i,source,group,packet_count,
+                  in_sequence:.mmtp.in_sequence,
                   implausible:.mmtp.implausible,loss_ratio:.mmtp.loss_ratio}' \
                 "leg$leg-report-$i.json" 2>/dev/null \
                 || echo "{\"leg\":$leg,\"tunnel\":$i,\"receipt\":\"missing-or-unparseable\"}"
@@ -1528,12 +1529,32 @@ jobs:
             # by both). Read it rather than recomputing it, but assert it is a
             # number: an absent field would otherwise arrive as null and a
             # null mean would read as 0.
+            #
+            # loss_ratio counts SEQUENCE CONTINUITY, not delivery, so it reads
+            # HIGH under reordering or duplication -- a direction no threshold
+            # on it can detect, because the inflated value is a perfectly
+            # ordinary float. Measured on run 36613263318 (BLO-33636): a leg
+            # reported loss_ratio 0.3242 with implausible=0 while receiving
+            # 67248 packets, the MOST of its round (peers 66920/66923). A third
+            # of the stream was plainly not lost; its sequence space was read
+            # twice. in_sequence is the field that says so -- 0.507 of
+            # packet_count there, against 0.996..1.000 on all 15 healthy
+            # receipts taken that day. 0.9 sits between those, but note it is
+            # set from ONE corrupt observation: widen it only on more.
+            #
+            # Kept LAST in the conjunction on purpose. jq's `and` short-circuits,
+            # so a guard placed earlier would swallow the `noloss` and `imp`
+            # receipts before their own guards saw them and silently make those
+            # two untestable (BLO-33636: an inert guard already shipped here
+            # once for exactly this reason).
             mean=$(jq -s --arg s "$SOURCE" --arg g "$GROUP" --argjson n "$n" '
               if (length == $n)
                  and all(.[]; .source == $s and .group == $g
                               and (.packet_count // 0) > 0
                               and (.mmtp.implausible // 1) == 0
-                              and ((.mmtp.loss_ratio | type) == "number"))
+                              and ((.mmtp.loss_ratio | type) == "number")
+                              and ((.mmtp.in_sequence | type) == "number")
+                              and (.mmtp.in_sequence >= (.packet_count * 0.9)))
               then (map(.mmtp.loss_ratio) | add / length)
               else null end' leg$leg-report-*.json 2>/dev/null) || mean=null
             [ -n "$mean" ] || mean=null
