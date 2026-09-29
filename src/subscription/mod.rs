@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::config::AmtConfig;
 use crate::error::{AmtError, Result};
 use crate::gateway::{AmtGateway, GatewayState, GroupKey};
-use crate::messages::AmtMessage;
+use crate::messages::{AmtMessage, GatewayAddress};
 use crate::platform::Platform;
 
 /// Hard cap mirroring the IWA TS SharedAmtGateway limit.
@@ -168,8 +168,15 @@ impl<P: Platform> SubscriptionManager<P> {
                 request_nonce,
                 response_mac,
                 query_data,
+                gateway_address,
             } => {
-                self.handle_query(request_nonce, response_mac, query_data, now_ms)?;
+                self.handle_query(
+                    request_nonce,
+                    response_mac,
+                    query_data,
+                    gateway_address,
+                    now_ms,
+                )?;
             }
             AmtMessage::MulticastData { ip_packet } => {
                 if self.inner.state() != GatewayState::Active {
@@ -274,6 +281,7 @@ impl<P: Platform> SubscriptionManager<P> {
         nonce: u32,
         mac: [u8; 6],
         query_data: Vec<u8>,
+        gateway_address: Option<GatewayAddress>,
         now_ms: u64,
     ) -> Result<()> {
         let initial_handshake = match self.inner.state() {
@@ -285,7 +293,10 @@ impl<P: Platform> SubscriptionManager<P> {
                 return Ok(());
             }
         };
-        if let Err(e) = self.inner.handle_query(nonce, mac, query_data) {
+        if let Err(e) = self
+            .inner
+            .handle_query(nonce, mac, query_data, gateway_address)
+        {
             self.out_queue.push_back(Event::Warning(e));
             return Ok(());
         }
@@ -478,18 +489,29 @@ impl<P: Platform> SubscriptionManager<P> {
     /// to Closed without emitting wire traffic. Subsequent subscribe()/unsubscribe()
     /// calls return ShutdownInProgress. After shutdown(), `is_closed()` returns
     /// true so the AsyncAmtGateway runtime can break out of its select loop.
+    ///
+    /// Active against a relay whose last Membership Query left the G flag
+    /// unset also closes without wire traffic: that relay does not support
+    /// Teardown, and a Teardown without the Gateway Address fields it
+    /// authenticates against could never be accepted (RFC 7450 §5.1.4.5,
+    /// §5.3.3.5).
     pub fn shutdown(&mut self, _now_ms: u64) -> Result<()> {
         self.shutting_down = true;
         if self.inner.state() == GatewayState::Active {
             let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
-            let msg = self.inner.send_teardown()?;
-            self.out_queue.push_back(Event::Transmit {
-                dst: relay,
-                port: self.inner.relay_port(),
-                payload: msg.encode(),
-                keepalive: false,
-            });
-            // inner.send_teardown() already advanced inner state to Closed.
+            match self.inner.send_teardown() {
+                Ok(msg) => {
+                    self.out_queue.push_back(Event::Transmit {
+                        dst: relay,
+                        port: self.inner.relay_port(),
+                        payload: msg.encode(),
+                        keepalive: false,
+                    });
+                    // inner.send_teardown() already advanced inner state to Closed.
+                }
+                Err(AmtError::NoGatewayAddress) => self.inner.reset(),
+                Err(e) => return Err(e),
+            }
         } else {
             // No wire traffic — but the manager must still expose "Closed"
             // semantics to its caller. inner.reset() returns to Idle (the
@@ -783,6 +805,7 @@ mod tests {
             request_nonce: 0xDEAD_BEEF,
             response_mac: [0xAA; 6],
             query_data: vec![0; 12],
+            gateway_address: None,
         };
         m.handle_datagram(&bad_query.encode(), 1200).unwrap();
 
@@ -837,6 +860,7 @@ mod tests {
             request_nonce: req_nonce,
             response_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
             query_data: vec![0x11; 12],
+            gateway_address: None,
         };
         m.handle_datagram(&query.encode(), 1200).unwrap();
 
@@ -863,7 +887,27 @@ mod tests {
             .any(|ev| matches!(ev, Event::HandshakeComplete)));
     }
 
+    /// The Gateway Address fields `drive_to_active`'s relay reports: it
+    /// supports Teardown, and saw the gateway at this (post-NAT) endpoint.
+    fn relay_observed_gateway() -> GatewayAddress {
+        GatewayAddress::from(
+            "198.51.100.7:40001"
+                .parse::<std::net::SocketAddr>()
+                .unwrap(),
+        )
+    }
+
     fn drive_to_active(m: &mut SubscriptionManager<TestPlatform>, key: GroupKey) -> u32 {
+        drive_to_active_via(m, key, Some(relay_observed_gateway()))
+    }
+
+    /// `drive_to_active` against a relay whose Query carries
+    /// `gateway_address` (`None`: G flag unset, no Teardown support).
+    fn drive_to_active_via(
+        m: &mut SubscriptionManager<TestPlatform>,
+        key: GroupKey,
+        gateway_address: Option<GatewayAddress>,
+    ) -> u32 {
         m.subscribe(key, 1000).unwrap();
         let initial = drain(m);
         let disc_nonce = discovery_nonce_from(&initial);
@@ -888,6 +932,7 @@ mod tests {
             request_nonce: req_nonce,
             response_mac: [0; 6],
             query_data: vec![0x11; 12],
+            gateway_address,
         };
         m.handle_datagram(&query.encode(), 1200).unwrap();
         drain(m);
@@ -907,6 +952,7 @@ mod tests {
             request_nonce,
             response_mac: refreshed_mac,
             query_data: vec![0x11; 12],
+            gateway_address: Some(relay_observed_gateway()),
         };
 
         m.handle_datagram(&query.encode(), 1300).unwrap();
@@ -1212,6 +1258,7 @@ mod tests {
             request_nonce: req_nonce,
             response_mac: [0; 6],
             query_data: vec![0x11; 12],
+            gateway_address: None,
         };
         m.handle_datagram(&query.encode(), 1200).unwrap();
 
@@ -1319,7 +1366,7 @@ mod tests {
             group: "232.0.0.1".parse().unwrap(),
             source: Some("10.0.0.1".parse().unwrap()),
         };
-        drive_to_active(&mut m, k);
+        let request_nonce = drive_to_active(&mut m, k);
         let _ = drain(&mut m);
 
         m.shutdown(1500).unwrap();
@@ -1332,7 +1379,49 @@ mod tests {
                 _ => None,
             })
             .expect("expected Teardown transmit");
-        assert_eq!(teardown.len(), 12, "Teardown is 12 bytes");
+        // RFC 7450 §5.1.7: the full 30-byte layout, echoing the Query.
+        assert_eq!(teardown.len(), 30, "Teardown is 30 bytes");
+        assert_eq!(
+            AmtMessage::decode(&teardown).unwrap(),
+            AmtMessage::Teardown {
+                request_nonce,
+                response_mac: [0; 6],
+                gateway_address: relay_observed_gateway(),
+            }
+        );
+    }
+
+    /// A relay whose Queries never set the G flag does not support Teardown
+    /// (RFC 7450 §5.1.4.5), and could not authenticate one without the
+    /// Gateway Address fields (§5.3.3.5). Shutdown sends nothing and still
+    /// closes, so the runtime's select loop can exit.
+    #[test]
+    fn shutdown_against_relay_without_teardown_support_closes_without_wire_traffic() {
+        let mut m = mgr();
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        drive_to_active_via(&mut m, k, None);
+        let _ = drain(&mut m);
+
+        m.shutdown(1500).unwrap();
+        assert!(m.is_closed());
+        let events = drain(&mut m);
+        assert!(
+            !events.iter().any(|ev| matches!(ev, Event::Transmit { .. })),
+            "{events:?}"
+        );
+        assert!(matches!(
+            m.subscribe(
+                GroupKey {
+                    group: "232.0.0.2".parse().unwrap(),
+                    source: Some("10.0.0.1".parse().unwrap()),
+                },
+                1600,
+            ),
+            Err(AmtError::ShutdownInProgress)
+        ));
     }
 
     #[test]

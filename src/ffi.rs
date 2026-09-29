@@ -48,6 +48,8 @@ pub enum AmtResult {
     AllocationError = 6,
     /// Null pointer provided
     NullPointer = 7,
+    /// No Gateway Address fields from the relay, so no Teardown can be built
+    NoGatewayAddress = 8,
     /// Unknown error
     Unknown = 99,
 }
@@ -58,6 +60,7 @@ impl From<crate::error::AmtError> for AmtResult {
             crate::error::AmtError::InvalidState => AmtResult::InvalidState,
             crate::error::AmtError::InvalidNonce => AmtResult::InvalidNonce,
             crate::error::AmtError::NoResponseMac => AmtResult::NoResponseMac,
+            crate::error::AmtError::NoGatewayAddress => AmtResult::NoGatewayAddress,
             crate::error::AmtError::InvalidMessage(_) => AmtResult::DecodeError,
             crate::error::AmtError::UnexpectedMessage => AmtResult::InvalidArgument,
             crate::error::AmtError::IoError(_) => AmtResult::Unknown,
@@ -449,7 +452,8 @@ pub unsafe extern "C" fn amt_gateway_handle_query(
             request_nonce,
             response_mac,
             query_data,
-        } => match gateway.handle_query(request_nonce, response_mac, query_data) {
+            gateway_address,
+        } => match gateway.handle_query(request_nonce, response_mac, query_data, gateway_address) {
             Ok(data) => {
                 unsafe {
                     *out_query_data = AmtBuffer::from_vec(data);
@@ -581,7 +585,9 @@ pub unsafe extern "C" fn amt_gateway_handle_data(
 /// - `out_message`: Pointer to receive encoded message buffer
 ///
 /// # Returns
-/// AmtResult indicating success or failure
+/// AmtResult indicating success or failure. `NoGatewayAddress` means the
+/// relay's last Membership Query did not set the G flag, so it does not
+/// support Teardown and there is nothing to send (RFC 7450 §5.2.3.7).
 ///
 /// # Safety
 /// `handle` must be a valid handle returned by this library, and `out_message`

@@ -176,6 +176,7 @@ impl JsAmtGateway {
                 request_nonce,
                 response_mac,
                 query_data,
+                gateway_address,
             } => {
                 // Debug logging via platform
                 web_sys::console::log_1(
@@ -187,7 +188,7 @@ impl JsAmtGateway {
                 );
 
                 self.inner
-                    .handle_query(request_nonce, response_mac, query_data)
+                    .handle_query(request_nonce, response_mac, query_data, gateway_address)
                     .map_err(|e| JsValue::from_str(&format!("{:?}", e)))
             }
             _ => Err(JsValue::from_str("Expected MembershipQuery message")),
@@ -257,7 +258,9 @@ impl JsAmtGateway {
 
     /// Send teardown message
     ///
-    /// Returns encoded Teardown message as Uint8Array
+    /// Returns encoded Teardown message as Uint8Array. Throws `NoGatewayAddress`
+    /// when the relay's last Membership Query did not set the G flag: it does
+    /// not support Teardown, so there is nothing to send (RFC 7450 §5.2.3.7).
     #[wasm_bindgen(js_name = sendTeardown)]
     pub fn send_teardown(&mut self) -> Result<Vec<u8>, JsValue> {
         let msg = self

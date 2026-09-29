@@ -55,6 +55,8 @@ typedef enum {
     AMT_RESULT_ALLOCATION_ERROR = 6,
     /** Null pointer provided */
     AMT_RESULT_NULL_POINTER = 7,
+    /** No Gateway Address fields from the relay, so no Teardown can be built */
+    AMT_RESULT_NO_GATEWAY_ADDRESS = 8,
     /** Unknown error */
     AMT_RESULT_UNKNOWN = 99,
 } amt_result_t;
@@ -230,9 +232,14 @@ amt_result_t amt_gateway_handle_data(
 /**
  * Send teardown message.
  *
+ * The 30-byte RFC 7450 section 5.1.7 Teardown, carrying the Gateway Address
+ * fields of the relay's last Membership Query.
+ *
  * @param handle Gateway handle
  * @param out_message Pointer to receive encoded message buffer
- * @return AMT_RESULT_OK on success
+ * @return AMT_RESULT_OK on success; AMT_RESULT_NO_GATEWAY_ADDRESS when that
+ *         Query did not set the G flag, i.e. the relay does not support
+ *         Teardown and there is nothing to send
  */
 amt_result_t amt_gateway_send_teardown(
     amt_gateway_handle_t handle,

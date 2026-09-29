@@ -42,15 +42,25 @@ async fn oneshot_happy_path_v4() {
     assert_eq!(&evt.payload[..], b"hello");
 
     gw.shutdown().await.expect("shutdown");
-
-    // Give the loopback socket a moment to deliver the Teardown to the fake relay task.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    await_authenticated_teardown(&relay).await;
 
     let captured = relay.captured.lock().await;
     assert!(captured.message_types.contains(&1));
     assert!(captured.message_types.contains(&3));
     assert!(captured.message_types.contains(&5));
     assert!(captured.message_types.contains(&7));
+    assert_eq!(captured.authenticated_teardowns.len(), 1);
+}
+
+/// The relay parsed and authenticated a Teardown (RFC 7450 §5.3.3.5): a
+/// datagram that merely starts with the Teardown type byte does not count.
+async fn await_authenticated_teardown(relay: &FakeRelay) {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        relay.teardown_authenticated.notified(),
+    )
+    .await
+    .expect("the relay never authenticated a Teardown");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -86,6 +96,8 @@ async fn oneshot_happy_path_v6() {
     assert_eq!(&evt.payload[..], b"hello");
 
     gw.shutdown().await.expect("shutdown");
+    // An IPv6 Gateway IP Address travels verbatim (RFC 7450 §5.1.7.7).
+    await_authenticated_teardown(&relay).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

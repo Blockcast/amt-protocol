@@ -276,7 +276,8 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleQuery<'
             request_nonce,
             response_mac,
             query_data,
-        } => match gw.handle_query(request_nonce, response_mac, query_data) {
+            gateway_address,
+        } => match gw.handle_query(request_nonce, response_mac, query_data, gateway_address) {
             Ok(data) => match env.byte_array_from_slice(&data) {
                 Ok(arr) => arr.into_raw(),
                 Err(_) => std::ptr::null_mut(),
@@ -363,7 +364,8 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleData<'l
 /// Send teardown
 ///
 /// JNI signature: (J)[B
-/// Returns encoded Teardown message or null on error
+/// Returns encoded Teardown message or null on error, including when the
+/// relay never sent Gateway Address fields (no Teardown it could accept)
 #[no_mangle]
 pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeSendTeardown<'local>(
     env: JNIEnv<'local>,

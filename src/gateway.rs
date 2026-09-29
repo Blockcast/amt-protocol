@@ -5,7 +5,7 @@
 
 use crate::config::AmtConfig;
 use crate::error::{AmtError, Result};
-use crate::messages::AmtMessage;
+use crate::messages::{AmtMessage, GatewayAddress};
 use crate::platform::{generate_nonce, Platform};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -86,6 +86,13 @@ pub struct AmtGateway<P: Platform> {
     /// Used in subsequent Update, Data, and Teardown messages
     response_mac: Option<[u8; 6]>,
 
+    /// Gateway Address fields of the Membership Query that supplied
+    /// `response_mac`, or `None` when that Query did not carry them (G flag
+    /// unset). Stored with the MAC, never on its own: a Teardown copies the
+    /// nonce, MAC and gateway endpoint of one and the same Query (RFC 7450
+    /// §5.2.3.7.2), and the relay authenticates the three together.
+    gateway_address: Option<GatewayAddress>,
+
     /// Active multicast group memberships
     groups: HashMap<GroupKey, GroupInfo>,
 
@@ -105,6 +112,7 @@ impl<P: Platform> AmtGateway<P> {
             discovery_nonce: None,
             request_nonce: None,
             response_mac: None,
+            gateway_address: None,
             groups: HashMap::new(),
             p_flag: false,
         }
@@ -291,12 +299,18 @@ impl<P: Platform> AmtGateway<P> {
 
     /// Process an initial or active-tunnel Membership Query.
     ///
-    /// Validates nonce and extracts response MAC and query data
+    /// Validates nonce and extracts response MAC and query data.
+    ///
+    /// `gateway_address` is the Query's Gateway Address fields, `None` when
+    /// its G flag is unset. It replaces the stored value together with the
+    /// MAC, so a Query without the fields also clears any a previous Query
+    /// supplied: they described a different MAC.
     pub fn handle_query(
         &mut self,
         request_nonce: u32,
         response_mac: [u8; 6],
         query_data: Vec<u8>,
+        gateway_address: Option<GatewayAddress>,
     ) -> Result<Vec<u8>> {
         if self.state != GatewayState::Requesting && self.state != GatewayState::Active {
             self.platform
@@ -325,6 +339,7 @@ impl<P: Platform> AmtGateway<P> {
 
         // Store response MAC for future messages
         self.response_mac = Some(response_mac);
+        self.gateway_address = gateway_address;
         self.state = GatewayState::Querying;
 
         // Return query data (IGMP/MLD query) for processing
@@ -389,7 +404,18 @@ impl<P: Platform> AmtGateway<P> {
 
     /// Send teardown message
     ///
-    /// Returns Teardown message to send to relay
+    /// Returns the Teardown to send to the relay (RFC 7450 §5.2.3.7.2). It
+    /// copies the Request Nonce, Response MAC and Gateway Address fields of
+    /// the Membership Query that provided the MAC for the last Membership
+    /// Update -- the Query `handle_query` stored last, since reaching `Active`
+    /// takes a `send_update` after it.
+    ///
+    /// Fails with [`AmtError::NoGatewayAddress`] when that Query did not carry
+    /// the Gateway Address fields. The relay authenticates a Teardown against
+    /// those fields, not against the datagram's source (§5.3.3.5), and a relay
+    /// that omits them does not support the Teardown procedure (§5.1.4.5):
+    /// there is then no Teardown it could accept, so none is built. The state
+    /// is left unchanged, as on every other refusal here.
     pub fn send_teardown(&mut self) -> Result<AmtMessage> {
         if self.state != GatewayState::Active {
             return Err(AmtError::InvalidState);
@@ -397,12 +423,14 @@ impl<P: Platform> AmtGateway<P> {
 
         let request_nonce = self.request_nonce.ok_or(AmtError::InvalidState)?;
         let response_mac = self.response_mac.ok_or(AmtError::NoResponseMac)?;
+        let gateway_address = self.gateway_address.ok_or(AmtError::NoGatewayAddress)?;
 
         self.state = GatewayState::Closed;
 
         Ok(AmtMessage::Teardown {
             request_nonce,
             response_mac,
+            gateway_address,
         })
     }
 
@@ -412,6 +440,7 @@ impl<P: Platform> AmtGateway<P> {
         self.discovery_nonce = None;
         self.request_nonce = None;
         self.response_mac = None;
+        self.gateway_address = None;
         self.groups.clear();
     }
 }
@@ -427,6 +456,36 @@ mod tests {
 
     fn test_platform() -> Arc<TestPlatform> {
         Arc::new(TestPlatform::new())
+    }
+
+    /// The Gateway Address fields a Teardown-capable relay returns for a
+    /// gateway it saw at `endpoint` (post-NAT).
+    fn relay_observed(endpoint: &str) -> GatewayAddress {
+        GatewayAddress::from(endpoint.parse::<std::net::SocketAddr>().unwrap())
+    }
+
+    /// Discovery, Request and a Query answered by one Update: the shortest
+    /// path to `Active`. Returns the request nonce.
+    fn drive_to_active(
+        gw: &mut AmtGateway<TestPlatform>,
+        response_mac: [u8; 6],
+        gateway_address: Option<GatewayAddress>,
+    ) -> u32 {
+        let discovery_nonce = match gw.start_discovery().unwrap() {
+            AmtMessage::RelayDiscovery { nonce } => nonce,
+            _ => panic!("Expected RelayDiscovery"),
+        };
+        gw.handle_advertisement(discovery_nonce, "198.51.100.1".parse().unwrap())
+            .unwrap();
+        let request_nonce = match gw.request_membership(false).unwrap() {
+            AmtMessage::Request { request_nonce, .. } => request_nonce,
+            _ => panic!("Expected Request"),
+        };
+        gw.handle_query(request_nonce, response_mac, vec![0x11], gateway_address)
+            .unwrap();
+        gw.send_update(vec![0x22]).unwrap();
+        assert_eq!(gw.state(), GatewayState::Active);
+        request_nonce
     }
 
     #[test]
@@ -490,7 +549,7 @@ mod tests {
         // Handle query
         let response_mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
         let query_data = vec![0x11, 0x22, 0x33];
-        gw.handle_query(nonce, response_mac, query_data.clone())
+        gw.handle_query(nonce, response_mac, query_data.clone(), None)
             .unwrap();
         assert_eq!(gw.state(), GatewayState::Querying);
     }
@@ -504,7 +563,7 @@ mod tests {
         // Try to handle query with wrong nonce
         let response_mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
         let query_data = vec![0x11, 0x22, 0x33];
-        let result = gw.handle_query(0x87654321, response_mac, query_data);
+        let result = gw.handle_query(0x87654321, response_mac, query_data, None);
         assert_eq!(result, Err(AmtError::InvalidNonce));
     }
 
@@ -534,10 +593,11 @@ mod tests {
             _ => panic!("Expected Request"),
         };
 
-        // Query
+        // Query, from a relay that supports Teardown (G flag set)
         let response_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let query_data = vec![0x11, 0x22];
-        gw.handle_query(req_nonce, response_mac, query_data)
+        let observed = relay_observed("203.0.113.9:40001");
+        gw.handle_query(req_nonce, response_mac, query_data, Some(observed))
             .unwrap();
 
         // Update
@@ -583,9 +643,11 @@ mod tests {
             AmtMessage::Teardown {
                 request_nonce,
                 response_mac: mac,
+                gateway_address,
             } => {
                 assert_eq!(request_nonce, req_nonce);
                 assert_eq!(mac, response_mac);
+                assert_eq!(gateway_address, observed);
             }
             _ => panic!("Expected Teardown"),
         };
@@ -608,7 +670,7 @@ mod tests {
             AmtMessage::Request { request_nonce, .. } => request_nonce,
             _ => panic!("Expected Request"),
         };
-        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11])
+        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11], None)
             .unwrap();
         gw.send_update(vec![0x22]).unwrap();
         assert_eq!(gw.state(), GatewayState::Active);
@@ -616,7 +678,7 @@ mod tests {
         let refreshed_mac = [6, 5, 4, 3, 2, 1];
         let query_data = vec![0x33, 0x44];
         let parsed = gw
-            .handle_query(request_nonce, refreshed_mac, query_data.clone())
+            .handle_query(request_nonce, refreshed_mac, query_data.clone(), None)
             .unwrap();
         assert_eq!(parsed, query_data);
         assert_eq!(gw.state(), GatewayState::Querying);
@@ -658,7 +720,7 @@ mod tests {
             AmtMessage::Request { request_nonce, .. } => request_nonce,
             _ => panic!("Expected Request"),
         };
-        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11])
+        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11], None)
             .unwrap();
         gw.send_update(vec![0x22]).unwrap();
         assert_eq!(gw.state(), GatewayState::Active);
@@ -693,7 +755,7 @@ mod tests {
         // The relay answers the keepalive with a Query bearing the same nonce
         // and a refreshed MAC, and the cycle continues.
         let refreshed_mac = [9, 8, 7, 6, 5, 4];
-        gw.handle_query(request_nonce, refreshed_mac, vec![0x33])
+        gw.handle_query(request_nonce, refreshed_mac, vec![0x33], None)
             .unwrap();
         assert_eq!(gw.state(), GatewayState::Querying);
 
@@ -754,8 +816,13 @@ mod tests {
         // is the one intermediate state a keepalive could plausibly race, so
         // it is the most load-bearing case here -- a Request accepted from
         // Querying would abandon an Update the caller still owes the relay.
-        gw.handle_query(request_nonce, [1, 2, 3, 4, 5, 6], vec![0x11])
-            .unwrap();
+        gw.handle_query(
+            request_nonce,
+            [1, 2, 3, 4, 5, 6],
+            vec![0x11],
+            Some(relay_observed("203.0.113.9:40001")),
+        )
+        .unwrap();
         assert_eq!(gw.state(), GatewayState::Querying);
         assert!(matches!(
             gw.request_membership(false),
@@ -865,7 +932,7 @@ mod tests {
         };
 
         let response_mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
-        gw.handle_query(req_nonce, response_mac, vec![0x11])
+        gw.handle_query(req_nonce, response_mac, vec![0x11], None)
             .unwrap();
         gw.send_update(vec![0x22]).unwrap();
 
@@ -873,5 +940,67 @@ mod tests {
         let ip_packet = vec![0x45, 0x00, 0x00, 0x1C]; // IPv4 header start
         let result = gw.handle_data(ip_packet.clone()).unwrap();
         assert_eq!(result, ip_packet);
+    }
+
+    /// RFC 7450 §5.2.3.7.2: a Teardown copies the Request Nonce, Response MAC
+    /// and Gateway Address fields of the Query that provided the MAC for the
+    /// LAST Membership Update. After a NAT rebind the relay re-Queries with the
+    /// new endpoint and a new MAC; pairing either with the first Query's values
+    /// would fail the relay's check (§5.3.3.5).
+    #[test]
+    fn teardown_copies_the_query_behind_the_last_update() {
+        let mut gw = AmtGateway::new(test_config(), test_platform());
+        let request_nonce = drive_to_active(
+            &mut gw,
+            [1, 2, 3, 4, 5, 6],
+            Some(relay_observed("203.0.113.9:40001")),
+        );
+
+        gw.request_membership(false).unwrap();
+        let rebound = relay_observed("[2001:db8::9]:40002");
+        let refreshed_mac = [6, 5, 4, 3, 2, 1];
+        gw.handle_query(request_nonce, refreshed_mac, vec![0x33], Some(rebound))
+            .unwrap();
+        gw.send_update(vec![0x44]).unwrap();
+
+        assert_eq!(
+            gw.send_teardown().unwrap(),
+            AmtMessage::Teardown {
+                request_nonce,
+                response_mac: refreshed_mac,
+                gateway_address: rebound,
+            }
+        );
+        assert_eq!(gw.state(), GatewayState::Closed);
+    }
+
+    /// Without the relay's Gateway Address fields no Teardown could pass the
+    /// relay's check (§5.3.3.5), so none is built and nothing changes.
+    #[test]
+    fn teardown_is_refused_when_the_relay_sent_no_gateway_address() {
+        let mut gw = AmtGateway::new(test_config(), test_platform());
+        drive_to_active(&mut gw, [1, 2, 3, 4, 5, 6], None);
+
+        assert_eq!(gw.send_teardown(), Err(AmtError::NoGatewayAddress));
+        assert_eq!(gw.state(), GatewayState::Active);
+    }
+
+    /// The fields belong to one Query: a later Query without them clears an
+    /// earlier Query's instead of pairing them with its own MAC.
+    #[test]
+    fn a_query_without_gateway_address_clears_the_previous_one() {
+        let mut gw = AmtGateway::new(test_config(), test_platform());
+        let request_nonce = drive_to_active(
+            &mut gw,
+            [1, 2, 3, 4, 5, 6],
+            Some(relay_observed("203.0.113.9:40001")),
+        );
+
+        gw.request_membership(false).unwrap();
+        gw.handle_query(request_nonce, [6, 5, 4, 3, 2, 1], vec![0x33], None)
+            .unwrap();
+        gw.send_update(vec![0x44]).unwrap();
+
+        assert_eq!(gw.send_teardown(), Err(AmtError::NoGatewayAddress));
     }
 }
