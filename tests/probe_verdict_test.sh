@@ -126,9 +126,18 @@ FAILED=0
 run_case() {
   local name=$1 tunnels=$2 pcs=$3 exits=$4 want=$5 k=${6:-1} got
   local dir; dir=$(mktemp -d -p "$WORK"); rm -rf "$WORK"/.claim.*
+  # Ally review of #39 (head c04f8534), Important (1). GITHUB_ENV is a real
+  # file here, as it is on a runner. Left unset, the aggregate's
+  # `>> "$GITHUB_ENV"` was an ambiguous redirect that killed the script with
+  # exit 1 -- so a red case could not tell "reached the verdict" from "died at
+  # the redirect", and the knee case passed only because a regressed knee
+  # (writing ZERO_DATA) died too. ZERO_DATA is what files an OUTAGE row, so
+  # it is asserted per case below, not inferred from the exit code.
+  : >"$dir/gh_env"
   ( cd "$dir"
     export TUNNELS=$tunnels PC_LIST=$pcs EXIT_LIST=$exits DISTINCT_SOURCE_IPS=$k \
-           RELAY=1.2.3.4 SOURCE=69.25.95.192 GROUP=232.1.1.60 TIMEOUT=5 PACKETS=3
+           RELAY=1.2.3.4 SOURCE=69.25.95.192 GROUP=232.1.1.60 TIMEOUT=5 PACKETS=3 \
+           GITHUB_ENV="$dir/gh_env"
     # k=unset is the production shape: the variable is ABSENT and the `:-1`
     # default in the workflow decides k.
     [ "$k" = unset ] && unset DISTINCT_SOURCE_IPS
@@ -144,10 +153,16 @@ run_case() {
   # environment, which is the opposite of a positive control. Belt-and-braces
   # with the extraction guard above: that one catches the known cause, this one
   # catches any cause.
-  if { [ "$want" = nonzero ] && [ "$got" != 0 ] && [ "$got" != 127 ]; } || [ "$got" = "$want" ]; then
-    echo "PASS  $name (exit $got)"
+  #
+  # Exit 1 is the aggregate verdict and the ONLY path that may set ZERO_DATA=1;
+  # 0, VOID 91, knee 93, reject 92 and a corrupt receipt must leave it unset.
+  local got_env want_env=; got_env=$(cat "$dir/gh_env")
+  [ "$want" = 1 ] && want_env=ZERO_DATA=1
+  if { { [ "$want" = nonzero ] && [ "$got" != 0 ] && [ "$got" != 127 ]; } || [ "$got" = "$want" ]; } \
+     && [ "$got_env" = "$want_env" ]; then
+    echo "PASS  $name (exit $got, GITHUB_ENV='$got_env')"
   else
-    echo "FAIL  $name: want exit $want, got $got"; FAILED=1
+    echo "FAIL  $name: want exit $want GITHUB_ENV='$want_env', got exit $got GITHUB_ENV='$got_env'"; FAILED=1
   fi
 
   if [ "$tunnels" = 1 ] && [ "$pcs" != oops ]; then

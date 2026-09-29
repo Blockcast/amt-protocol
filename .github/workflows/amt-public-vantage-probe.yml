@@ -576,7 +576,7 @@ jobs:
           # same shelf life as the one that expired above -- check it, do not
           # inherit it.
           if [ "$TUNNELS" -gt "$K" ] && [ "$ok" -le "$K" ]; then
-            echo "::error::VOID as a relay result: $TUNNELS tunnels requested from k=$K source address(es), but only $ok received data -- so no fan-out was established and this run cannot distinguish a harness ceiling from a relay that keys tunnel state on source ADDRESS alone (pre-linux-amt-7ec53567 behaviour). Check the relay the pod is actually on: an unrolled node reproduces exactly this. Harness-ceiling telemetry above is still valid."
+            echo "::error::VOID as a relay result: $TUNNELS tunnels requested from k=$K source address(es), but only $ok received data -- so no fan-out was established. With ok >= 1 this run cannot distinguish a harness ceiling from a relay that keys tunnel state on source ADDRESS alone (pre-linux-amt-7ec53567 behaviour); ok=0 is neither, since address-alone keying still delivers to one tunnel, so it is a total forwarding failure or a dead harness (rerun with tunnels=1 to route it). Check the relay the pod is actually on: an unrolled node reproduces exactly this. Harness-ceiling telemetry above is still valid."
             exit 91
           fi
           # ⚠ Ally review (head fed8b706), Important (2). The partial knee --
