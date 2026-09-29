@@ -1476,6 +1476,7 @@ jobs:
           echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"
 
           MEANS=
+          IPS=
           leg=0
           for n in 1 "$TUNNELS" 1; do
             leg=$((leg+1))
@@ -1485,7 +1486,9 @@ jobs:
             # invalidates the comparison, and one curl per leg lets the receipt
             # SAY that, instead of leaving a reader to infer it from a wide
             # noise floor that has several other explanations.
-            echo "leg${leg}_public_ip=$(curl -fsS https://api.ipify.org || echo unavailable)"
+            ip=$(curl -fsS https://api.ipify.org || echo unavailable)
+            echo "leg${leg}_public_ip=$ip"
+            IPS="${IPS:+$IPS,}$ip"
             pids=""
             # amt-verify exits 1 on `outcome: timeout`, the NORMAL end of a
             # bounded sample (BLO-26574, CTO ruling item 5), so the exit code is
@@ -1558,6 +1561,17 @@ jobs:
           signal=$(printf '%s' "$verdict" | cut -f2)
           noise=$(printf '%s' "$verdict" | cut -f3)
           why=$(printf '%s' "$verdict" | cut -f4)
+          # A wide floor has two causes that take DIFFERENT follow-ups, and the
+          # per-leg addresses above already tell them apart -- so say which,
+          # rather than leaving a reader to diff three log lines:
+          #   several addresses -> the egress rotated mid-job. The comparison is
+          #     void for a reason outside the path, and the next run may be fine.
+          #   ONE address       -> the path itself drifted while the vantage held.
+          #     Re-running is not the answer; that vantage is unusable at this
+          #     threshold. Observed on the very first live run (36568716671):
+          #     one IP across all three legs, floor 0.0088.
+          vantage=$(printf '%s' "$IPS" | tr ',' '\n' | sort -u | paste -sd'/' -)
+          echo "vantage_addresses=$vantage"
           echo "fanout_loss_signal=$signal fanout_loss_noise_floor=$noise threshold=$THRESH verdict=$v"
 
           case "$v" in
@@ -1570,7 +1584,7 @@ jobs:
             # is evidence that this run could not ask the question. Scoring it
             # PASS would be the retired clause's defect with the sign flipped.
             VOID)
-              echo "::error::VOID, not FAIL: $why (signal=$signal noise_floor=$noise threshold=$THRESH). This run cannot answer whether fan-out costs loss, and that is NOT a relay verdict -- do not read it as one and do not re-roll hoping for a quiet vantage. If the floor is wide the public path drifted across the legs; re-dispatch and, if it persists, the vantage is unusable for a measurement at this threshold. If a leg produced no usable mean, read the per-receipt lines above: a leg that failed to ESTABLISH fan-out is oneshot's verdict (exit 91/93), not this job's."
+              echo "::error::VOID, not FAIL: $why (signal=$signal noise_floor=$noise threshold=$THRESH, vantage=$vantage). This run cannot answer whether fan-out costs loss, and that is NOT a relay verdict -- do not read it as one and do not re-roll hoping for a quiet vantage. If the floor is wide, read vantage= above: SEVERAL addresses means the egress rotated mid-job and the next run may be fine; ONE address means the path itself drifted while the vantage held, and re-running is not the answer -- that vantage is unusable for a measurement at this threshold. If a leg produced no usable mean, read the per-receipt lines above: a leg that failed to ESTABLISH fan-out is oneshot's verdict (exit 91/93), not this job's."
               exit 91
               ;;
             FAIL)

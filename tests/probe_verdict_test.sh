@@ -730,4 +730,14 @@ grep -q '^ *THRESH=0.002' "$WORK/delta.sh" \
   && echo "PASS  delta threshold is a constant, not an input" \
   || { echo "FAIL  delta threshold is no longer a hardcoded constant"; FAILED=1; }
 
+# A wide floor has two causes with different follow-ups -- the egress rotated,
+# or the path drifted while the address held -- and only the per-leg addresses
+# tell them apart. Live run 36568716671 hit the second (one IP across all three
+# legs, floor 0.0088), so a VOID that does not report the vantage sends the
+# reader to re-dispatch against a vantage that cannot answer. Source-level
+# because the exit code is 91 either way.
+grep -q 'vantage=\$vantage' "$WORK/delta.sh" \
+  && echo "PASS  VOID message reports the vantage addresses" \
+  || { echo "FAIL  VOID no longer reports vantage: a rotated egress and a drifting path are indistinguishable"; FAILED=1; }
+
 [ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }
