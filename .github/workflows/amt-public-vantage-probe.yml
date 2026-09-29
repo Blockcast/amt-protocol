@@ -34,8 +34,13 @@ on:
         description: >-
           oneshot = the BLO-21823 data-receipt probe (default, unchanged).
           tunnels-ramp = the BLO-33457 tunnel-STATE occupancy ramp.
+          loss-delta = the BLO-33636 AC-2 fan-out loss control: legs N=1, N, N=1
+          on ONE vantage, scored as a DIFFERENCE against a paired noise floor.
+          It answers "does asking for N tunnels cost loss?", which is what the
+          AC's retired absolute threshold was reaching for; it does NOT re-decide
+          demultiplexing -- that verdict is oneshot's (exit 91 VOID / 93 knee).
         type: choice
-        options: [oneshot, tunnels-ramp]
+        options: [oneshot, tunnels-ramp, loss-delta]
         default: oneshot
       ramp_steps:
         description: >-
@@ -1354,3 +1359,233 @@ jobs:
             step-*.log
             report*.json
             verbose*.log
+
+  # BLO-33636 AC 2, as AMENDED 2026-09-29 by its author (PlatformSREEngineer).
+  # The clause this implements replaces `each tunnel's loss_ratio < 0.002`.
+  #
+  # Why that one was retired -- it is the same defect this job must not repeat.
+  # It was an ABSOLUTE threshold sitting on a baseline the rig cannot hold
+  # constant: the runner's public IP is assigned per run, and three consecutive
+  # runs on 2026-09-28 against one relay, one stream and one client build
+  # measured per-tunnel loss of 0.000365 / 0.00752 / 0.01101 on three different
+  # vantages. A 30x spread with every controlled variable identical. So the
+  # clause did not measure the relay; it measured which Azure egress the runner
+  # drew, and it redded a relay that those same runs had just shown correct.
+  #
+  # What it was REACHING for is the cost of fan-out: does asking the relay for N
+  # tunnels make the stream lossier than asking it for 1? That is a DIFFERENCE,
+  # and a difference is measurable on a noisy path provided the comparison is
+  # same-vantage and same-minute.
+  #
+  #   signal = loss(N) - mean(loss(1_a), loss(1_b))    the fan-out cost
+  #   noise  = |loss(1_a) - loss(1_b)|                 what the path did on its
+  #                                                    own, over that interval
+  #
+  # Leg order is 1, N, 1 -- deliberately NOT 1, 1, N. The two N=1 legs BRACKET
+  # the N leg, so the same three legs yield both terms and the noise floor spans
+  # the interval the signal was measured in. Ordered 1,1,N the floor would be
+  # measured before the signal and could not witness drift across it.
+  #
+  # VOID is load-bearing and is why this is not simply a delta threshold. A path
+  # that drifts by more than the threshold cannot answer a question posed at
+  # that threshold, in EITHER direction -- so a clean-looking signal over a
+  # drifting floor is not a pass, it is an unanswerable run. Without the paired
+  # floor the delta is just another unvalidated constant and would rot exactly
+  # as the absolute one did: a delta instrument with no noise floor licenses the
+  # INSTRUMENT, never the THRESHOLD.
+  #
+  # Stated residual, on the record rather than discovered later: this assumes
+  # path loss is roughly stationary across the three legs. The two N=1 legs are
+  # what make that assumption falsifiable instead of implicit -- they cannot
+  # prove stationarity, but they refuse the run when it visibly fails.
+  #
+  # SCOPE. This job does not re-decide demultiplexing. `tunnels_receiving=N/N`
+  # is oneshot's verdict (exit 91 VOID / 93 knee) and is the other half of AC 2;
+  # a leg here that fails to establish fan-out is reported VOID and routed there
+  # rather than being diagnosed twice, in two places, with two chances to drift.
+  loss-delta:
+    if: ${{ inputs.mode == 'loss-delta' }}
+    runs-on: ubuntu-latest
+    # Three legs run SEQUENTIALLY, so wall clock is ~3x timeout plus image pull
+    # and container startup. The boundary check in the step holds 3 x TIMEOUT
+    # under 900s, leaving ~5 min of slack here. Do not narrow this cap without
+    # narrowing that check: an EXCEEDED job timeout CANCELS the job (measured,
+    # see the probe job's note), and a cancelled job emits no verdict at all --
+    # which reads as a missing measurement rather than a rejected input.
+    timeout-minutes: 20
+    # No `issues: write`: this mode is dispatch-only measurement and must never
+    # file an outage row. Routing belongs to the scheduled oneshot probe.
+    permissions:
+      contents: read
+      packages: read
+    env:
+      RELAY: ${{ inputs.relay || '69.25.95.128' }}
+      SOURCE: ${{ inputs.source || '69.25.95.192' }}
+      GROUP: ${{ inputs.group || '232.1.1.60' }}
+      TIMEOUT: ${{ inputs.timeout || '30' }}
+      PACKETS: ${{ inputs.packet_count || '3' }}
+      # The MIDDLE leg's N. Defaults to 3 because that is the N the AC names.
+      TUNNELS: ${{ inputs.tunnels || '3' }}
+    steps:
+      - name: Vantage receipt
+        run: |
+          echo "utc=$(date -u +%FT%TZ)"
+          echo "public_ip=$(curl -fsS https://api.ipify.org)"
+          echo "target=$RELAY:2268 sg=($SOURCE,$GROUP) middle_leg_tunnels=$TUNNELS"
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: fan-out loss delta (legs N=1, N, N=1 on ONE vantage)
+        run: |
+          # ALL THREE LEGS RUN IN THIS ONE JOB ON PURPOSE. A separate job is a
+          # separate runner and therefore a separate public IP -- which is the
+          # exact variable this control exists to hold constant. Do not split
+          # the legs across jobs, or into a matrix, however much tidier it
+          # looks: doing so silently rebuilds the per-vantage lottery that the
+          # retired absolute threshold was.
+          #
+          # From the AC, NOT a dispatch input: a caller must not be able to
+          # declare the threshold that decides their own result. Same reasoning
+          # as DISTINCT_SOURCE_IPS in the probe job.
+          THRESH=0.002
+
+          MAX_TUNNELS=256
+          case "$TUNNELS" in ''|*[!0-9]*)
+            echo "::error::tunnels must be an integer in 2..$MAX_TUNNELS, got '$TUNNELS'"; exit 92 ;;
+          esac
+          # The floor is 2, not 1. At N=1 the middle leg IS a control leg, so
+          # signal is 0 by construction and the run would report PASS having
+          # measured nothing -- a vacuous green, which is worse than a refusal.
+          if [ "$TUNNELS" -lt 2 ] || [ "$TUNNELS" -gt "$MAX_TUNNELS" ]; then
+            echo "::error::tunnels must be an integer in 2..$MAX_TUNNELS, got '$TUNNELS' (N=1 makes the middle leg a control leg: signal is 0 by construction)"; exit 92
+          fi
+          case "$TIMEOUT" in ''|*[!0-9]*)
+            echo "::error::timeout must be an integer, got '$TIMEOUT'"; exit 92 ;;
+          esac
+          if [ "$((TIMEOUT * 3))" -gt 900 ]; then
+            echo "::error::3 legs x timeout=${TIMEOUT}s = $((TIMEOUT * 3))s exceeds the 900s budget under this job's 20-minute cap; lower timeout or raise both together"; exit 92
+          fi
+
+          docker pull -q $IMAGE || docker build -q -t $IMAGE \
+            --label org.opencontainers.image.revision=${{ github.sha }} .
+          echo "image_digest=$(docker inspect --format='{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}local-build{{end}}' $IMAGE)"
+          echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"
+
+          MEANS=
+          leg=0
+          for n in 1 "$TUNNELS" 1; do
+            leg=$((leg+1))
+            echo "--- leg $leg: N=$n ---"
+            # Vantage is the variable this control holds constant, so record it
+            # PER LEG rather than once for the job. An egress rotation mid-job
+            # invalidates the comparison, and one curl per leg lets the receipt
+            # SAY that, instead of leaving a reader to infer it from a wide
+            # noise floor that has several other explanations.
+            echo "leg${leg}_public_ip=$(curl -fsS https://api.ipify.org || echo unavailable)"
+            pids=""
+            # amt-verify exits 1 on `outcome: timeout`, the NORMAL end of a
+            # bounded sample (BLO-26574, CTO ruling item 5), so the exit code is
+            # not the verdict here any more than it is in the probe job. The
+            # receipt is. Suspend -e across the reap for that reason.
+            set +e
+            for i in $(seq 1 "$n"); do
+              docker run --rm --network host $IMAGE \
+                --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
+                --timeout "$TIMEOUT" --packet-count "$PACKETS" --json --verbose \
+                >"leg$leg-report-$i.json" 2>"leg$leg-verbose-$i.log" &
+              pids="$pids $!"
+            done
+            for p in $pids; do wait "$p"; done
+            set -e
+
+            # Per-receipt telemetry BEFORE the mean, so a VOID names the leg and
+            # the field that caused it rather than reporting a bare null.
+            for i in $(seq 1 "$n"); do
+              jq -rc --argjson l "$leg" --argjson i "$i" \
+                '{leg:$l,tunnel:$i,source,group,packet_count,
+                  implausible:.mmtp.implausible,loss_ratio:.mmtp.loss_ratio}' \
+                "leg$leg-report-$i.json" 2>/dev/null \
+                || echo "{\"leg\":$leg,\"tunnel\":$i,\"receipt\":\"missing-or-unparseable\"}"
+            done
+
+            # Fail CLOSED on every field the mean depends on, and on the COUNT.
+            # A mean taken over the survivors of a partly-failed leg would
+            # silently be a mean over a different N than the leg asked for --
+            # and N is the variable under test, so that is not a degraded
+            # measurement, it is a measurement of something else wearing this
+            # one's label. `length == $n` is the guard that refuses it.
+            #
+            # loss_ratio is amt-verify's own field and is byte-identical to the
+            # AC's `gaps/(gaps+received)` -- verified on run 36474867098's three
+            # receipts, including the non-zero one (25/68487 -> 0.0003650327799
+            # by both). Read it rather than recomputing it, but assert it is a
+            # number: an absent field would otherwise arrive as null and a
+            # null mean would read as 0.
+            mean=$(jq -s --arg s "$SOURCE" --arg g "$GROUP" --argjson n "$n" '
+              if (length == $n)
+                 and all(.[]; .source == $s and .group == $g
+                              and (.packet_count // 0) > 0
+                              and (.mmtp.implausible // 1) == 0
+                              and ((.mmtp.loss_ratio | type) == "number"))
+              then (map(.mmtp.loss_ratio) | add / length)
+              else null end' leg$leg-report-*.json 2>/dev/null) || mean=null
+            [ -n "$mean" ] || mean=null
+            echo "leg${leg}_n=$n leg${leg}_mean_loss=$mean"
+            MEANS="${MEANS:+$MEANS,}$mean"
+          done
+
+          echo "leg_mean_losses=[$MEANS]"
+          # One jq for the arithmetic: shell cannot compare floats, and awk
+          # would be a second dialect for no gain. Emits TAB-separated
+          # verdict/signal/noise/why so the shell never parses a float.
+          verdict=$(jq -rn --argjson m "[$MEANS]" --argjson t "$THRESH" '
+            if ($m | length) != 3 or any($m[]; . == null)
+            then "VOID\tnull\tnull\tat least one leg produced no usable mean"
+            else
+              $m[0] as $a | $m[1] as $b | $m[2] as $c
+              | (($a + $c) / 2)                          as $base
+              | ($b - $base)                             as $signal
+              | (($a - $c) | if . < 0 then -. else . end) as $noise
+              | if   $noise  >= $t then "VOID\t\($signal)\t\($noise)\tnoise floor >= threshold"
+                elif $signal >= $t then "FAIL\t\($signal)\t\($noise)\tfan-out cost >= threshold"
+                else                    "PASS\t\($signal)\t\($noise)\tfan-out cost < threshold" end
+            end') || verdict=$(printf 'VOID\tnull\tnull\tverdict arithmetic failed')
+          v=$(printf '%s' "$verdict" | cut -f1)
+          signal=$(printf '%s' "$verdict" | cut -f2)
+          noise=$(printf '%s' "$verdict" | cut -f3)
+          why=$(printf '%s' "$verdict" | cut -f4)
+          echo "fanout_loss_signal=$signal fanout_loss_noise_floor=$noise threshold=$THRESH verdict=$v"
+
+          case "$v" in
+            PASS)
+              echo "PASS: fan-out to N=$TUNNELS cost $signal loss over the mean of its two bracketing N=1 legs, against a noise floor of $noise and a threshold of $THRESH. Both terms are same-vantage and same-minute, so this is a measurement of the relay and not of the runner's egress."
+              ;;
+            # VOID is checked FIRST on purpose. When the floor is wide the
+            # signal is uninterpretable in EITHER direction -- a small delta
+            # over a drifting baseline is not evidence of a cheap fan-out, it
+            # is evidence that this run could not ask the question. Scoring it
+            # PASS would be the retired clause's defect with the sign flipped.
+            VOID)
+              echo "::error::VOID, not FAIL: $why (signal=$signal noise_floor=$noise threshold=$THRESH). This run cannot answer whether fan-out costs loss, and that is NOT a relay verdict -- do not read it as one and do not re-roll hoping for a quiet vantage. If the floor is wide the public path drifted across the legs; re-dispatch and, if it persists, the vantage is unusable for a measurement at this threshold. If a leg produced no usable mean, read the per-receipt lines above: a leg that failed to ESTABLISH fan-out is oneshot's verdict (exit 91/93), not this job's."
+              exit 91
+              ;;
+            FAIL)
+              echo "::error::FAIL: fan-out to N=$TUNNELS cost $signal loss over its two bracketing N=1 legs (noise floor $noise, threshold $THRESH). The floor is BELOW the threshold, so the path was stable enough to ask and the cost is attributable to serving N tunnels rather than 1."
+              exit 1
+              ;;
+            *)
+              echo "::error::unreachable verdict '$v' -- the jq above emits only PASS/FAIL/VOID, so this means its output shape changed"; exit 92
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: amt-loss-delta
+          path: |
+            leg*-report-*.json
+            leg*-verbose-*.log
