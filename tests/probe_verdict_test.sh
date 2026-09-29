@@ -134,6 +134,9 @@ case "$loss" in
   ''|none) mmtp= ;;
   imp)     mmtp=',"mmtp":{"implausible":1,"loss_ratio":0}' ;;
   noloss)  mmtp=',"mmtp":{"implausible":0}' ;;
+  # A receipt for a DIFFERENT (S,G) with an otherwise clean mmtp block, so the
+  # per-leg `.source == $s and .group == $g` clause is the only guard that sees it.
+  badsg)   SOURCE=198.51.100.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015}' ;;
   *)       mmtp=",\"mmtp\":{\"implausible\":0,\"loss_ratio\":$loss}" ;;
 esac
 echo "{\"source\":\"$SOURCE\",\"group\":\"$GROUP\",\"packet_count\":$pc,\"outcome\":\"timeout\"$mmtp}"
@@ -682,6 +685,14 @@ run_delta_case "receipt with no mmtp block -> VOID" \
 # it. Same family as every other "an absent field is not a zero" trap here.
 run_delta_case "mmtp present but loss_ratio absent -> VOID" \
   3 1,1,1,1,1 0.001,0.0015,noloss,0.0015,0.001 30 91
+
+# A receipt that echoes a different source/group is not a measurement of this
+# run's channel. Without the (S,G) clause in the per-leg mean it is averaged in
+# like any other tunnel, and a clean-looking stray receipt lowers the leg mean.
+# Every other guard passes this receipt, so this case is the one that holds the
+# clause; removing it turns this case green.
+run_delta_case "receipt echoes a different source/group -> VOID" \
+  3 1,1,1,1,1 0.001,0.0015,badsg,0.0015,0.001 30 91
 
 # implausible != 0 means the sequence numbers cannot be trusted, so neither can
 # a loss ratio derived from them.
