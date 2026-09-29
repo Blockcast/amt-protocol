@@ -115,11 +115,47 @@ while ! mkdir "$STUB_DIR/.claim.$((n+1))" 2>/dev/null; do n=$((n+1)); done
 n=$((n+1))
 pc=$(echo "$PC_LIST"   | cut -d, -f"$n")
 ec=$(echo "$EXIT_LIST" | cut -d, -f"$n")
-echo "{\"source\":\"$SOURCE\",\"group\":\"$GROUP\",\"packet_count\":$pc,\"outcome\":\"timeout\"}"
+# BLO-33636 AC 2 delta control. LOSS_LIST is optional and unset for every probe
+# case, which read only source/group/packet_count -- so those receipts keep the
+# shape they had. Two sentinels the delta cases need and a float cannot express:
+#   none = emit NO mmtp block at all (an older client build), which is what
+#          exercises the `loss_ratio | type == "number"` guard. An absent field
+#          arrives as null and a null must NOT be allowed to read as 0.
+#   imp  = emit mmtp with implausible=1, the sequence-validity guard.
+# A non-numeric token otherwise lands in the JSON verbatim and corrupts the
+# receipt, which is the same `oops` mechanism PC_LIST already uses.
+loss=$(echo "${LOSS_LIST:-}" | cut -d, -f"$n")
+# An EMPTY receipt: the container died before writing (OOM-kill, evicted).
+# The shell redirect still creates the file, so jq -s sees a valid input
+# carrying ZERO values -- it does not error, the leg's array is simply one
+# element short. That is what the `length == $n` count guard is for.
+if [ "$pc" = empty ]; then echo "handshake trace" >&2; exit "$ec"; fi
+case "$loss" in
+  ''|none) mmtp= ;;
+  imp)     mmtp=',"mmtp":{"implausible":1,"loss_ratio":0}' ;;
+  noloss)  mmtp=',"mmtp":{"implausible":0}' ;;
+  # A receipt for a DIFFERENT source, or a DIFFERENT group, with an otherwise
+  # clean mmtp block, so one conjunct of the per-leg `.source == $s and
+  # .group == $g` clause is the only guard that sees it. Two sentinels, not one
+  # that varies both: a receipt wrong in both fields fails each conjunct, so
+  # either conjunct alone would still void it and the other would go unheld.
+  badsrc)  SOURCE=198.51.100.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015}' ;;
+  badgrp)  GROUP=232.9.9.9; mmtp=',"mmtp":{"implausible":0,"loss_ratio":0.0015}' ;;
+  *)       mmtp=",\"mmtp\":{\"implausible\":0,\"loss_ratio\":$loss}" ;;
+esac
+echo "{\"source\":\"$SOURCE\",\"group\":\"$GROUP\",\"packet_count\":$pc,\"outcome\":\"timeout\"$mmtp}"
 echo "handshake trace" >&2
 exit "$ec"
 EOF
 chmod +x "$WORK/bin/docker"
+# The delta step curls api.ipify.org once per leg for its per-leg vantage
+# receipt. Stub it: a unit test must not depend on egress, and the real call
+# would also be the slowest thing in this file by two orders of magnitude.
+cat >"$WORK/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "203.0.113.7"
+EOF
+chmod +x "$WORK/bin/curl"
 export PATH="$WORK/bin:$PATH" STUB_DIR="$WORK"
 
 FAILED=0
@@ -542,5 +578,184 @@ if bad:
     sys.exit(1)
 print("PASS  route gate routes exactly one row for every non-success scheduled end")
 PY
+
+# ---------------------------------------------------------------------------
+# BLO-33636 AC 2 (AMENDED 2026-09-29): the fan-out loss DELTA control.
+#
+# Extracted the same way as probe.sh, from the `loss-delta` job, so this tests
+# the shipped shell rather than a copy that can drift. The probe extractor
+# above is scoped to jobs['probe'], so the new job cannot disturb it.
+# ---------------------------------------------------------------------------
+python3 - "$WORKFLOW" "$WORK/delta.sh" <<'PY'
+import sys, yaml
+wf, out = sys.argv[1], sys.argv[2]
+steps = yaml.safe_load(open(wf))['jobs']['loss-delta']['steps']
+block = next(s['run'] for s in steps if 'run' in s and 'docker pull' in s['run'])
+open(out, 'w').write(block)
+PY
+[ -s "$WORK/delta.sh" ] || { echo "ABORT: could not extract delta.sh from $WORKFLOW (the 'loss-delta' job renamed, or its 'docker pull' step moved)" >&2; exit 2; }
+
+# run_delta_case <name> <N> <pcs> <losses> <timeout> <want>
+#
+# PC_LIST/LOSS_LIST are FLAT across all three legs, in leg order: index 1 is
+# leg 1 (N=1), 2..N+1 are the middle leg, N+2 is leg 3. Within the middle leg
+# the N concurrent stubs claim indices in a racy order, but every assertion
+# here is order-independent by construction -- a mean does not care, and one
+# bad receipt invalidates the leg whichever slot it lands in.
+run_delta_case() {
+  local name=$1 n=$2 pcs=$3 losses=$4 tmo=$5 want=$6 got
+  local dir; dir=$(mktemp -d -p "$WORK"); rm -rf "$WORK"/.claim.*
+  ( cd "$dir"
+    export TUNNELS=$n PC_LIST=$pcs LOSS_LIST=$losses EXIT_LIST=1,1,1,1,1,1,1,1 \
+           RELAY=1.2.3.4 SOURCE=69.25.95.192 GROUP=232.1.1.60 \
+           TIMEOUT=$tmo PACKETS=3
+    bash "$WORK/delta.sh" >out.log 2>&1
+  ); got=$?
+  if [ "$got" = "$want" ]; then
+    echo "PASS  $name (exit $got)"
+  else
+    echo "FAIL  $name: want exit $want, got $got"; FAILED=1
+    sed -n '1,40p' "$dir/out.log" | sed 's/^/      /'
+  fi
+}
+
+# Reference legs are 1,3,1 with THRESH=0.002.
+#
+#   base   = mean(leg1, leg3);  signal = leg2 - base;  noise = |leg1 - leg3|
+#
+# 0 = PASS, 1 = FAIL (fan-out costs loss), 91 = VOID, 92 = rejected input.
+
+# signal = 0.0015 - 0.001 = 0.0005 < 0.002; noise = 0. The instrument's
+# positive control: it must be able to return a PASS, or every red below is
+# vacuous.
+run_delta_case "clean fan-out -> PASS" \
+  3 1,1,1,1,1 0.001,0.0015,0.0015,0.0015,0.001 30 0
+
+# signal = 0.005 - 0.001 = 0.004 >= 0.002 over a floor of 0, so the path was
+# stable enough to ask and the cost is attributable to serving 3 tunnels.
+run_delta_case "fan-out costs loss over a quiet floor -> FAIL" \
+  3 1,1,1,1,1 0.001,0.005,0.005,0.005,0.001 30 1
+
+# The VOID arm must beat a clean-looking PASS. noise = |0.001 - 0.010| = 0.009
+# >= 0.002, so the run cannot ask the question. Note the signal here is
+# NEGATIVE (0.0015 - 0.0055 = -0.004), i.e. it clears the PASS test
+# comfortably -- so an implementation without the VOID arm reports a clean PASS
+# off a baseline that moved 9x the threshold underneath it. That is the retired
+# absolute clause's defect with the sign flipped.
+run_delta_case "wide noise floor beats a clean-looking signal -> VOID" \
+  3 1,1,1,1,1 0.001,0.0015,0.0015,0.0015,0.010 30 91
+
+# THE PRECEDENCE CASE: both arms fire at once. base = 0.0035, so signal =
+# 0.0065 >= 0.002 AND noise = |0.001 - 0.006| = 0.005 >= 0.002. VOID and FAIL
+# are BOTH true and the order of the tests decides which is reported -- the
+# ruling says VOID, because a large signal measured across a baseline that
+# moved by 2.5x the threshold is not evidence that fan-out is expensive, it is
+# evidence that this run could not tell. Reporting FAIL there would indict a
+# relay on the runner's egress, which is the whole defect being retired.
+#
+# The case above does NOT test this: with a negative signal only one arm can
+# fire, so swapping the two tests leaves its verdict unchanged. Only a case
+# where both are true can see the order at all.
+run_delta_case "wide floor AND large signal -> VOID, not FAIL" \
+  3 1,1,1,1,1 0.001,0.010,0.010,0.010,0.006 30 91
+
+# A zero-data tunnel in the middle leg. The mean must NOT be taken over the two
+# survivors: that would be a 2-tunnel measurement wearing a 3-tunnel label, and
+# N is the variable under test. Establishing fan-out is oneshot's verdict, so
+# this routes VOID rather than being re-diagnosed here.
+run_delta_case "zero-data tunnel in the middle leg -> VOID" \
+  3 1,1,0,1,1 0.001,0.0015,0.0015,0.0015,0.001 30 91
+
+# An older client build with no mmtp block at all.
+run_delta_case "receipt with no mmtp block -> VOID" \
+  3 1,1,1,1,1 0.001,0.0015,none,0.0015,0.001 30 91
+
+# mmtp PRESENT and implausible=0, but loss_ratio ABSENT -- a build that reports
+# sequence validity without a loss figure.
+#
+# ⚠ This case exists because mutation testing caught the one above being
+# INERT for the `loss_ratio | type == "number"` guard. With no mmtp block the
+# `implausible // 1` guard fires first and returns null anyway, so removing the
+# type guard left that case green and the type guard was untested -- a guard
+# with a confident comment and nothing holding it. Here implausible is a clean
+# 0, so the type guard is the ONLY thing that sees the absent field.
+#
+# Without it, `map(.mmtp.loss_ratio)` yields [0.0015, null, 0.0015]; jq's `add`
+# treats null as the identity rather than erroring, so it sums to 0.003 and
+# divides by 3 for a mean of 0.001. The missing receipt is silently scored as a
+# PERFECT zero-loss tunnel, the leg looks clean, and the run reports PASS. A
+# non-numeric loss_ratio (a string) would make `add` error and land on null by
+# accident -- absence is the shape that fails open, which is why this case uses
+# it. Same family as every other "an absent field is not a zero" trap here.
+run_delta_case "mmtp present but loss_ratio absent -> VOID" \
+  3 1,1,1,1,1 0.001,0.0015,noloss,0.0015,0.001 30 91
+
+# A receipt that echoes a different source or group is not a measurement of
+# this run's channel. Without the (S,G) clause in the per-leg mean it is
+# averaged in like any other tunnel, and a clean-looking stray receipt lowers
+# the leg mean. Every other guard passes these receipts, so each case holds one
+# conjunct: replacing `.source == $s` with `true` turns the first green, and
+# replacing `.group == $g` with `true` turns the second green.
+run_delta_case "receipt echoes a different source -> VOID" \
+  3 1,1,1,1,1 0.001,0.0015,badsrc,0.0015,0.001 30 91
+run_delta_case "receipt echoes a different group -> VOID" \
+  3 1,1,1,1,1 0.001,0.0015,badgrp,0.0015,0.001 30 91
+
+# implausible != 0 means the sequence numbers cannot be trusted, so neither can
+# a loss ratio derived from them.
+run_delta_case "implausible sequence numbers -> VOID" \
+  3 1,1,1,1,1 0.001,0.0015,imp,0.0015,0.001 30 91
+
+# A corrupt receipt: `oops` lands in the JSON verbatim, so the file will not
+# parse and the leg has no usable mean.
+run_delta_case "unparseable receipt -> VOID" \
+  3 1,1,oops,1,1 0.001,0.0015,0.0015,0.0015,0.001 30 91
+
+# An EMPTY receipt -- the container died before writing. Distinct from the
+# corrupt one above and caught by a different guard: jq -s does NOT error on an
+# empty input, it just yields one value fewer, so the leg would otherwise be
+# scored as a clean 2-tunnel run wearing a 3-tunnel label. `length == $n` is
+# the only thing that sees it.
+run_delta_case "empty receipt (container died mid-write) -> VOID" \
+  3 1,1,empty,1,1 0.001,0.0015,0.0015,0.0015,0.001 30 91
+
+# N=1 makes the middle leg a control leg: signal is 0 by construction and the
+# run would report PASS having measured nothing. Rejected at the boundary.
+run_delta_case "N=1 is a vacuous green -> rejected" \
+  1 1,1,1 0.001,0.001,0.001 30 92
+run_delta_case "non-integer N -> rejected" \
+  abc 1,1,1 0.001,0.001,0.001 30 92
+
+# Three legs run sequentially, so the job's wall clock is ~3x timeout. Reject
+# at the boundary rather than letting the job cap CANCEL the run mid-leg: a
+# cancelled job emits no verdict, which reads as a missing measurement rather
+# than a rejected input.
+run_delta_case "3 x timeout over the job budget -> rejected" \
+  3 1,1,1,1,1 0.001,0.001,0.001,0.001,0.001 400 92
+
+# The legs must be ordered 1, N, 1 -- bracketing, not 1,1,N. Ordered 1,1,N the
+# noise floor is measured entirely BEFORE the signal and cannot witness drift
+# across the interval the signal was taken in, which is the whole reason the
+# ruling specified this order. A source-level assertion because the exit code
+# cannot distinguish the two orders on a stationary stub path.
+grep -q 'for n in 1 "\$TUNNELS" 1; do' "$WORK/delta.sh" \
+  && echo "PASS  delta legs bracket the N leg (1, N, 1)" \
+  || { echo "FAIL  delta legs are not ordered 1, N, 1 -- the noise floor no longer spans the signal"; FAILED=1; }
+
+# The threshold decides the result, so a dispatch caller must not be able to
+# supply it. Same contract as DISTINCT_SOURCE_IPS in the probe job.
+grep -q '^ *THRESH=0.002' "$WORK/delta.sh" \
+  && echo "PASS  delta threshold is a constant, not an input" \
+  || { echo "FAIL  delta threshold is no longer a hardcoded constant"; FAILED=1; }
+
+# A wide floor has two causes with different follow-ups -- the egress rotated,
+# or the path drifted while the address held -- and only the per-leg addresses
+# tell them apart. Live run 36568716671 hit the second (one IP across all three
+# legs, floor 0.0088), so a VOID that does not report the vantage sends the
+# reader to re-dispatch against a vantage that cannot answer. Source-level
+# because the exit code is 91 either way.
+grep -q 'vantage=\$vantage' "$WORK/delta.sh" \
+  && echo "PASS  VOID message reports the vantage addresses" \
+  || { echo "FAIL  VOID no longer reports vantage: a rotated egress and a drifting path are indistinguishable"; FAILED=1; }
 
 [ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }
