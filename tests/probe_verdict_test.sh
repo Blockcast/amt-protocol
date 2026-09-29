@@ -165,11 +165,18 @@ run_case "N=1 unparseable receipt -> red"                1 "oops"    "1"   nonze
 
 # Ally review of #25 (head 0ad7198), Important (1). k=1 is the real rig: every
 # container shares the runner netns, and the relay keys tunnel state on source
-# ADDRESS, so N>1 cannot establish fan-out. Both of these USED to be decided by
-# packet_count -- "both receiving" was asserted GREEN here, which is the false
-# positive Ally flagged, and "second zero-data" exited 1 with a message blaming
-# delivery. Both are now VOID (91), decided before packet_count is consulted.
-run_case "N=2 both receiving, k=1 -> void"               2 "500,500" "1,1" 91  1
+# ADDRESS, so N>1 cannot establish fan-out. "second zero-data" used to exit 1
+# with a message blaming delivery; it is now VOID (91), decided before
+# packet_count is consulted.
+#
+# ⚠ "both receiving, k=1" USED TO ASSERT 91 AND NOW ASSERTS 0. That test
+# encoded the premise this PR retires: with the old `TUNNELS -gt K` guard the
+# verdict never looked at what the run measured, so 2/2 receiving from one
+# address was voided as "the relay must be pre-fix". Prod .128 was rolled onto
+# the endpoint-key module on 2026-09-28 and run 36474867098 then took 3/3 from
+# ONE public address -- so ok > K is now the DEMONSTRATION that the relay
+# fans out, and voiding it would fail the only runs that can prove the fix.
+run_case "N=2 both receiving, k=1 -> green (fan-out demonstrated)" 2 "500,500" "1,1" 0 1
 run_case "N=2 second zero-data, k=1 -> void not red"     2 "500,0"   "1,1" 91  1
 
 # Ally review of #25 (head 73c16a1), Important (1). Every case above exports
@@ -184,6 +191,21 @@ run_case "N=2 second zero-data, k unset -> void (prod default)" 2 "500,0" "1,1" 
 run_case "N=2 second zero-data, k=2 -> red"              2 "500,0"   "1,1" 1   2
 run_case "N=2 first zero-data, k=2 -> red"               2 "0,500"   "1,1" 1   2
 run_case "N=2 both receiving, k=2 -> green"              2 "500,500" "1,1" 0   2
+
+# Ally review of #39 (head fed8b706), Important (1). The VOID condition must
+# key on K, not on a literal 1: byte-identical while K is 1, but with distinct
+# source addresses a run that never demonstrated fan-out would go GREEN. Here
+# N=3 over k=2 addresses with only 2 receiving is exactly that -- ok <= K, so
+# nothing was demonstrated beyond what k already gives you. Mutation-checked:
+# with the literal-1 form this case scores 1 -- a routed OUTAGE row for a run
+# that established no fan-out at all. Only the K form voids it.
+run_case "N=3, ok=2, k=2 -> void (no fan-out beyond k)"  3 "500,500,0" "1,1,1" 91 2
+
+# Ally review of #39 (head fed8b706), Important (2). The partial knee is a
+# relay at its per-source cap: it IS forwarding, to ok tunnels. It used to fall
+# through to the aggregate verdict, which sets ZERO_DATA=1 and files an OUTAGE
+# row. Distinct code, and ZERO_DATA stays unset so neither routing arm fires.
+run_case "N=3, ok=2, k=1 -> knee not outage"             3 "500,500,0" "1,1,1" 93 1
 
 # Ally review of #25 (head 0ad7198), Important (2). `tunnels` is a dispatch
 # input used as the launch count; reject at the boundary, not mid-loop.

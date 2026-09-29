@@ -554,18 +554,50 @@ jobs:
           # 36474867098 printed `tunnels_receiving=3/3` and still exited 91,
           # citing a pre-fix relay, against data showing the relay is not.
           #
-          # `ok` is the count of tunnels that actually received data, so ok >= 2
-          # IS the demonstration that one source address presented more than one
-          # endpoint -- no version lookup, no per-relay table, nothing to rot.
-          # VOID now fires only when fan-out was NOT demonstrated (ok <= 1 with
-          # TUNNELS > 1), which is exactly the case where "harness ceiling" and
+          # `ok` is the count of tunnels that actually received data, so ok > K
+          # IS the demonstration that K source addresses presented more than K
+          # endpoints -- no version lookup, no per-relay table, nothing to rot.
+          # VOID now fires only when fan-out was NOT demonstrated (ok <= K with
+          # TUNNELS > K), which is exactly the case where "harness ceiling" and
           # "relay keys on address alone" are indistinguishable and the
-          # misattribution below is possible. Where ok is 2..TUNNELS-1 there is
-          # a real partial knee, and the packet_count verdict downstream is the
-          # honest report of it.
-          if [ "$TUNNELS" -gt 1 ] && [ "$ok" -le 1 ]; then
+          # misattribution below is possible.
+          #
+          # ⚠ Ally review (head fed8b706), Important (1): this condition was
+          # written with the literal 1 on both sides, which is byte-identical
+          # today (K is 1; DISTINCT_SOURCE_IPS is set nowhere in this file) but
+          # silently WRONG the moment the rig presents distinct addresses. The
+          # "ok >= 2 proves one address presented two endpoints" inference holds
+          # only while K == 1: with DISTINCT_SOURCE_IPS=3, a 3-tunnel run spread
+          # over 3 addresses yields ok=3, the guard stays silent, and the run
+          # reports fan-out that was never demonstrated -- a false GREEN on the
+          # exact measurement this workflow exists to make. The error string
+          # already printed k=$K, so message and condition disagreed. K is the
+          # instrument; use it. And note K==1 is itself a dated premise with the
+          # same shelf life as the one that expired above -- check it, do not
+          # inherit it.
+          if [ "$TUNNELS" -gt "$K" ] && [ "$ok" -le "$K" ]; then
             echo "::error::VOID as a relay result: $TUNNELS tunnels requested from k=$K source address(es), but only $ok received data -- so no fan-out was established and this run cannot distinguish a harness ceiling from a relay that keys tunnel state on source ADDRESS alone (pre-linux-amt-7ec53567 behaviour). Check the relay the pod is actually on: an unrolled node reproduces exactly this. Harness-ceiling telemetry above is still valid."
             exit 91
+          fi
+          # ⚠ Ally review (head fed8b706), Important (2). The partial knee --
+          # ok in K+1..TUNNELS-1 -- is a relay at its per-source cap, which IS
+          # forwarding, to `ok` tunnels. Falling through to the aggregate
+          # verdict below would set ZERO_DATA=1 and file "[amt-probe] relay not
+          # forwarding to public gateways", i.e. an OUTAGE row for a capability
+          # reading. That false row then swallows the next real alert as a
+          # comment -- the hazard named at the aggregate verdict itself. Split
+          # out with its own code and message, exactly as 91 was split out of
+          # the aggregate for the same misattribution reason.
+          #
+          # ZERO_DATA is deliberately NOT set: arm 1 of the routing gate needs
+          # it, and arm 2 needs event_name == 'schedule'. The scheduled probe
+          # runs tunnels=1 (the input default), so this branch is unreachable
+          # on a schedule -- it needs a deliberate tunnels>=K+2 dispatch, i.e.
+          # the AMT_MAX_TUNNELS_PER_SOURCE ramp anticipated above. Neither arm
+          # fires, which is the intent: a knee is a measurement, not an alert.
+          if [ "$ok" -gt "$K" ] && [ "$ok" -lt "$TUNNELS" ]; then
+            echo "::error::KNEE, not an outage: $ok of $TUNNELS tunnels received data from k=$K source address(es). Fan-out IS established (ok > k), so the relay is forwarding; $((TUNNELS - ok)) tunnel(s) short is a per-source capability ceiling (AMT_MAX_TUNNELS_PER_SOURCE defaults to 16, amt.h:573) or a harness ceiling. Read tunnels_requested/ulimit_n_*/nproc above to tell those apart. NOT routed as a forwarding failure."
+            exit 93
           fi
           # A probe that cannot fail is not a probe: surface the client's verdict
           # as the job's verdict. Receipts still upload via `if: always()`.
@@ -586,7 +618,7 @@ jobs:
           if [ "$ok" -ne "$TUNNELS" ]; then
             echo "::error::$((TUNNELS - ok)) of $TUNNELS tunnel(s) received no data (packet_count=0)"
             # The routing step keys on THIS verdict, not on failure(): exits
-            # 90/91/92, an ipify blip or a login error also fail the job, and
+            # 90/91/92/93, an ipify blip or a login error also fail the job, and
             # filing those as "relay not forwarding" would open a false
             # [amt-probe] issue that swallows the next real alert as a comment.
             # $GITHUB_ENV is processed after the step whatever its exit code.
@@ -621,7 +653,7 @@ jobs:
       #
       # TWO causes, two rows. ZERO_DATA is the relay verdict. Any other bad end
       # on a scheduled run (checkout, registry login, the vantage receipt,
-      # amt-verify's guard exits 90/91/92, or the job cancelled by its own
+      # amt-verify's guard exits 90/91/92/93, or the job cancelled by its own
       # `timeout-minutes`) means the DETECTOR stopped, which is
       # indistinguishable from a healthy relay unless it is filed too. It gets
       # its own `[amt-probe][infra]` title so the two diagnoses never share a
@@ -688,7 +720,7 @@ jobs:
           - Detected at: $(date -u +%FT%TZ)
 
           This is not a relay finding: checkout, registry login, the vantage
-          receipt, or an amt-verify guard (exit 90/91/92) failed -- or the job
+          receipt, or an amt-verify guard (exit 90/91/92/93) failed -- or the job
           was cancelled by its own \`timeout-minutes\`, i.e. it wedged. While it
           persists the detector is not running, and a stopped detector reads as
           a healthy relay (BLO-33585). Fix the run, then close this row."
