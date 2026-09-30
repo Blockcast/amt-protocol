@@ -646,6 +646,10 @@ PY
 
 # run_delta_case <name> <N> <pcs> <losses> <timeout> <want> [<reason>]
 #
+# PACKETS (the dispatch packet_count) is only handed to the stubbed docker, so
+# every receipt-level case runs at 100000, clear of the up-front sample floor.
+# The packet_count boundary cases set it per call: CASE_PACKETS=<v> run_delta_case ...
+#
 # <reason>, when given, must appear in the output: two VOIDs share exit 91, and
 # a case about one cause must not go green on the other.
 #
@@ -660,7 +664,7 @@ run_delta_case() {
   ( cd "$dir"
     export TUNNELS=$n PC_LIST=$pcs LOSS_LIST=$losses EXIT_LIST=1,1,1,1,1,1,1,1 \
            RELAY=1.2.3.4 SOURCE=69.25.95.192 GROUP=232.1.1.60 \
-           TIMEOUT=$tmo PACKETS=3
+           TIMEOUT=$tmo PACKETS=${CASE_PACKETS-100000}
     bash "$WORK/delta.sh" >out.log 2>&1
   ); got=$?
   if [ "$got" != "$want" ]; then
@@ -797,15 +801,17 @@ run_delta_case "receipt with no in_sequence field -> VOID" \
   3 67000,67000,67000,67000,67000 0.001,0.0015,noinseq,0.0015,0.001 30 91
 
 # Ally review of #49 (head fd9591ea), Important. Clean SHORT samples, the shape
-# a default dispatch (PACKETS=3) produces: in_sequence is packet_count - tracks
-# exactly, because no track's first arrival is in-sequence. The in_sequence
-# bar now clears them (the old 0.9 x packet_count refused both, 3 < 3.6 and
-# 3 < 5.4) -- but they are still VOID, for the right reason. One lost packet in
-# 4 reads as 1/5 = 0.2, a hundred times THRESH, and a lossy short leg failed
-# the bar besides (a gap-ending arrival is not in-sequence): short samples
-# returned PASS or VOID and never FAIL. The sample floor refuses them by name,
-# before they can PASS. Same figures as amt-verify's own fixtures
-# contiguous_sequence_is_zero_loss and tracks_are_counted_independently.
+# a default dispatch (PACKETS=3) produced before the up-front refusal below, and
+# a deadline that expires short of packet_count still does: in_sequence is
+# packet_count - tracks exactly, because no track's first arrival is
+# in-sequence. The in_sequence bar now clears them (the old 0.9 x packet_count
+# refused both, 3 < 3.6 and 3 < 5.4) -- but they are still VOID, for the right
+# reason. One lost packet in 4 reads as 1/5 = 0.2, a hundred times THRESH, and
+# a lossy short leg failed the bar besides (a gap-ending arrival is not
+# in-sequence): short samples returned PASS or VOID and never FAIL. The sample
+# floor refuses them by name, before they can PASS. Same figures as
+# amt-verify's own fixtures contiguous_sequence_is_zero_loss and
+# tracks_are_counted_independently.
 run_delta_case "clean short sample, 4 packets / 1 track -> VOID, too short" \
   3 4,4,4,4,4 clean1,clean1,clean1,clean1,clean1 30 91 "sample too short"
 run_delta_case "clean short sample, 6 packets / 3 tracks -> VOID, too short" \
@@ -877,6 +883,23 @@ run_delta_case "unparseable receipt -> VOID" \
 # the only thing that sees it.
 run_delta_case "empty receipt (container died mid-write) -> VOID" \
   3 1,1,empty,1,1 0.001,0.0015,0.0015,0.0015,0.001 30 91
+
+# Ally review of #49 (head 0a907563), Important. packet_count is shared with
+# oneshot and defaults to 3, but received <= packet_count and the sample floor
+# needs received >= floor(1 / THRESH) = 500 -- so a packet_count below 500 can
+# only VOID, after three full legs. Refused up front instead. The receipts are
+# the shape such a dispatch would really produce, so without the refusal each
+# case VOIDs (91) as "sample too short" rather than passing by accident; 500 is
+# the boundary, and PASSes. The `abc` case's receipts clear the floor and would
+# PASS, so the integer guard is the only thing that stops it reaching amt-verify.
+CASE_PACKETS=3 run_delta_case "packet_count=3 (the shared default) -> rejected" \
+  3 3,3,3,3,3 clean1,clean1,clean1,clean1,clean1 30 92 "below the sample floor of 500"
+CASE_PACKETS=499 run_delta_case "packet_count=499, one short of the floor -> rejected" \
+  3 499,499,499,499,499 clean1,clean1,clean1,clean1,clean1 30 92 "below the sample floor of 500"
+CASE_PACKETS=500 run_delta_case "packet_count=500, at the floor -> not refused (PASS)" \
+  3 500,500,500,500,500 clean1,clean1,clean1,clean1,clean1 30 0
+CASE_PACKETS=abc run_delta_case "non-integer packet_count -> rejected" \
+  3 1000,1000,1000,1000,1000 clean1,clean1,clean1,clean1,clean1 30 92 "packet_count must be an integer"
 
 # N=1 makes the middle leg a control leg: signal is 0 by construction and the
 # run would report PASS having measured nothing. Rejected at the boundary.

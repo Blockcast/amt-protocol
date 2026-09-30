@@ -1469,6 +1469,21 @@ jobs:
           if [ "$((TIMEOUT * 3))" -gt 900 ]; then
             echo "::error::3 legs x timeout=${TIMEOUT}s = $((TIMEOUT * 3))s exceeds the 900s budget under this job's 20-minute cap; lower timeout or raise both together"; exit 92
           fi
+          # packet_count is SHARED with oneshot, whose default of 3 is right for
+          # detection and wrong here: the per-receipt SAMPLE FLOOR below needs
+          # (received + 1) x THRESH > 1, so the least usable received is
+          # floor(1 / THRESH) = 500. received <= packet_count always (packet_count
+          # also counts duplicate and behind-the-mark arrivals), so a packet_count
+          # below that cannot clear it: refuse before paying for three legs that
+          # can only VOID. The runtime floor STAYS -- received can still fall short
+          # of a packet_count that clears this (deadline, reordering).
+          case "$PACKETS" in ''|*[!0-9]*)
+            echo "::error::packet_count must be an integer, got '$PACKETS'"; exit 92 ;;
+          esac
+          MIN_PACKETS=$(jq -n --argjson t "$THRESH" '1 / $t | floor')
+          if [ "$PACKETS" -lt "$MIN_PACKETS" ]; then
+            echo "::error::packet_count=$PACKETS is below the sample floor of $MIN_PACKETS: a receipt counts only if (received + 1) x THRESH > 1, i.e. received >= $MIN_PACKETS at THRESH=$THRESH, and received <= packet_count, so all three legs would VOID as 'sample too short'. Dispatch comfortably above $MIN_PACKETS -- late arrivals count in packet_count but not in received."; exit 92
+          fi
 
           docker pull -q $IMAGE || docker build -q -t $IMAGE \
             --label org.opencontainers.image.revision=${{ github.sha }} .
@@ -1551,6 +1566,13 @@ jobs:
             # packet_count - tracks, the smaller basis, they can only read
             # higher. 0.9 sits between those, but note it is set from ONE
             # corrupt observation: widen it only on more.
+            # The bar also caps what this job can report as FAIL: one track with
+            # G gap runs has in_sequence = packet_count - 1 - G against
+            # 0.9 x (packet_count - 1), so G > 0.1 x (packet_count - 1) is refused
+            # as VOID. The cap is on gap RUNS, not lost packets: isolated
+            # single-packet loss hits it near 9% loss_ratio, bursty loss (mean
+            # bursts of 5-21 in BLO-33456) clears the bar at far higher loss.
+            # Frequent scattered loss reads VOID, not FAIL, by design.
             # tracks is asserted numeric like the other two; its `// 0` is the
             # STRICTEST fallback (it restores the packet_count bar), so that
             # conjunct alone refuses an absent tracks. And tracks <= received:
