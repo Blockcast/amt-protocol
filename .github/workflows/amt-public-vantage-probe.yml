@@ -1612,7 +1612,7 @@ jobs:
             if ($m | length) != 3 or any($m[]; . == null)
             then "VOID\tnull\tnull\tat least one leg produced no usable mean (per-receipt lines above name the field; in_sequence is judged against 0.9 x (packet_count - tracks))"
             elif any($m[]; . == "short")
-            then "VOID\tnull\tnull\tsample too short to resolve the threshold: every receipt must have (received + 1) > 1/THRESH = \(1 / $t), so that ONE lost packet reads below THRESH, and at least one did not (received is on the per-receipt lines above). Dispatch with packet_count >= \(1 / $t)"
+            then "VOID\tnull\tnull\tsample too short to resolve the threshold: every receipt must have (received + 1) > 1/THRESH = \(1 / $t), so that ONE lost packet reads below THRESH, and at least one did not (received is on the per-receipt lines above). late (behind-the-mark) arrivals count in packet_count but not in received, so under reordering received falls well short of it (46328 of 67248 on the BLO-33636 receipt): dispatch with packet_count comfortably above \(1 / $t), not at it"
             else
               $m[0] as $a | $m[1] as $b | $m[2] as $c
               | (($a + $c) / 2)                          as $base

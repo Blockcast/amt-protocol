@@ -819,6 +819,17 @@ run_delta_case "received 499, one short of the floor -> VOID, too short" \
 run_delta_case "received 500, at the floor -> PASS" \
   3 500,500,500,500,500 clean1,clean1,clean1,clean1,clean1 30 0
 
+# Ally review of #49 (head 1817b412), Important: the floor's two quantifiers
+# were not mutation-held. The per-receipt floor is `all`: one coarse receipt
+# among long ones must still VOID the leg, or it contributes a mean it cannot
+# resolve (`any` turned this VOID into PASS). The per-leg check is `any`: one
+# short leg among three must VOID by name (`all` fell through to arithmetic on
+# the string "short" and VOIDed as "verdict arithmetic failed").
+run_delta_case "one short receipt among long ones -> VOID, too short" \
+  3 1000,1000,1000,4,1000 clean1,clean1,clean1,clean1,clean1 30 91 "sample too short"
+run_delta_case "one short leg among three -> VOID, too short" \
+  3 4,1000,1000,1000,1000 clean1,clean1,clean1,clean1,clean1 30 91 "sample too short"
+
 # Above the floor, the bar must still subtract tracks. 100 tracks at 600
 # packets: in_sequence is 500, which clears 0.9 x (600 - 100) = 450 and would
 # be refused by 0.9 x 600 = 540. tracks has to exceed a tenth of packet_count
