@@ -1180,4 +1180,20 @@ grep -q 'NOT YET A CREDITED PASS' "$WORK/dverdict.sh" \
   && echo "PASS  a PASS states it is one reading, not a credited pass" \
   || { echo "FAIL  PASS no longer states the >=5-run floor-characterization condition"; FAILED=1; }
 
+# The within-vantage control. The N>1 leg runs its tunnels from ONE address at
+# one instant, so their disagreement is what the cross-vantage floor ASSUMES is
+# the whole story -- and on run 36664230865 the two differed by 266x in the
+# same minute (7.6e-6 within vantage against a 2.02e-3 cross-vantage floor).
+# Without this term a wide floor cannot be told apart from a noisy night, which
+# is the question the >=5-run characterization exists to answer.
+grep -q 'within_vantage_spread=' "$WORK/dverdict.sh" \
+  && echo "PASS  every run emits the within-vantage control beside the floor" \
+  || { echo "FAIL  within_vantage_spread no longer emitted: a wide floor cannot be told from a noisy night"; FAILED=1; }
+# It must be a REPORTED term, never a verdict arm. Gating it needs a constant,
+# and the ruling that commissioned this design reserves new constants to data.
+# A `spread` appearing in the verdict jq would be that constant smuggled in.
+grep -q 'spread' "$WORK/dverdict.sh" && ! grep -qE '\$(sp|spread)[a-z_]* *(>=|<=|>|<)' "$WORK/dverdict.sh" \
+  && echo "PASS  within-vantage spread is reported, not gated" \
+  || { echo "FAIL  within-vantage spread became a verdict arm: that is a new constant chosen by the instrument author"; FAILED=1; }
+
 [ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }

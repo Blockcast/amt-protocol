@@ -1711,12 +1711,34 @@ jobs:
           [ -n "$mean" ] || mean=null
           echo "leg${LEG}_n=$N leg${LEG}_mean_loss=$mean"
 
+          # WITHIN-VANTAGE SPREAD, and it is the control this design was
+          # missing. A leg with N > 1 runs N tunnels from ONE address at one
+          # instant, so the disagreement AMONG them is what two observers
+          # sharing a vantage see -- which is the term the cross-vantage floor
+          # assumes is the whole story. Pairing it with the cross-vantage noise
+          # floor is what makes "the dominant loss is upstream of the vantage"
+          # falsifiable in EVERY run instead of resting on the single
+          # favourable observation that licensed the design.
+          #
+          # REPORTED, NOT GATED, and deliberately so: turning it into a VOID arm
+          # needs a constant, and the ruling that commissioned this design says
+          # a constant comes from data rather than from whoever is writing the
+          # instrument. This emits the data. Null for the N=1 legs, which have
+          # nothing to disagree with. Computed in its own jq so the heavily
+          # mutation-tested mean above is left untouched.
+          spread=$(jq -s '[.[].mmtp.loss_ratio]
+            | if (length > 1) and (all(.[]; type == "number"))
+              then (max - min) else null end' leg$LEG-report-*.json 2>/dev/null) || spread=null
+          [ -n "$spread" ] || spread=null
+          echo "leg${LEG}_within_vantage_spread=$spread"
+
           # --argjson mean so a null stays a JSON null and a float stays a
           # float; --arg ip because "unavailable" is a legal value here and the
           # verdict's distinctness guard must see it as a string, not choke.
           jq -n --argjson leg "$LEG" --argjson n "$N" --argjson mean "$mean" \
+                --argjson spread "$spread" \
                 --arg ip "$ip" --argjson start "$start" --argjson end "$end" \
-            '{leg:$leg,n:$n,mean:$mean,ip:$ip,start:$start,end:$end}' \
+            '{leg:$leg,n:$n,mean:$mean,spread:$spread,ip:$ip,start:$start,end:$end}' \
             | tee "leg-$LEG.json"
 
       - uses: actions/upload-artifact@v4
@@ -1844,6 +1866,15 @@ jobs:
           vantage=$(jq -rn --argjson l "$legs" '[$l[].ip] | join("/")' 2>/dev/null || echo unknown)
           echo "vantage_addresses=$vantage"
           echo "floor_legs=$(jq -rn --argjson l "$legs" '[$l[] | select(.n == 1) | .mean | tostring] | join(",")' 2>/dev/null || echo unknown)"
+          # The paired control. `noise` is what two observers on DIFFERENT
+          # vantages disagreed by; this is what N observers on ONE vantage
+          # disagreed by, at the same instant, against the same relay and
+          # stream. The cross-vantage floor is only a floor if the two are
+          # comparable -- if within-vantage agreement is orders of magnitude
+          # tighter, the floor is measuring the vantages rather than the path,
+          # and a wide floor is a property of the DESIGN rather than of the
+          # night. Reported so that question is answerable from any run.
+          echo "within_vantage_spread=$(jq -rn --argjson l "$legs" '[$l[] | select(.n > 1) | .spread | tostring] | join(",")' 2>/dev/null || echo unknown)"
           echo "fanout_loss_signal=$signal fanout_loss_noise_floor=$noise threshold=$THRESH verdict=$v"
 
           case "$v" in
