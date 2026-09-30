@@ -1469,6 +1469,21 @@ jobs:
           if [ "$((TIMEOUT * 3))" -gt 900 ]; then
             echo "::error::3 legs x timeout=${TIMEOUT}s = $((TIMEOUT * 3))s exceeds the 900s budget under this job's 20-minute cap; lower timeout or raise both together"; exit 92
           fi
+          # packet_count is SHARED with oneshot, whose default of 3 is right for
+          # detection and wrong here: the per-receipt SAMPLE FLOOR below needs
+          # (received + 1) x THRESH > 1, so the least usable received is
+          # floor(1 / THRESH) = 500. received <= packet_count always (packet_count
+          # also counts duplicate and behind-the-mark arrivals), so a packet_count
+          # below that cannot clear it: refuse before paying for three legs that
+          # can only VOID. The runtime floor STAYS -- received can still fall short
+          # of a packet_count that clears this (deadline, reordering).
+          case "$PACKETS" in ''|*[!0-9]*)
+            echo "::error::packet_count must be an integer, got '$PACKETS'"; exit 92 ;;
+          esac
+          MIN_PACKETS=$(jq -n --argjson t "$THRESH" '1 / $t | floor')
+          if [ "$PACKETS" -lt "$MIN_PACKETS" ]; then
+            echo "::error::packet_count=$PACKETS is below the sample floor of $MIN_PACKETS: a receipt counts only if (received + 1) x THRESH > 1, i.e. received >= $MIN_PACKETS at THRESH=$THRESH, and received <= packet_count, so all three legs would VOID as 'sample too short'. Dispatch comfortably above $MIN_PACKETS -- late arrivals count in packet_count but not in received."; exit 92
+          fi
 
           docker pull -q $IMAGE || docker build -q -t $IMAGE \
             --label org.opencontainers.image.revision=${{ github.sha }} .
@@ -1509,7 +1524,8 @@ jobs:
             # the field that caused it rather than reporting a bare null.
             for i in $(seq 1 "$n"); do
               jq -rc --argjson l "$leg" --argjson i "$i" \
-                '{leg:$l,tunnel:$i,source,group,packet_count,
+                '{leg:$l,tunnel:$i,source,group,packet_count,received:.mmtp.received,
+                  in_sequence:.mmtp.in_sequence,tracks:.mmtp.tracks,
                   implausible:.mmtp.implausible,loss_ratio:.mmtp.loss_ratio}' \
                 "leg$leg-report-$i.json" 2>/dev/null \
                 || echo "{\"leg\":$leg,\"tunnel\":$i,\"receipt\":\"missing-or-unparseable\"}"
@@ -1528,13 +1544,82 @@ jobs:
             # by both). Read it rather than recomputing it, but assert it is a
             # number: an absent field would otherwise arrive as null and a
             # null mean would read as 0.
-            mean=$(jq -s --arg s "$SOURCE" --arg g "$GROUP" --argjson n "$n" '
+            #
+            # loss_ratio counts SEQUENCE CONTINUITY, not delivery, so it reads
+            # HIGH under reordering or duplication -- a direction no threshold
+            # on it can detect, because the inflated value is a perfectly
+            # ordinary float. Measured on run 36613263318 (BLO-33636): a leg
+            # reported loss_ratio 0.3242 with implausible=0 while receiving
+            # 67248 packets, the MOST of its round (peers 66920/66923). A third
+            # of the stream was plainly not lost; its sequence space was read
+            # twice. in_sequence is the field that says so.
+            #
+            # in_sequence counts arrivals exactly one past their track's previous
+            # number, so a track's FIRST arrival is never in it (amt-verify
+            # SeqTracker::observe): a perfectly clean stream has in_sequence ==
+            # packet_count - tracks EXACTLY. The bar is 0.9 of that, not of
+            # packet_count -- against packet_count it was unsatisfiable below
+            # ~10 x tracks packets, and PACKETS defaults to 3, so every default
+            # dispatch VOIDed (Ally review, PR #49). The corrupt leg above sat at
+            # 0.507 (in_sequence 34115 of 67248 - 9 tracks). The 15 healthy
+            # receipts taken that day read 0.996..1.000 of packet_count; against
+            # packet_count - tracks, the smaller basis, they can only read
+            # higher. 0.9 sits between those, but note it is set from ONE
+            # corrupt observation: widen it only on more.
+            # The bar also caps what this job can report as FAIL: one track with
+            # G gap runs has in_sequence = packet_count - 1 - G against
+            # 0.9 x (packet_count - 1), so G > 0.1 x (packet_count - 1) is refused
+            # as VOID. The cap is on gap RUNS, not lost packets: isolated
+            # single-packet loss hits it near 9% loss_ratio, bursty loss (mean
+            # bursts of 5-21 in BLO-33456) clears the bar at far higher loss.
+            # Frequent scattered loss reads VOID, not FAIL, by design.
+            # tracks is asserted numeric like the other two; its `// 0` is the
+            # STRICTEST fallback (it restores the packet_count bar), so that
+            # conjunct alone refuses an absent tracks. And tracks <= received:
+            # every track's first arrival is in received (SeqTracker::observe),
+            # so a genuine receipt cannot break it, and without it a corrupt
+            # tracks drives the bar negative and waves any in_sequence through.
+            # Bounded by received rather than packet_count because that is the
+            # invariant amt-verify actually holds, and it leaves the
+            # packet_count > 0 guard its own witness.
+            #
+            # SAMPLE FLOOR. A clean sample of 3 packets has in_sequence 2, which
+            # clears the bar -- but it cannot measure loss at THRESH. One lost
+            # packet reads as 1/(received + 1) (loss_ratio = gaps / (gaps +
+            # received)), so at 3 packets it is 0.25 -- and a lossy short leg
+            # fails the bar besides, since a gap-ending arrival is not
+            # in-sequence. Without a floor a short run returns PASS or VOID and
+            # never FAIL. The floor is derived from THRESH, not chosen: a receipt
+            # counts only if ONE lost packet would read BELOW THRESH, i.e.
+            # (received + 1) x THRESH > 1 -- received >= 500 at 0.002.
+            # received, not packet_count - tracks: received is the ratio's own
+            # denominator term, so this is its resolution exactly. packet_count
+            # also counts duplicate and behind-the-mark arrivals the ratio never
+            # sees -- 20920 of 67248 on the reordering receipt above -- so it
+            # can claim a resolution the ratio does not have. Arithmetic rather
+            # than `>=` so a non-numeric received errors (jq orders strings
+            # above every number) instead of passing. It is checked only once
+            # every other guard has passed, so the leg reports "short" rather
+            # than null, and the VOID names that cause rather than a bare null.
+            #
+            # The in_sequence bar is kept LAST in the conjunction on purpose.
+            # jq's `and` short-circuits, so a guard placed earlier would
+            # swallow the `noloss` and `imp` receipts before their own guards
+            # saw them and silently make those two untestable (BLO-33636: an
+            # inert guard already shipped here once for exactly this reason).
+            mean=$(jq -s --arg s "$SOURCE" --arg g "$GROUP" --argjson n "$n" --argjson t "$THRESH" '
               if (length == $n)
                  and all(.[]; .source == $s and .group == $g
                               and (.packet_count // 0) > 0
                               and (.mmtp.implausible // 1) == 0
-                              and ((.mmtp.loss_ratio | type) == "number"))
-              then (map(.mmtp.loss_ratio) | add / length)
+                              and ((.mmtp.loss_ratio | type) == "number")
+                              and ((.mmtp.in_sequence | type) == "number")
+                              and ((.mmtp.tracks | type) == "number")
+                              and (.mmtp.tracks <= .mmtp.received)
+                              and (.mmtp.in_sequence >= (((.packet_count // 0) - (.mmtp.tracks // 0)) * 0.9)))
+              then if all(.[]; ((.mmtp.received + 1) * $t) > 1)
+                   then (map(.mmtp.loss_ratio) | add / length)
+                   else "short" end
               else null end' leg$leg-report-*.json 2>/dev/null) || mean=null
             [ -n "$mean" ] || mean=null
             echo "leg${leg}_n=$n leg${leg}_mean_loss=$mean"
@@ -1547,7 +1632,9 @@ jobs:
           # verdict/signal/noise/why so the shell never parses a float.
           verdict=$(jq -rn --argjson m "[$MEANS]" --argjson t "$THRESH" '
             if ($m | length) != 3 or any($m[]; . == null)
-            then "VOID\tnull\tnull\tat least one leg produced no usable mean"
+            then "VOID\tnull\tnull\tat least one leg produced no usable mean (per-receipt lines above name the field; in_sequence is judged against 0.9 x (packet_count - tracks))"
+            elif any($m[]; . == "short")
+            then "VOID\tnull\tnull\tsample too short to resolve the threshold: every receipt must have (received + 1) > 1/THRESH = \(1 / $t), so that ONE lost packet reads below THRESH, and at least one did not (received is on the per-receipt lines above). late (behind-the-mark) arrivals count in packet_count but not in received, so under reordering received falls well short of it (46328 of 67248 on the BLO-33636 receipt): dispatch with packet_count comfortably above \(1 / $t), not at it"
             else
               $m[0] as $a | $m[1] as $b | $m[2] as $c
               | (($a + $c) / 2)                          as $base
