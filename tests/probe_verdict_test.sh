@@ -961,6 +961,18 @@ run_delta_case "unparseable receipt -> VOID" \
 run_delta_case "empty receipt (container died mid-write) -> VOID" \
   3 1,1,empty,1,1 0.001,0.0015,0.0015,0.0015,0.001 30 91
 
+# The within-vantage spread needs the same count guard as the mean. The leg's
+# verdict is already VOID here (its mean is null), so the exit code cannot see
+# it -- but the spread is harvested ACROSS runs into a population, and without
+# `length == $n` the two survivors (0.0015, 0.0095) publish 0.008 under this
+# leg's N=3 with nothing on the line saying the reading is short.
+run_delta_case "empty receipt -> within-vantage spread null, not a spread over the survivors" \
+  3 1,1,empty,1,1 0.001,0.0015,0.0015,0.0095,0.001 30 91 "leg2_within_vantage_spread=null"
+# And it is still computed when every receipt counts. Without this the case
+# above is satisfied by a spread that is always null.
+run_delta_case "every receipt counts -> within-vantage spread reported" \
+  3 1,1,1,1,1 0.001,0.001,0.002,0.001,0.001 30 0 "leg2_within_vantage_spread=0.001"
+
 # Ally review of #49 (head 0a907563), Important. packet_count is shared with
 # oneshot and defaults to 3, but received <= packet_count and the sample floor
 # needs received >= floor(1 / THRESH) = 500 -- so a packet_count below 500 can
@@ -1081,6 +1093,29 @@ delta_glob_order_case() {
 }
 delta_glob_order_case
 
+# The verdict checks the N each artifact CARRIES, not only the matrix source.
+# Here the treatment leg ran N=1 -- a matrix edit that dropped fan-out. Every
+# other guard passes (three indices, three distinct vantages, full overlap,
+# clean means), so without the shape arm this is a PASS having measured
+# nothing: signal 0 by construction, the vacuous green preflight refuses N=1
+# to prevent. The matrix assertion below cannot see it; it reads the source.
+delta_leg_shape_case() {
+  local dir; dir=$(mktemp -d -p "$WORK"); local got
+  ( cd "$dir"
+    for leg in 1 2 3; do
+      printf '{"leg":%s,"n":1,"mean":0.0,"ip":"203.0.113.%s","start":100,"end":160}\n' "$leg" "$leg" >"leg-$leg.json"
+    done
+    TIMEOUT=30 TUNNELS=3 bash "$WORK/dverdict.sh" >out.log 2>&1
+  ); got=$?
+  if [ "$got" = 91 ] && grep -qF "not floor/treatment/floor" "$dir/out.log"; then
+    echo "PASS  treatment leg carrying n=1 -> VOID, not a vacuous PASS (exit $got)"
+  else
+    echo "FAIL  treatment leg carrying n=1: want exit 91 naming the leg shape, got $got"; FAILED=1
+    sed -n '1,20p' "$dir/out.log" | sed 's/^/      /'
+  fi
+}
+delta_leg_shape_case
+
 # A leg that never produced an artifact at all -- a cancelled or evicted runner.
 # Distinct from every receipt-level VOID above: there is no leg file to judge,
 # so the count-and-index guard is the only thing that sees it, and it must say
@@ -1182,7 +1217,7 @@ grep -q 'NOT YET A CREDITED PASS' "$WORK/dverdict.sh" \
 
 # The within-vantage control. The N>1 leg runs its tunnels from ONE address at
 # one instant, so their disagreement is what the cross-vantage floor ASSUMES is
-# the whole story -- and on run 36664230865 the two differed by 266x in the
+# the whole story -- and on run 36664230865 the two differed by ~265x in the
 # same minute (7.6e-6 within vantage against a 2.02e-3 cross-vantage floor).
 # Without this term a wide floor cannot be told apart from a noisy night, which
 # is the question the >=5-run characterization exists to answer.
@@ -1192,8 +1227,37 @@ grep -q 'within_vantage_spread=' "$WORK/dverdict.sh" \
 # It must be a REPORTED term, never a verdict arm. Gating it needs a constant,
 # and the ruling that commissioned this design reserves new constants to data.
 # A `spread` appearing in the verdict jq would be that constant smuggled in.
-grep -q 'spread' "$WORK/dverdict.sh" && ! grep -qE '\$(sp|spread)[a-z_]* *(>=|<=|>|<)' "$WORK/dverdict.sh" \
+#
+# STRUCTURAL, not a regex over comparison syntax. The first version matched only
+# a jq VARIABLE named $sp..., so a field comparison -- `($l[1].spread >= x)` --
+# or an alias -- `.spread as $w | ... $w >= x` -- slipped through it (Ally,
+# head 46e839d4). Every verdict arm lives in the one jq program assigned to
+# `verdict=`, and that program has no reason to read `spread` at all, so assert
+# exactly that. The comparison regex stays for the rest of the block, where a
+# shell-side override of $v would have to compare the term to something.
+python3 - "$WORK/dverdict.sh" <<'PY' \
   && echo "PASS  within-vantage spread is reported, not gated" \
   || { echo "FAIL  within-vantage spread became a verdict arm: that is a new constant chosen by the instrument author"; FAILED=1; }
+import re, sys
+src = open(sys.argv[1]).read()
+# The program is single-quoted and apostrophe-free (bash -n above), so the
+# first quote after `jq -rn ...` closes it.
+m = re.search(r"verdict=\$\(jq -rn [^']*'([^']*)'\) \|\| verdict=", src)
+prog = m.group(1) if m else ''
+# Non-vacuous: an extraction that missed the arms would pass `not in` trivially.
+arms = all(f'"{v}\\t' in prog for v in ('PASS', 'FAIL', 'VOID'))
+compared = re.search(r'(\$sp[a-z_]* *|\.spread[^|\n]*)(>=|<=|>|<)', src)
+sys.exit(0 if arms and 'spread' not in prog and not compared else 1)
+PY
+
+# The VOID message carries the control beside the floor, and the 2e-4 bar
+# beside THRESH. A wide floor is at least 10x the single read condition 4 calls
+# a signal to re-examine the DESIGN, and whether it is the night or the design
+# is the question within_vantage_spread exists to answer -- so a VOID that
+# omits it leaves that question unanswerable from the log. Source-level
+# for the same reason as the vantages assertion: the exit code is 91 either way.
+grep -F '::error::VOID' "$WORK/dverdict.sh" | grep -F 'within_vantage_spread=$within' | grep -qF '2e-4' \
+  && echo "PASS  VOID message reports the within-vantage control and the 2e-4 bar" \
+  || { echo "FAIL  VOID no longer reports within_vantage_spread and the 2e-4 bar beside the floor"; FAILED=1; }
 
 [ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }
