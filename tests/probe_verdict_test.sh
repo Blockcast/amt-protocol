@@ -969,9 +969,11 @@ run_delta_case "empty receipt (container died mid-write) -> VOID" \
 run_delta_case "empty receipt -> within-vantage spread null, not a spread over the survivors" \
   3 1,1,empty,1,1 0.001,0.0015,0.0015,0.0095,0.001 30 91 "leg2_within_vantage_spread=null"
 # And it is still computed when every receipt counts. Without this the case
-# above is satisfied by a spread that is always null.
+# above is satisfied by a spread that is always null. The reason is matched as a
+# substring, so the leg is chosen with spread 0.003 against mean 0.002, min 0.001
+# and max 0.004: no other statistic of it can print a line this one prefixes.
 run_delta_case "every receipt counts -> within-vantage spread reported" \
-  3 1,1,1,1,1 0.001,0.001,0.002,0.001,0.001 30 0 "leg2_within_vantage_spread=0.001"
+  3 1,1,1,1,1 0.001,0.001,0.004,0.001,0.001 30 0 "leg2_within_vantage_spread=0.003"
 
 # Ally review of #49 (head 0a907563), Important. packet_count is shared with
 # oneshot and defaults to 3, but received <= packet_count and the sample floor
@@ -1099,22 +1101,27 @@ delta_glob_order_case
 # clean means), so without the shape arm this is a PASS having measured
 # nothing: signal 0 by construction, the vacuous green preflight refuses N=1
 # to prevent. The matrix assertion below cannot see it; it reads the source.
+# The two floor-leg cases witness the other conjuncts: a floor leg that ran
+# fan-out puts the treatment term into the baseline it is subtracted from.
 delta_leg_shape_case() {
-  local dir; dir=$(mktemp -d -p "$WORK"); local got
+  local name=$1 ns=$2 dir; dir=$(mktemp -d -p "$WORK"); local got
   ( cd "$dir"
     for leg in 1 2 3; do
-      printf '{"leg":%s,"n":1,"mean":0.0,"ip":"203.0.113.%s","start":100,"end":160}\n' "$leg" "$leg" >"leg-$leg.json"
+      printf '{"leg":%s,"n":%s,"mean":0.0,"ip":"203.0.113.%s","start":100,"end":160}\n' \
+        "$leg" "$(echo "$ns" | cut -d, -f"$leg")" "$leg" >"leg-$leg.json"
     done
     TIMEOUT=30 TUNNELS=3 bash "$WORK/dverdict.sh" >out.log 2>&1
   ); got=$?
   if [ "$got" = 91 ] && grep -qF "not floor/treatment/floor" "$dir/out.log"; then
-    echo "PASS  treatment leg carrying n=1 -> VOID, not a vacuous PASS (exit $got)"
+    echo "PASS  $name -> VOID, not a vacuous PASS (exit $got)"
   else
-    echo "FAIL  treatment leg carrying n=1: want exit 91 naming the leg shape, got $got"; FAILED=1
+    echo "FAIL  $name: want exit 91 naming the leg shape, got $got"; FAILED=1
     sed -n '1,20p' "$dir/out.log" | sed 's/^/      /'
   fi
 }
-delta_leg_shape_case
+delta_leg_shape_case "treatment leg carrying n=1" 1,1,1
+delta_leg_shape_case "leg 1 carrying n=3" 3,3,1
+delta_leg_shape_case "leg 3 carrying n=3" 1,3,3
 
 # A leg that never produced an artifact at all -- a cancelled or evicted runner.
 # Distinct from every receipt-level VOID above: there is no leg file to judge,
@@ -1231,23 +1238,29 @@ grep -q 'within_vantage_spread=' "$WORK/dverdict.sh" \
 # STRUCTURAL, not a regex over comparison syntax. The first version matched only
 # a jq VARIABLE named $sp..., so a field comparison -- `($l[1].spread >= x)` --
 # or an alias -- `.spread as $w | ... $w >= x` -- slipped through it (Ally,
-# head 46e839d4). Every verdict arm lives in the one jq program assigned to
-# `verdict=`, and that program has no reason to read `spread` at all, so assert
-# exactly that. The comparison regex stays for the rest of the block, where a
-# shell-side override of $v would have to compare the term to something.
+# head 46e839d4). Widening it to `.spread ... >=` still missed the shell
+# variable that carries the term out of jq: `awk -v w="$within" ...` or
+# `jq --argjson w "$within" ...` puts a quote between the name and the
+# operator, so no comparison regex sees it. Assert where the term may APPEAR,
+# not how it may be compared: every non-comment line of the block naming
+# `spread` or `$within` is the one `within=` assignment -- a lone command
+# substitution, which runs in a subshell and cannot set $v -- or a lone
+# `echo "..."`. The verdict jq is spread-free by the same rule. Non-vacuous:
+# the assignment and an echo of it must both be found.
 python3 - "$WORK/dverdict.sh" <<'PY' \
   && echo "PASS  within-vantage spread is reported, not gated" \
   || { echo "FAIL  within-vantage spread became a verdict arm: that is a new constant chosen by the instrument author"; FAILED=1; }
 import re, sys
-src = open(sys.argv[1]).read()
-# The program is single-quoted and apostrophe-free (bash -n above), so the
-# first quote after `jq -rn ...` closes it.
-m = re.search(r"verdict=\$\(jq -rn [^']*'([^']*)'\) \|\| verdict=", src)
-prog = m.group(1) if m else ''
-# Non-vacuous: an extraction that missed the arms would pass `not in` trivially.
-arms = all(f'"{v}\\t' in prog for v in ('PASS', 'FAIL', 'VOID'))
-compared = re.search(r'(\$sp[a-z_]* *|\.spread[^|\n]*)(>=|<=|>|<)', src)
-sys.exit(0 if arms and 'spread' not in prog and not compared else 1)
+code = [l.strip() for l in open(sys.argv[1])]
+code = [l for l in code if l and not l.startswith('#')]
+uses = [l for l in code if re.search(r'spread|\$\{?within\b', l)]
+assign = [l for l in uses if re.fullmatch(r"within=\$\(jq -rn [^']*'[^']*'[^'()]*\)", l)]
+echo = lambda l: re.fullmatch(r'echo "[^"]*"', l)
+bad = [l for l in uses if l not in assign and not echo(l)]
+for l in bad:
+    print('      reads the spread and can act on it:', l[:160])
+echoed = [l for l in uses if echo(l) and re.search(r'\$\{?within\b', l)]
+sys.exit(0 if len(assign) == 1 and echoed and not bad else 1)
 PY
 
 # The VOID message carries the control beside the floor, and the 2e-4 bar

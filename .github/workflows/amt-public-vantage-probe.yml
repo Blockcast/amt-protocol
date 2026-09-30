@@ -1407,17 +1407,19 @@ jobs:
   #
   # Cross-vantage is licensed by MEASUREMENT, not by convenience. The path term
   # it appears to give up was measured as COMMON to observers ONCE: two
-  # concurrent runs on different egress IPs agreed to four significant figures
+  # concurrent runs on different egress IPs agreed to within ~2.4%
   # (36612884351 0.00055490 vs 36612890738 0.00056847 -- delta 1.36e-5, 147x
   # under THRESH), which is what suggested the dominant loss term is upstream
   # of the vantage and cancels in a cross-vantage difference just as it does in
-  # a same-vantage one. That is the SINGLE FAVOURABLE OBSERVATION, and the first
-  # dispatches of this design did not reproduce it: run 36664230865 read a
-  # cross-vantage floor of 2.02e-3 (N=1 legs 5.031e-3 / 3.011e-3) against a
-  # within-vantage spread of 7.6e-6 in the same minute -- ~265x apart -- and
-  # run 36664238282 read null / 2.577e-3. So a floor near 2e-3 is the observed
-  # case, not an anomaly, and the licence is a hypothesis every run now tests
-  # (within_vantage_spread beside the floor) rather than a settled property.
+  # a same-vantage one. That is the SINGLE FAVOURABLE OBSERVATION, and the one
+  # dispatch of this design that produced a floor did not reproduce it: run
+  # 36664230865 read a cross-vantage floor of 2.02e-3 (N=1 legs 5.031e-3 /
+  # 3.011e-3) against a within-vantage spread of 7.6e-6 in the same minute --
+  # ~265x apart. Run 36664238282 produced no floor (leg 1 null; its 2.577e-3 is
+  # leg 3 alone), so it neither reproduces nor contradicts either reading. One
+  # agreement against one wide floor settles nothing, and the licence is a
+  # hypothesis every run now tests (within_vantage_spread beside the floor)
+  # rather than a settled property.
   #
   # The 780 s quiet-gap variant was rejected for a structural reason, not a cost
   # one: it is calibrated against an undocumented 260 s / 780 s retention window
