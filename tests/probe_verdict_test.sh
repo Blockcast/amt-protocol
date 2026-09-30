@@ -197,14 +197,42 @@ echo "handshake trace" >&2
 exit "$ec"
 EOF
 chmod +x "$WORK/bin/docker"
-# The delta step curls api.ipify.org once per leg for its per-leg vantage
+# The delta legs curl api.ipify.org once each for their per-leg vantage
 # receipt. Stub it: a unit test must not depend on egress, and the real call
 # would also be the slowest thing in this file by two orders of magnitude.
+#
+# IP_LIST is indexed by $LEG, because the cross-vantage design makes the
+# address a VARIABLE the verdict judges rather than a constant it records:
+# three distinct addresses is the licence to compare the legs at all. Unset (as
+# it is for every probe case) it falls back to the single constant those cases
+# were written against, so their behaviour is unchanged.
 cat >"$WORK/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-echo "203.0.113.7"
+if [ -n "${IP_LIST:-}" ]; then echo "$IP_LIST" | cut -d, -f"${LEG:-1}"; else echo "203.0.113.7"; fi
 EOF
 chmod +x "$WORK/bin/curl"
+# Each leg stamps a start and an end with `date -u +%s`, and the verdict
+# intersects the three windows. Stubbed the legs would start and finish inside
+# one second, so every window would be a POINT and the three-way overlap would
+# be zero -- which is the "legs never ran at the same time" VOID. Every
+# receipt-level case would go red for a reason that has nothing to do with the
+# receipts. TIME_LIST supplies the six stamps (start1,end1,...,end3) instead.
+#
+# mkdir is the same atomic claim the docker stub uses: it succeeds on a leg's
+# FIRST call (the start stamp) and fails on its second (the end stamp), so the
+# stub needs no counter file it could race on. Falls through to the real date
+# for every other caller and for an unset TIME_LIST.
+cat >"$WORK/bin/date" <<'EOF'
+#!/usr/bin/env bash
+if [ -n "${TIME_LIST:-}" ] && [ "${1:-}" = "-u" ] && [ "${2:-}" = "+%s" ]; then
+  f=$((2 * ${LEG:-1} - 1))
+  mkdir "$STUB_DIR/.date.${LEG:-1}" 2>/dev/null || f=$((f + 1))
+  echo "$TIME_LIST" | cut -d, -f"$f"
+  exit 0
+fi
+exec /bin/date "$@"
+EOF
+chmod +x "$WORK/bin/date"
 export PATH="$WORK/bin:$PATH" STUB_DIR="$WORK"
 
 FAILED=0
@@ -629,43 +657,92 @@ print("PASS  route gate routes exactly one row for every non-success scheduled e
 PY
 
 # ---------------------------------------------------------------------------
-# BLO-33636 AC 2 (AMENDED 2026-09-29): the fan-out loss DELTA control.
+# BLO-33636 AC 2 (AMENDED 2026-09-30): the fan-out loss DELTA control, now
+# CONCURRENT CROSS-VANTAGE. The sequential same-vantage bracket is withdrawn as
+# structurally invalid -- it required the control leg to share a source address
+# with the treatment leg AND be unaffected by it, and the relay keys tunnel
+# state on the source address, so the control was coupled to the treatment
+# through the mechanism under test.
 #
-# Extracted the same way as probe.sh, from the `loss-delta` job, so this tests
-# the shipped shell rather than a copy that can drift. The probe extractor
-# above is scoped to jobs['probe'], so the new job cannot disturb it.
+# The shipped shell is now THREE blocks in three jobs (preflight / leg /
+# verdict), because a matrix is the only way to get a leg its own runner and
+# therefore its own egress address. All three are extracted, and the driver
+# below stitches them in the order a real run executes them -- so every case
+# still exercises the shipped shell rather than a copy that can drift, and
+# every pre-existing case keeps its signature and its expected exit code.
 # ---------------------------------------------------------------------------
-python3 - "$WORKFLOW" "$WORK/delta.sh" <<'PY'
+python3 - "$WORKFLOW" "$WORK" <<'PY'
 import sys, yaml
-wf, out = sys.argv[1], sys.argv[2]
-steps = yaml.safe_load(open(wf))['jobs']['loss-delta']['steps']
-block = next(s['run'] for s in steps if 'run' in s and 'docker pull' in s['run'])
-open(out, 'w').write(block)
+wf, work = sys.argv[1], sys.argv[2]
+jobs = yaml.safe_load(open(wf))['jobs']
+def block(job, needle):
+    return next(s['run'] for s in jobs[job]['steps']
+                if 'run' in s and needle in s['run'])
+open(work + '/preflight.sh', 'w').write(block('loss-delta-preflight', 'MAX_TUNNELS'))
+open(work + '/leg.sh',       'w').write(block('loss-delta',           'docker pull'))
+open(work + '/dverdict.sh',  'w').write(block('loss-delta-verdict',   'fanout_loss_signal'))
 PY
-[ -s "$WORK/delta.sh" ] || { echo "ABORT: could not extract delta.sh from $WORKFLOW (the 'loss-delta' job renamed, or its 'docker pull' step moved)" >&2; exit 2; }
+for f in preflight leg dverdict; do
+  [ -s "$WORK/$f.sh" ] || { echo "ABORT: could not extract $f.sh from $WORKFLOW (a 'loss-delta*' job renamed, or its step moved)" >&2; exit 2; }
+  # PARSE the block before running any case against it. These blocks embed long
+  # jq programs inside shell SINGLE quotes, so one apostrophe in an English
+  # word closes the quote and bash reparses the rest of the jq as commands.
+  # That fails with `syntax error near unexpected token else` pointing at a
+  # line nowhere near the apostrophe, and -- because a syntax error is exit 2
+  # -- it turns EVERY case red at once with a want/got line that reads like a
+  # verdict regression. Measured while writing this design: 36 cases, one
+  # apostrophe. Diagnose it once, here, by name.
+  bash -n "$WORK/$f.sh" 2>/dev/null \
+    || { echo "ABORT: $f.sh is not valid bash -- look for an apostrophe inside a single-quoted jq program:" >&2
+         bash -n "$WORK/$f.sh"; exit 2; }
+done
 
 # run_delta_case <name> <N> <pcs> <losses> <timeout> <want> [<reason>]
 #
 # PACKETS (the dispatch packet_count) is only handed to the stubbed docker, so
 # every receipt-level case runs at 100000, clear of the up-front sample floor.
 # The packet_count boundary cases set it per call: CASE_PACKETS=<v> run_delta_case ...
+# CASE_IPS and CASE_TIMES do the same for the two guards this design added.
 #
-# <reason>, when given, must appear in the output: two VOIDs share exit 91, and
-# a case about one cause must not go green on the other.
+# <reason>, when given, must appear in the output: several VOIDs share exit 91,
+# and a case about one cause must not go green on the other.
 #
 # PC_LIST/LOSS_LIST are FLAT across all three legs, in leg order: index 1 is
-# leg 1 (N=1), 2..N+1 are the middle leg, N+2 is leg 3. Within the middle leg
-# the N concurrent stubs claim indices in a racy order, but every assertion
+# leg 1 (N=1), 2..N+1 are the treatment leg, N+2 is leg 3. Within the treatment
+# leg the N concurrent stubs claim indices in a racy order, but every assertion
 # here is order-independent by construction -- a mean does not care, and one
 # bad receipt invalidates the leg whichever slot it lands in.
+#
+# The legs run SEQUENTIALLY here while being CONCURRENT in production, and that
+# is not a fidelity gap: the leg block's own behaviour does not depend on its
+# siblings, and the only thing concurrency buys -- three distinct vantages
+# whose windows overlap -- is a property of the ARTIFACTS, which CASE_IPS and
+# CASE_TIMES set directly. Simulating real parallelism would test the harness.
 run_delta_case() {
   local name=$1 n=$2 pcs=$3 losses=$4 tmo=$5 want=$6 reason=${7:-} got
-  local dir; dir=$(mktemp -d -p "$WORK"); rm -rf "$WORK"/.claim.*
+  local dir; dir=$(mktemp -d -p "$WORK"); rm -rf "$WORK"/.claim.* "$WORK"/.date.*
   ( cd "$dir"
     export TUNNELS=$n PC_LIST=$pcs LOSS_LIST=$losses EXIT_LIST=1,1,1,1,1,1,1,1 \
            RELAY=1.2.3.4 SOURCE=69.25.95.192 GROUP=232.1.1.60 \
-           TIMEOUT=$tmo PACKETS=${CASE_PACKETS-100000}
-    bash "$WORK/delta.sh" >out.log 2>&1
+           TIMEOUT=$tmo PACKETS=${CASE_PACKETS-100000} \
+           IP_LIST=${CASE_IPS-203.0.113.1,203.0.113.2,203.0.113.3} \
+           TIME_LIST=${CASE_TIMES-100,160,100,160,100,160}
+    # Preflight is a GATE, not a step: on rejection the legs never run, and its
+    # exit code is the run's. Without the `|| exit` a rejected dispatch would
+    # fall through to three legs and a verdict, and the 92 cases would score
+    # whatever the verdict happened to say.
+    bash "$WORK/preflight.sh" >out.log 2>&1 || exit $?
+    for leg in 1 2 3; do
+      # The matrix's `include`, by hand: legs 1 and 3 are the N=1 floor pair,
+      # leg 2 is the treatment.
+      if [ "$leg" = 2 ]; then export LEG=$leg N=$TUNNELS; else export LEG=$leg N=1; fi
+      # `|| true`: the leg block is contracted never to fail on a measurement
+      # outcome, and a leg that DID fail must still reach the verdict as a
+      # missing artifact rather than aborting the case -- that is the shape the
+      # verdict's "did not produce three legs" guard exists to report.
+      bash "$WORK/leg.sh" >>out.log 2>&1 || true
+    done
+    bash "$WORK/dverdict.sh" >>out.log 2>&1
   ); got=$?
   if [ "$got" != "$want" ]; then
     echo "FAIL  $name: want exit $want, got $got"; FAILED=1
@@ -884,6 +961,20 @@ run_delta_case "unparseable receipt -> VOID" \
 run_delta_case "empty receipt (container died mid-write) -> VOID" \
   3 1,1,empty,1,1 0.001,0.0015,0.0015,0.0015,0.001 30 91
 
+# The within-vantage spread needs the same count guard as the mean. The leg's
+# verdict is already VOID here (its mean is null), so the exit code cannot see
+# it -- but the spread is harvested ACROSS runs into a population, and without
+# `length == $n` the two survivors (0.0015, 0.0095) publish 0.008 under this
+# leg's N=3 with nothing on the line saying the reading is short.
+run_delta_case "empty receipt -> within-vantage spread null, not a spread over the survivors" \
+  3 1,1,empty,1,1 0.001,0.0015,0.0015,0.0095,0.001 30 91 "leg2_within_vantage_spread=null"
+# And it is still computed when every receipt counts. Without this the case
+# above is satisfied by a spread that is always null. The reason is matched as a
+# substring, so the leg is chosen with spread 0.003 against mean 0.002, min 0.001
+# and max 0.004: no other statistic of it can print a line this one prefixes.
+run_delta_case "every receipt counts -> within-vantage spread reported" \
+  3 1,1,1,1,1 0.001,0.001,0.004,0.001,0.001 30 0 "leg2_within_vantage_spread=0.003"
+
 # Ally review of #49 (head 0a907563), Important. packet_count is shared with
 # oneshot and defaults to 3, but received <= packet_count and the sample floor
 # needs received >= floor(1 / THRESH) = 500 -- so a packet_count below 500 can
@@ -908,36 +999,278 @@ run_delta_case "N=1 is a vacuous green -> rejected" \
 run_delta_case "non-integer N -> rejected" \
   abc 1,1,1 0.001,0.001,0.001 30 92
 
-# Three legs run sequentially, so the job's wall clock is ~3x timeout. Reject
-# at the boundary rather than letting the job cap CANCEL the run mid-leg: a
-# cancelled job emits no verdict, which reads as a missing measurement rather
-# than a rejected input.
-run_delta_case "3 x timeout over the job budget -> rejected" \
-  3 1,1,1,1,1 0.001,0.001,0.001,0.001,0.001 400 92
+# The legs are CONCURRENT now, so the job budget is 1x timeout, not 3x. Reject
+# at the boundary rather than letting the job cap CANCEL a leg mid-join: a
+# cancelled leg emits no artifact, which the verdict can only report as a
+# missing measurement rather than a rejected input. 780 is the boundary and
+# must be ACCEPTED -- without that second case the check is satisfied by a
+# guard that rejects everything.
+run_delta_case "timeout over the job budget -> rejected" \
+  3 1,1,1,1,1 0.001,0.001,0.001,0.001,0.001 800 92 "exceeds the 780s budget"
+run_delta_case "timeout at the job budget -> accepted" \
+  3 1000,1000,1000,1000,1000 clean1,clean1,clean1,clean1,clean1 780 0
 
-# The legs must be ordered 1, N, 1 -- bracketing, not 1,1,N. Ordered 1,1,N the
-# noise floor is measured entirely BEFORE the signal and cannot witness drift
-# across the interval the signal was taken in, which is the whole reason the
-# ruling specified this order. A source-level assertion because the exit code
-# cannot distinguish the two orders on a stationary stub path.
-grep -q 'for n in 1 "\$TUNNELS" 1; do' "$WORK/delta.sh" \
-  && echo "PASS  delta legs bracket the N leg (1, N, 1)" \
-  || { echo "FAIL  delta legs are not ordered 1, N, 1 -- the noise floor no longer spans the signal"; FAILED=1; }
+# ---------------------------------------------------------------------------
+# The two guards the 2026-09-30 concurrent cross-vantage design ADDS. Both are
+# structural: they decide whether the run was a valid experiment at all, so
+# they are checked BEFORE the means and each needs its own witness.
+# ---------------------------------------------------------------------------
+
+# DISTINCT VANTAGES. Two legs on one address are not a control pair, they ARE
+# the collision this AC measures -- so a run that drew a duplicate egress has
+# rebuilt the withdrawn same-vantage bracket by accident. The receipts here are
+# perfectly clean and would otherwise PASS, so the distinctness guard is the
+# only thing that can refuse them.
+CASE_IPS=203.0.113.1,203.0.113.1,203.0.113.3 \
+run_delta_case "two legs share an egress address -> VOID, not PASS" \
+  3 1000,1000,1000,1000,1000 clean1,clean1,clean1,clean1,clean1 30 91 "three distinct, known egress addresses"
+# And the FLOOR PAIR specifically: legs 1 and 3 are the noise term, so a
+# collision between the two of them makes the floor a measurement of the defect
+# rather than of the path. Distinct from the case above, which collides a floor
+# leg with the treatment leg.
+CASE_IPS=203.0.113.1,203.0.113.2,203.0.113.1 \
+run_delta_case "the two floor legs share an egress address -> VOID" \
+  3 1000,1000,1000,1000,1000 clean1,clean1,clean1,clean1,clean1 30 91 "three distinct, known egress addresses"
+# An UNKNOWN vantage must fail CLOSED. `unavailable` is what the leg writes
+# when the ipify curl fails, and three of them are `unique | length == 1` so
+# the distinctness test catches that shape -- but ONE among two real addresses
+# is `unique | length == 3` and passes it. The explicit `any(. == "unavailable")`
+# conjunct is the only guard that sees this one: an address that could not be
+# read cannot be shown distinct from the other two.
+CASE_IPS=203.0.113.1,unavailable,203.0.113.3 \
+run_delta_case "one vantage unreadable -> VOID, fails closed" \
+  3 1000,1000,1000,1000,1000 clean1,clean1,clean1,clean1,clean1 30 91 "three distinct, known egress addresses"
+
+# OVERLAPPING WINDOWS. A floor that did not run WHILE the signal ran is the
+# withdrawn sequential design wearing this one's label -- which is exactly what
+# a matrix leg delayed by a queued runner produces, silently, with three
+# distinct addresses and clean receipts. Legs here run 100-160, 200-260,
+# 300-360: no shared instant.
+CASE_TIMES=100,160,200,260,300,360 \
+run_delta_case "legs ran in sequence, not concurrently -> VOID" \
+  3 1000,1000,1000,1000,1000 clean1,clean1,clean1,clean1,clean1 30 91 "never ran at the same time"
+# TOUCHING windows are not overlapping windows. max(starts)=160, min(ends)=160,
+# so the intersection is a single instant of zero length -- the boundary the
+# `<= 0` test exists for, and the one a `< 0` test would wave through.
+CASE_TIMES=100,160,160,220,100,220 \
+run_delta_case "windows touch but do not overlap -> VOID" \
+  3 1000,1000,1000,1000,1000 clean1,clean1,clean1,clean1,clean1 30 91 "never ran at the same time"
+# One second of genuine overlap is enough to ask the question. Without this the
+# two cases above are satisfied by a guard that voids every run.
+CASE_TIMES=100,161,160,220,100,220 \
+run_delta_case "one second of three-way overlap -> PASS" \
+  3 1000,1000,1000,1000,1000 clean1,clean1,clean1,clean1,clean1 30 0
+
+# The verdict must assemble the legs BY INDEX, not by the order the artifact
+# files happen to glob in.
+#
+# ⚠ This case is written AROUND run_delta_case on purpose, and the first
+# version of it was INERT. Driven through the stitched driver the legs are
+# written as leg-1/leg-2/leg-3, so the `leg-*.json` glob yields index order
+# anyway and `sort_by(.leg)` can be deleted with the suite still green --
+# mutation testing caught exactly that. A case that cannot fail when the guard
+# is removed is documentation.
+#
+# The contract is real even though the current filenames satisfy it by luck:
+# rename the artifacts to something descriptive -- floor-a / floor-b /
+# treatment, an obvious future tidy-up -- and lexical order becomes 1, 3, 2,
+# putting a FLOOR leg at $m[1] and computing the signal against the treatment.
+# So the files here are named so that lexical order (a, b, c) is legs 3, 1, 2.
+# Leg 2 is the only lossy one: by index the signal is 0.00299 and the run
+# FAILs; read in glob order the legs are misindexed and it VOIDs instead.
+delta_glob_order_case() {
+  local dir; dir=$(mktemp -d -p "$WORK"); local got
+  ( cd "$dir"
+    printf '%s\n' '{"leg":3,"n":1,"mean":0.0,"ip":"203.0.113.3","start":100,"end":160}' >leg-a.json
+    printf '%s\n' '{"leg":1,"n":1,"mean":0.0,"ip":"203.0.113.1","start":100,"end":160}' >leg-b.json
+    printf '%s\n' '{"leg":2,"n":3,"mean":0.00299,"ip":"203.0.113.2","start":100,"end":160}' >leg-c.json
+    TIMEOUT=30 TUNNELS=3 bash "$WORK/dverdict.sh" >out.log 2>&1
+  ); got=$?
+  if [ "$got" = 1 ]; then
+    echo "PASS  verdict orders legs by index, not by glob order (exit $got)"
+  else
+    echo "FAIL  verdict reads legs in glob order: want exit 1 (FAIL), got $got"; FAILED=1
+    sed -n '1,20p' "$dir/out.log" | sed 's/^/      /'
+  fi
+}
+delta_glob_order_case
+
+# The verdict checks the N each artifact CARRIES, not only the matrix source.
+# Here the treatment leg ran N=1 -- a matrix edit that dropped fan-out. Every
+# other guard passes (three indices, three distinct vantages, full overlap,
+# clean means), so without the shape arm this is a PASS having measured
+# nothing: signal 0 by construction, the vacuous green preflight refuses N=1
+# to prevent. The matrix assertion below cannot see it; it reads the source.
+# The two floor-leg cases witness the other conjuncts: a floor leg that ran
+# fan-out puts the treatment term into the baseline it is subtracted from.
+delta_leg_shape_case() {
+  local name=$1 ns=$2 dir; dir=$(mktemp -d -p "$WORK"); local got
+  ( cd "$dir"
+    for leg in 1 2 3; do
+      printf '{"leg":%s,"n":%s,"mean":0.0,"ip":"203.0.113.%s","start":100,"end":160}\n' \
+        "$leg" "$(echo "$ns" | cut -d, -f"$leg")" "$leg" >"leg-$leg.json"
+    done
+    TIMEOUT=30 TUNNELS=3 bash "$WORK/dverdict.sh" >out.log 2>&1
+  ); got=$?
+  if [ "$got" = 91 ] && grep -qF "not floor/treatment/floor" "$dir/out.log"; then
+    echo "PASS  $name -> VOID, not a vacuous PASS (exit $got)"
+  else
+    echo "FAIL  $name: want exit 91 naming the leg shape, got $got"; FAILED=1
+    sed -n '1,20p' "$dir/out.log" | sed 's/^/      /'
+  fi
+}
+delta_leg_shape_case "treatment leg carrying n=1" 1,1,1
+delta_leg_shape_case "leg 1 carrying n=3" 3,3,1
+delta_leg_shape_case "leg 3 carrying n=3" 1,3,3
+
+# A leg that never produced an artifact at all -- a cancelled or evicted runner.
+# Distinct from every receipt-level VOID above: there is no leg file to judge,
+# so the count-and-index guard is the only thing that sees it, and it must say
+# "missing measurement" rather than naming a receipt field that was never read.
+delta_missing_leg_case() {
+  local dir; dir=$(mktemp -d -p "$WORK"); rm -rf "$WORK"/.claim.* "$WORK"/.date.*
+  local got
+  ( cd "$dir"
+    export TUNNELS=3 PC_LIST=1000,1000,1000,1000,1000 \
+           LOSS_LIST=clean1,clean1,clean1,clean1,clean1 EXIT_LIST=1,1,1,1,1,1,1,1 \
+           RELAY=1.2.3.4 SOURCE=69.25.95.192 GROUP=232.1.1.60 \
+           TIMEOUT=30 PACKETS=100000 \
+           IP_LIST=203.0.113.1,203.0.113.2,203.0.113.3 \
+           TIME_LIST=100,160,100,160,100,160
+    bash "$WORK/preflight.sh" >out.log 2>&1 || exit $?
+    for leg in 1 2; do
+      if [ "$leg" = 2 ]; then export LEG=$leg N=$TUNNELS; else export LEG=$leg N=1; fi
+      bash "$WORK/leg.sh" >>out.log 2>&1 || true
+    done
+    bash "$WORK/dverdict.sh" >>out.log 2>&1
+  ); got=$?
+  if [ "$got" = 91 ] && grep -qF "three legs indexed 1,2,3" "$dir/out.log"; then
+    echo "PASS  leg 3 never reported (cancelled runner) -> VOID, missing measurement (exit $got)"
+  else
+    echo "FAIL  leg 3 never reported: want exit 91 naming the missing leg, got $got"; FAILED=1
+    sed -n '1,40p' "$dir/out.log" | sed 's/^/      /'
+  fi
+}
+delta_missing_leg_case
+
+# Legs 1 and 3 are the N=1 floor pair and leg 2 is the treatment. A matrix that
+# puts N=1 anywhere but 1 and 3 computes the signal against the wrong term. A
+# source-level assertion on the workflow because the stitched driver above sets
+# LEG/N itself and so cannot witness the matrix at all.
+python3 - "$WORKFLOW" <<'PY' && echo "PASS  delta matrix is floor/treatment/floor at legs 1/2/3" \
+  || { echo "FAIL  delta matrix legs are no longer N=1 / N / N=1 at 1 / 2 / 3"; FAILED=1; }
+import sys, yaml
+m = yaml.safe_load(open(sys.argv[1]))['jobs']['loss-delta']['strategy']['matrix']['include']
+want = [{'leg': 1, 'n': 1}, {'leg': 3, 'n': 1}]
+got = [e for e in m if e['n'] == 1]
+sys.exit(0 if len(m) == 3 and got == want and '${{' in str(
+    next(e['n'] for e in m if e['leg'] == 2)) else 1)
+PY
+
+# The verdict gate reads the preflight job's result, and that job id has
+# HYPHENS. A bare property name in the Actions expression grammar is
+# [a-zA-Z_][a-zA-Z0-9_]*, so `needs.loss-delta-preflight.result` is parsed as
+# subtraction, not as a lookup -- it evaluates to something that is not the
+# preflight result, with no workflow error to say so, and the gate that keeps a
+# rejected dispatch from being re-reported as a VOID quietly stops working.
+# Bracket syntax is the only form that survives a hyphen.
+python3 - "$WORKFLOW" <<'PY' && echo "PASS  verdict gate reads preflight via bracket syntax (hyphen-safe)" \
+  || { echo "FAIL  verdict gate uses dotted syntax on a hyphenated job id: the expression parses as subtraction"; FAILED=1; }
+import sys, yaml, re
+g = yaml.safe_load(open(sys.argv[1]))['jobs']['loss-delta-verdict']['if']
+sys.exit(0 if "needs['loss-delta-preflight']" in g or 'needs["loss-delta-preflight"]' in g
+         else 1)
+PY
+
+# fail-fast would CANCEL the surviving legs the moment one failed, and a
+# cancelled leg uploads no artifact -- so a single dead leg would destroy the
+# vantage and window evidence the verdict needs to say WHY the run is void.
+python3 -c "
+import sys, yaml
+s = yaml.safe_load(open(sys.argv[1]))['jobs']['loss-delta']['strategy']
+sys.exit(0 if s.get('fail-fast') is False else 1)" "$WORKFLOW" \
+  && echo "PASS  a dead leg does not cancel its siblings" \
+  || { echo "FAIL  loss-delta matrix no longer sets fail-fast: false"; FAILED=1; }
 
 # The threshold decides the result, so a dispatch caller must not be able to
-# supply it. Same contract as DISTINCT_SOURCE_IPS in the probe job.
-grep -q '^ *THRESH=0.002' "$WORK/delta.sh" \
-  && echo "PASS  delta threshold is a constant, not an input" \
-  || { echo "FAIL  delta threshold is no longer a hardcoded constant"; FAILED=1; }
+# supply it. Same contract as DISTINCT_SOURCE_IPS in the probe job. Asserted on
+# BOTH blocks that carry it: preflight derives the sample floor from it and the
+# verdict applies it, so either one becoming an input reopens the hole.
+for blk in preflight dverdict; do
+  grep -q '^ *THRESH=0.002' "$WORK/$blk.sh" \
+    && echo "PASS  delta threshold is a constant in $blk, not an input" \
+    || { echo "FAIL  delta threshold is no longer a hardcoded constant in $blk"; FAILED=1; }
+done
 
-# A wide floor has two causes with different follow-ups -- the egress rotated,
-# or the path drifted while the address held -- and only the per-leg addresses
-# tell them apart. Live run 36568716671 hit the second (one IP across all three
-# legs, floor 0.0088), so a VOID that does not report the vantage sends the
-# reader to re-dispatch against a vantage that cannot answer. Source-level
-# because the exit code is 91 either way.
-grep -q 'vantage=\$vantage' "$WORK/delta.sh" \
+# A wide floor sends the reader somewhere, and where depends on the vantages --
+# so a VOID that does not report them is a dead end. Live run 36568716671 hit
+# the same-vantage case under the withdrawn design (one IP across all three
+# legs, floor 0.0088). Source-level because the exit code is 91 either way.
+grep -q 'vantages=\$vantage' "$WORK/dverdict.sh" \
   && echo "PASS  VOID message reports the vantage addresses" \
-  || { echo "FAIL  VOID no longer reports vantage: a rotated egress and a drifting path are indistinguishable"; FAILED=1; }
+  || { echo "FAIL  VOID no longer reports the vantages: a drifting path and a collided egress are indistinguishable"; FAILED=1; }
+
+# The ruling's condition 4: no PASS is credited until the floor is characterized
+# over >= 5 runs. That is a claim about a POPULATION, so each run has to emit
+# its own reading in a form a later reader can harvest without having read the
+# workflow. A PASS that does not say it is provisional invites exactly the
+# single-reading credit the condition forbids.
+grep -q 'floor_legs=' "$WORK/dverdict.sh" \
+  && echo "PASS  every run emits its floor reading for the >=5-run distribution" \
+  || { echo "FAIL  the run no longer emits floor_legs: the floor distribution cannot be harvested"; FAILED=1; }
+grep -q 'NOT YET A CREDITED PASS' "$WORK/dverdict.sh" \
+  && echo "PASS  a PASS states it is one reading, not a credited pass" \
+  || { echo "FAIL  PASS no longer states the >=5-run floor-characterization condition"; FAILED=1; }
+
+# The within-vantage control. The N>1 leg runs its tunnels from ONE address at
+# one instant, so their disagreement is what the cross-vantage floor ASSUMES is
+# the whole story -- and on run 36664230865 the two differed by ~265x in the
+# same minute (7.6e-6 within vantage against a 2.02e-3 cross-vantage floor).
+# Without this term a wide floor cannot be told apart from a noisy night, which
+# is the question the >=5-run characterization exists to answer.
+grep -q 'within_vantage_spread=' "$WORK/dverdict.sh" \
+  && echo "PASS  every run emits the within-vantage control beside the floor" \
+  || { echo "FAIL  within_vantage_spread no longer emitted: a wide floor cannot be told from a noisy night"; FAILED=1; }
+# It must be a REPORTED term, never a verdict arm. Gating it needs a constant,
+# and the ruling that commissioned this design reserves new constants to data.
+# A `spread` appearing in the verdict jq would be that constant smuggled in.
+#
+# STRUCTURAL, not a regex over comparison syntax. The first version matched only
+# a jq VARIABLE named $sp..., so a field comparison -- `($l[1].spread >= x)` --
+# or an alias -- `.spread as $w | ... $w >= x` -- slipped through it (Ally,
+# head 46e839d4). Widening it to `.spread ... >=` still missed the shell
+# variable that carries the term out of jq: `awk -v w="$within" ...` or
+# `jq --argjson w "$within" ...` puts a quote between the name and the
+# operator, so no comparison regex sees it. Assert where the term may APPEAR,
+# not how it may be compared: every non-comment line of the block naming
+# `spread` or `$within` is the one `within=` assignment -- a lone command
+# substitution, which runs in a subshell and cannot set $v -- or a lone
+# `echo "..."`. The verdict jq is spread-free by the same rule. Non-vacuous:
+# the assignment and an echo of it must both be found.
+python3 - "$WORK/dverdict.sh" <<'PY' \
+  && echo "PASS  within-vantage spread is reported, not gated" \
+  || { echo "FAIL  within-vantage spread became a verdict arm: that is a new constant chosen by the instrument author"; FAILED=1; }
+import re, sys
+code = [l.strip() for l in open(sys.argv[1])]
+code = [l for l in code if l and not l.startswith('#')]
+uses = [l for l in code if re.search(r'spread|\$\{?within\b', l)]
+assign = [l for l in uses if re.fullmatch(r"within=\$\(jq -rn [^']*'[^']*'[^'()]*\)", l)]
+echo = lambda l: re.fullmatch(r'echo "[^"]*"', l)
+bad = [l for l in uses if l not in assign and not echo(l)]
+for l in bad:
+    print('      reads the spread and can act on it:', l[:160])
+echoed = [l for l in uses if echo(l) and re.search(r'\$\{?within\b', l)]
+sys.exit(0 if len(assign) == 1 and echoed and not bad else 1)
+PY
+
+# The VOID message carries the control beside the floor, and the 2e-4 bar
+# beside THRESH. A wide floor is at least 10x the single read condition 4 calls
+# a signal to re-examine the DESIGN, and whether it is the night or the design
+# is the question within_vantage_spread exists to answer -- so a VOID that
+# omits it leaves that question unanswerable from the log. Source-level
+# for the same reason as the vantages assertion: the exit code is 91 either way.
+grep -F '::error::VOID' "$WORK/dverdict.sh" | grep -F 'within_vantage_spread=$within' | grep -qF '2e-4' \
+  && echo "PASS  VOID message reports the within-vantage control and the 2e-4 bar" \
+  || { echo "FAIL  VOID no longer reports within_vantage_spread and the 2e-4 bar beside the floor"; FAILED=1; }
 
 [ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }

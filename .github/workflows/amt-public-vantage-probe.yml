@@ -35,7 +35,8 @@ on:
           oneshot = the BLO-21823 data-receipt probe (default, unchanged).
           tunnels-ramp = the BLO-33457 tunnel-STATE occupancy ramp.
           loss-delta = the BLO-33636 AC-2 fan-out loss control: legs N=1, N, N=1
-          on ONE vantage, scored as a DIFFERENCE against a paired noise floor.
+          launched CONCURRENTLY on three DIFFERENT vantages, scored as a
+          DIFFERENCE against the paired noise floor the two N=1 legs give.
           It answers "does asking for N tunnels cost loss?", which is what the
           AC's retired absolute threshold was reaching for; it does NOT re-decide
           demultiplexing -- that verdict is oneshot's (exit 91 VOID / 93 knee).
@@ -1360,7 +1361,7 @@ jobs:
             report*.json
             verbose*.log
 
-  # BLO-33636 AC 2, as AMENDED 2026-09-29 by its author (PlatformSREEngineer).
+  # BLO-33636 AC 2, as AMENDED 2026-09-30 by its author (PlatformSREEngineer).
   # The clause this implements replaces `each tunnel's loss_ratio < 0.002`.
   #
   # Why that one was retired -- it is the same defect this job must not repeat.
@@ -1373,18 +1374,58 @@ jobs:
   # drew, and it redded a relay that those same runs had just shown correct.
   #
   # What it was REACHING for is the cost of fan-out: does asking the relay for N
-  # tunnels make the stream lossier than asking it for 1? That is a DIFFERENCE,
-  # and a difference is measurable on a noisy path provided the comparison is
-  # same-vantage and same-minute.
+  # tunnels make the stream lossier than asking it for 1? That is a DIFFERENCE.
   #
   #   signal = loss(N) - mean(loss(1_a), loss(1_b))    the fan-out cost
-  #   noise  = |loss(1_a) - loss(1_b)|                 what the path did on its
-  #                                                    own, over that interval
+  #   noise  = |loss(1_a) - loss(1_b)|                 what the paths did on
+  #                                                    their own, over that
+  #                                                    same interval
   #
-  # Leg order is 1, N, 1 -- deliberately NOT 1, 1, N. The two N=1 legs BRACKET
-  # the N leg, so the same three legs yield both terms and the noise floor spans
-  # the interval the signal was measured in. Ordered 1,1,N the floor would be
-  # measured before the signal and could not witness drift across it.
+  # WHY THE LEGS ARE CONCURRENT AND CROSS-VANTAGE. The sequential same-vantage
+  # bracket (legs 1, N, 1 on ONE runner) that stood here from 2026-09-29 is
+  # WITHDRAWN -- withdrawn, not re-tuned, because it was structurally invalid
+  # rather than merely noisy.
+  #
+  # It asked the control leg to do two things that cannot both hold ON THIS
+  # DEFECT: share the network path with the treatment leg, AND be unaffected by
+  # it. "Shares the path" is implemented as "shares the source address", and the
+  # relay keys tunnel state on the source address -- so the control was coupled
+  # to the treatment through the exact mechanism under test. A control affected
+  # by the treatment is not a control, at any threshold.
+  #
+  # Measured, run 36613247340, one vantage 20.102.103.115:
+  #   leg 1 (N=1) 66989 | leg 2 (N=3) 67531 / 0 / 67493 | leg 3 (N=1) 0
+  # Leg 3 is a plain N=1 join, identical to leg 1, same address, two minutes
+  # later. It received NOTHING. That is a dead instrument, not an unlucky floor.
+  # (Two mechanisms predict it -- relay slot retention, and the mroute syncer's
+  # address-keyed gatewayKey -- and the withdrawal does not depend on which.)
+  #
+  # There is NO same-vantage concurrent variant. Two simultaneous N=1 joins from
+  # one address ARE the collision under test. Shared path and independent source
+  # address are mutually exclusive here, which is why the clause as originally
+  # written had no valid implementation at all.
+  #
+  # Cross-vantage is licensed by MEASUREMENT, not by convenience. The path term
+  # it appears to give up was measured as COMMON to observers ONCE: two
+  # concurrent runs on different egress IPs agreed to within ~2.4%
+  # (36612884351 0.00055490 vs 36612890738 0.00056847 -- delta 1.36e-5, 147x
+  # under THRESH), which is what suggested the dominant loss term is upstream
+  # of the vantage and cancels in a cross-vantage difference just as it does in
+  # a same-vantage one. That is the SINGLE FAVOURABLE OBSERVATION, and the one
+  # dispatch of this design that produced a floor did not reproduce it: run
+  # 36664230865 read a cross-vantage floor of 2.02e-3 (N=1 legs 5.031e-3 /
+  # 3.011e-3) against a within-vantage spread of 7.6e-6 in the same minute --
+  # ~265x apart. Run 36664238282 produced no floor (leg 1 null; its 2.577e-3 is
+  # leg 3 alone), so it neither reproduces nor contradicts either reading. One
+  # agreement against one wide floor settles nothing, and the licence is a
+  # hypothesis every run now tests (within_vantage_spread beside the floor)
+  # rather than a settled property.
+  #
+  # The 780 s quiet-gap variant was rejected for a structural reason, not a cost
+  # one: it is calibrated against an undocumented 260 s / 780 s retention window
+  # that is a property of the PRE-FIX relay. An instrument whose validity rests
+  # on the broken relay's timer would have to be re-established against the
+  # fixed relay before it could certify it. Concurrency has no such coupling.
   #
   # VOID is load-bearing and is why this is not simply a delta threshold. A path
   # that drifts by more than the threshold cannot answer a question posed at
@@ -1394,83 +1435,86 @@ jobs:
   # as the absolute one did: a delta instrument with no noise floor licenses the
   # INSTRUMENT, never the THRESHOLD.
   #
+  # TWO GUARDS ARE NEW AND THEY ARE WHAT MAKE THIS DESIGN THE DESIGN:
+  #
+  #   DISTINCT VANTAGES. If two legs drew the same egress address they are the
+  #     collision, not a control pair -- the very thing the withdrawal is about,
+  #     silently rebuilt. GitHub does not promise distinct egress per runner, so
+  #     this is checked and not assumed. VOID.
+  #
+  #   OVERLAPPING WINDOWS. The floor is only a floor if it is contemporaneous
+  #     with the signal; three legs that ran one after another are the withdrawn
+  #     design wearing this one's label. Zero three-way overlap is VOID. The
+  #     overlap FRACTION is reported and DELIBERATELY NOT thresholded: the
+  #     ruling's floor-characterization condition says that constant comes from
+  #     >= 5 runs of data, so guessing one here would be the retired absolute
+  #     clause's defect a third time. Same discipline as the 0.9 in_sequence
+  #     bar, which says on its own line that it is set from one observation.
+  #     The start/end stamps come from three independent runner clocks, so
+  #     the fraction also carries inter-runner skew: immaterial to the
+  #     overlap > 0 test, but present in any fraction harvested from runs.
+  #
   # Stated residual, on the record rather than discovered later: this assumes
-  # path loss is roughly stationary across the three legs. The two N=1 legs are
-  # what make that assumption falsifiable instead of implicit -- they cannot
-  # prove stationarity, but they refuse the run when it visibly fails.
+  # path loss is roughly stationary across the three legs and common across the
+  # three vantages. The two N=1 legs are what make that falsifiable instead of
+  # implicit -- they cannot prove it, but they refuse the run when it visibly
+  # fails.
   #
   # SCOPE. This job does not re-decide demultiplexing. `tunnels_receiving=N/N`
   # is oneshot's verdict (exit 91 VOID / 93 knee) and is the other half of AC 2;
   # a leg here that fails to establish fan-out is reported VOID and routed there
   # rather than being diagnosed twice, in two places, with two chances to drift.
-  loss-delta:
+
+  # Validation lives in its own job, ahead of the legs, for a reason that is not
+  # tidiness. Run inside the matrix it would fire three times, and -- worse --
+  # the verdict job cannot tell "the dispatch was unusable" from "every leg
+  # VOIDed": both arrive as an absent artifact. VOID is a claim about the path,
+  # exit 92 is a claim about the dispatch, and collapsing them would let a typo
+  # read as a relay measurement. Failing once, before any leg is paid for, keeps
+  # them distinguishable.
+  loss-delta-preflight:
     if: ${{ inputs.mode == 'loss-delta' }}
     runs-on: ubuntu-latest
-    # Three legs run SEQUENTIALLY, so wall clock is ~3x timeout plus image pull
-    # and container startup. The boundary check in the step holds 3 x TIMEOUT
-    # under 900s, leaving ~5 min of slack here. Do not narrow this cap without
-    # narrowing that check: an EXCEEDED job timeout CANCELS the job (measured,
-    # see the probe job's note), and a cancelled job emits no verdict at all --
-    # which reads as a missing measurement rather than a rejected input.
-    timeout-minutes: 20
-    # No `issues: write`: this mode is dispatch-only measurement and must never
-    # file an outage row. Routing belongs to the scheduled oneshot probe.
+    timeout-minutes: 5
     permissions:
       contents: read
-      packages: read
     env:
-      RELAY: ${{ inputs.relay || '69.25.95.128' }}
-      SOURCE: ${{ inputs.source || '69.25.95.192' }}
-      GROUP: ${{ inputs.group || '232.1.1.60' }}
       TIMEOUT: ${{ inputs.timeout || '30' }}
       PACKETS: ${{ inputs.packet_count || '3' }}
-      # The MIDDLE leg's N. Defaults to 3 because that is the N the AC names.
       TUNNELS: ${{ inputs.tunnels || '3' }}
     steps:
-      - name: Vantage receipt
+      - name: reject unusable dispatch inputs
         run: |
-          echo "utc=$(date -u +%FT%TZ)"
-          echo "public_ip=$(curl -fsS https://api.ipify.org)"
-          echo "target=$RELAY:2268 sg=($SOURCE,$GROUP) middle_leg_tunnels=$TUNNELS"
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: fan-out loss delta (legs N=1, N, N=1 on ONE vantage)
-        run: |
-          # ALL THREE LEGS RUN IN THIS ONE JOB ON PURPOSE. A separate job is a
-          # separate runner and therefore a separate public IP -- which is the
-          # exact variable this control exists to hold constant. Do not split
-          # the legs across jobs, or into a matrix, however much tidier it
-          # looks: doing so silently rebuilds the per-vantage lottery that the
-          # retired absolute threshold was.
-          #
           # From the AC, NOT a dispatch input: a caller must not be able to
           # declare the threshold that decides their own result. Same reasoning
-          # as DISTINCT_SOURCE_IPS in the probe job.
+          # as DISTINCT_SOURCE_IPS in the probe job. It is repeated in the
+          # verdict job, which is where it is actually applied; the copy here
+          # exists only to derive the sample floor, and the test asserts both.
           THRESH=0.002
 
           MAX_TUNNELS=256
           case "$TUNNELS" in ''|*[!0-9]*)
             echo "::error::tunnels must be an integer in 2..$MAX_TUNNELS, got '$TUNNELS'"; exit 92 ;;
           esac
-          # The floor is 2, not 1. At N=1 the middle leg IS a control leg, so
+          # The floor is 2, not 1. At N=1 the treatment leg IS a floor leg, so
           # signal is 0 by construction and the run would report PASS having
           # measured nothing -- a vacuous green, which is worse than a refusal.
           if [ "$TUNNELS" -lt 2 ] || [ "$TUNNELS" -gt "$MAX_TUNNELS" ]; then
-            echo "::error::tunnels must be an integer in 2..$MAX_TUNNELS, got '$TUNNELS' (N=1 makes the middle leg a control leg: signal is 0 by construction)"; exit 92
+            echo "::error::tunnels must be an integer in 2..$MAX_TUNNELS, got '$TUNNELS' (N=1 makes the treatment leg a floor leg: signal is 0 by construction)"; exit 92
           fi
           case "$TIMEOUT" in ''|*[!0-9]*)
             echo "::error::timeout must be an integer, got '$TIMEOUT'"; exit 92 ;;
           esac
-          if [ "$((TIMEOUT * 3))" -gt 900 ]; then
-            echo "::error::3 legs x timeout=${TIMEOUT}s = $((TIMEOUT * 3))s exceeds the 900s budget under this job's 20-minute cap; lower timeout or raise both together"; exit 92
+          # The legs are CONCURRENT, so the budget is 1x timeout, not the 3x it
+          # was under the withdrawn sequential bracket. Kept as a check anyway:
+          # an EXCEEDED job timeout CANCELS the job (measured, see the probe
+          # job's note), and a cancelled leg emits no artifact -- which the
+          # verdict job can only report as a missing measurement.
+          if [ "$TIMEOUT" -gt 780 ]; then
+            echo "::error::timeout=${TIMEOUT}s exceeds the 780s budget under the leg job's 15-minute cap (legs are concurrent, so this is 1x timeout plus image pull and container startup, not 3x)"; exit 92
           fi
           # packet_count is SHARED with oneshot, whose default of 3 is right for
-          # detection and wrong here: the per-receipt SAMPLE FLOOR below needs
+          # detection and wrong here: the per-receipt SAMPLE FLOOR needs
           # (received + 1) x THRESH > 1, so the least usable received is
           # floor(1 / THRESH) = 500. received <= packet_count always (packet_count
           # also counts duplicate and behind-the-mark arrivals), so a packet_count
@@ -1484,186 +1528,383 @@ jobs:
           if [ "$PACKETS" -lt "$MIN_PACKETS" ]; then
             echo "::error::packet_count=$PACKETS is below the sample floor of $MIN_PACKETS: a receipt counts only if (received + 1) x THRESH > 1, i.e. received >= $MIN_PACKETS at THRESH=$THRESH, and received <= packet_count, so all three legs would VOID as 'sample too short'. Dispatch comfortably above $MIN_PACKETS -- late arrivals count in packet_count but not in received."; exit 92
           fi
+          echo "preflight_ok tunnels=$TUNNELS timeout=$TIMEOUT packet_count=$PACKETS threshold=$THRESH"
 
+  # THE THREE LEGS. A matrix, so each leg is a SEPARATE RUNNER and therefore a
+  # separate public IP -- which is the whole point of the design, and the exact
+  # opposite of what the withdrawn same-job bracket needed. Matrix legs start
+  # together, so the three joins overlap in wall-clock time; the verdict job
+  # MEASURES that overlap rather than assuming it.
+  #
+  # Leg indices 1/2/3 are floor / treatment / floor, kept in that order so the
+  # verdict arithmetic reads $m[0], $m[1], $m[2] exactly as it did. The order is
+  # now positional bookkeeping only -- concurrent legs have no sequence to
+  # bracket, and the bracketing the old order bought is replaced by the overlap
+  # guard.
+  loss-delta:
+    if: ${{ inputs.mode == 'loss-delta' }}
+    needs: loss-delta-preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # A dead leg must NOT cancel its siblings. The surviving legs and their
+      # vantages are what let the verdict say WHY the run is void, and a
+      # cancelled sibling emits no artifact to say it with.
+      fail-fast: false
+      matrix:
+        include:
+          - leg: 1
+            n: 1
+          - leg: 2
+            n: ${{ inputs.tunnels || '3' }}
+          - leg: 3
+            n: 1
+    permissions:
+      contents: read
+      packages: read
+    env:
+      RELAY: ${{ inputs.relay || '69.25.95.128' }}
+      SOURCE: ${{ inputs.source || '69.25.95.192' }}
+      GROUP: ${{ inputs.group || '232.1.1.60' }}
+      TIMEOUT: ${{ inputs.timeout || '30' }}
+      PACKETS: ${{ inputs.packet_count || '3' }}
+      LEG: ${{ matrix.leg }}
+      N: ${{ matrix.n }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: leg (N concurrent joins from this runner's own vantage)
+        run: |
+          # THIS STEP NEVER FAILS ON A MEASUREMENT OUTCOME. It always writes
+          # leg-$LEG.json, with `mean` possibly null or "short", and exits 0.
+          # The verdict is one job's job, in one place. A leg that exited
+          # nonzero here would skip its own artifact upload and arrive at the
+          # verdict as silence -- indistinguishable from a runner that never
+          # started, which is a different fact with a different follow-up.
           docker pull -q $IMAGE || docker build -q -t $IMAGE \
             --label org.opencontainers.image.revision=${{ github.sha }} .
           echo "image_digest=$(docker inspect --format='{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}local-build{{end}}' $IMAGE)"
           echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"
 
-          MEANS=
-          IPS=
-          leg=0
-          for n in 1 "$TUNNELS" 1; do
-            leg=$((leg+1))
-            echo "--- leg $leg: N=$n ---"
-            # Vantage is the variable this control holds constant, so record it
-            # PER LEG rather than once for the job. An egress rotation mid-job
-            # invalidates the comparison, and one curl per leg lets the receipt
-            # SAY that, instead of leaving a reader to infer it from a wide
-            # noise floor that has several other explanations.
-            ip=$(curl -fsS https://api.ipify.org || echo unavailable)
-            echo "leg${leg}_public_ip=$ip"
-            IPS="${IPS:+$IPS,}$ip"
-            pids=""
-            # amt-verify exits 1 on `outcome: timeout`, the NORMAL end of a
-            # bounded sample (BLO-26574, CTO ruling item 5), so the exit code is
-            # not the verdict here any more than it is in the probe job. The
-            # receipt is. Suspend -e across the reap for that reason.
-            set +e
-            for i in $(seq 1 "$n"); do
-              docker run --rm --network host $IMAGE \
-                --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
-                --timeout "$TIMEOUT" --packet-count "$PACKETS" --json --verbose \
-                >"leg$leg-report-$i.json" 2>"leg$leg-verbose-$i.log" &
-              pids="$pids $!"
-            done
-            for p in $pids; do wait "$p"; done
-            set -e
+          # The vantage is the variable this design VARIES rather than holds,
+          # so it is recorded per leg and the verdict refuses a collision. One
+          # curl, this leg, this runner.
+          ip=$(curl -fsS https://api.ipify.org || echo unavailable)
+          echo "leg${LEG}_public_ip=$ip n=$N"
 
-            # Per-receipt telemetry BEFORE the mean, so a VOID names the leg and
-            # the field that caused it rather than reporting a bare null.
-            for i in $(seq 1 "$n"); do
-              jq -rc --argjson l "$leg" --argjson i "$i" \
-                '{leg:$l,tunnel:$i,source,group,packet_count,received:.mmtp.received,
-                  in_sequence:.mmtp.in_sequence,tracks:.mmtp.tracks,
-                  implausible:.mmtp.implausible,loss_ratio:.mmtp.loss_ratio}' \
-                "leg$leg-report-$i.json" 2>/dev/null \
-                || echo "{\"leg\":$leg,\"tunnel\":$i,\"receipt\":\"missing-or-unparseable\"}"
-            done
+          # Wall-clock window. The verdict intersects the three of them: a floor
+          # that did not run WHILE the signal ran is not a floor, it is the
+          # withdrawn sequential design with a matrix in front of it.
+          start=$(date -u +%s)
+          pids=""
+          # amt-verify exits 1 on `outcome: timeout`, the NORMAL end of a
+          # bounded sample (BLO-26574, CTO ruling item 5), so the exit code is
+          # not the verdict here any more than it is in the probe job. The
+          # receipt is. Suspend errexit across the reap for that reason.
+          set +e
+          for i in $(seq 1 "$N"); do
+            docker run --rm --network host $IMAGE \
+              --no-driad --relay "$RELAY" --source "$SOURCE" --group "$GROUP" \
+              --timeout "$TIMEOUT" --packet-count "$PACKETS" --json --verbose \
+              >"leg$LEG-report-$i.json" 2>"leg$LEG-verbose-$i.log" &
+            pids="$pids $!"
+          done
+          for p in $pids; do wait "$p"; done
+          set -e
+          end=$(date -u +%s)
 
-            # Fail CLOSED on every field the mean depends on, and on the COUNT.
-            # A mean taken over the survivors of a partly-failed leg would
-            # silently be a mean over a different N than the leg asked for --
-            # and N is the variable under test, so that is not a degraded
-            # measurement, it is a measurement of something else wearing this
-            # one's label. `length == $n` is the guard that refuses it.
-            #
-            # loss_ratio is amt-verify's own field and is byte-identical to the
-            # AC's `gaps/(gaps+received)` -- verified on run 36474867098's three
-            # receipts, including the non-zero one (25/68487 -> 0.0003650327799
-            # by both). Read it rather than recomputing it, but assert it is a
-            # number: an absent field would otherwise arrive as null and a
-            # null mean would read as 0.
-            #
-            # loss_ratio counts SEQUENCE CONTINUITY, not delivery, so it reads
-            # HIGH under reordering or duplication -- a direction no threshold
-            # on it can detect, because the inflated value is a perfectly
-            # ordinary float. Measured on run 36613263318 (BLO-33636): a leg
-            # reported loss_ratio 0.3242 with implausible=0 while receiving
-            # 67248 packets, the MOST of its round (peers 66920/66923). A third
-            # of the stream was plainly not lost; its sequence space was read
-            # twice. in_sequence is the field that says so.
-            #
-            # in_sequence counts arrivals exactly one past their track's previous
-            # number, so a track's FIRST arrival is never in it (amt-verify
-            # SeqTracker::observe): a perfectly clean stream has in_sequence ==
-            # packet_count - tracks EXACTLY. The bar is 0.9 of that, not of
-            # packet_count -- against packet_count it was unsatisfiable below
-            # ~10 x tracks packets, and PACKETS defaults to 3, so every default
-            # dispatch VOIDed (Ally review, PR #49). The corrupt leg above sat at
-            # 0.507 (in_sequence 34115 of 67248 - 9 tracks). The 15 healthy
-            # receipts taken that day read 0.996..1.000 of packet_count; against
-            # packet_count - tracks, the smaller basis, they can only read
-            # higher. 0.9 sits between those, but note it is set from ONE
-            # corrupt observation: widen it only on more.
-            # The bar also caps what this job can report as FAIL: one track with
-            # G gap runs has in_sequence = packet_count - 1 - G against
-            # 0.9 x (packet_count - 1), so G > 0.1 x (packet_count - 1) is refused
-            # as VOID. The cap is on gap RUNS, not lost packets: isolated
-            # single-packet loss hits it near 9% loss_ratio, bursty loss (mean
-            # bursts of 5-21 in BLO-33456) clears the bar at far higher loss.
-            # Frequent scattered loss reads VOID, not FAIL, by design.
-            # tracks is asserted numeric like the other two; its `// 0` is the
-            # STRICTEST fallback (it restores the packet_count bar), so that
-            # conjunct alone refuses an absent tracks. And tracks <= received:
-            # every track's first arrival is in received (SeqTracker::observe),
-            # so a genuine receipt cannot break it, and without it a corrupt
-            # tracks drives the bar negative and waves any in_sequence through.
-            # Bounded by received rather than packet_count because that is the
-            # invariant amt-verify actually holds, and it leaves the
-            # packet_count > 0 guard its own witness.
-            #
-            # SAMPLE FLOOR. A clean sample of 3 packets has in_sequence 2, which
-            # clears the bar -- but it cannot measure loss at THRESH. One lost
-            # packet reads as 1/(received + 1) (loss_ratio = gaps / (gaps +
-            # received)), so at 3 packets it is 0.25 -- and a lossy short leg
-            # fails the bar besides, since a gap-ending arrival is not
-            # in-sequence. Without a floor a short run returns PASS or VOID and
-            # never FAIL. The floor is derived from THRESH, not chosen: a receipt
-            # counts only if ONE lost packet would read BELOW THRESH, i.e.
-            # (received + 1) x THRESH > 1 -- received >= 500 at 0.002.
-            # received, not packet_count - tracks: received is the ratio's own
-            # denominator term, so this is its resolution exactly. packet_count
-            # also counts duplicate and behind-the-mark arrivals the ratio never
-            # sees -- 20920 of 67248 on the reordering receipt above -- so it
-            # can claim a resolution the ratio does not have. Arithmetic rather
-            # than `>=` so a non-numeric received errors (jq orders strings
-            # above every number) instead of passing. It is checked only once
-            # every other guard has passed, so the leg reports "short" rather
-            # than null, and the VOID names that cause rather than a bare null.
-            #
-            # The in_sequence bar is kept LAST in the conjunction on purpose.
-            # jq's `and` short-circuits, so a guard placed earlier would
-            # swallow the `noloss` and `imp` receipts before their own guards
-            # saw them and silently make those two untestable (BLO-33636: an
-            # inert guard already shipped here once for exactly this reason).
-            mean=$(jq -s --arg s "$SOURCE" --arg g "$GROUP" --argjson n "$n" --argjson t "$THRESH" '
-              if (length == $n)
-                 and all(.[]; .source == $s and .group == $g
-                              and (.packet_count // 0) > 0
-                              and (.mmtp.implausible // 1) == 0
-                              and ((.mmtp.loss_ratio | type) == "number")
-                              and ((.mmtp.in_sequence | type) == "number")
-                              and ((.mmtp.tracks | type) == "number")
-                              and (.mmtp.tracks <= .mmtp.received)
-                              and (.mmtp.in_sequence >= (((.packet_count // 0) - (.mmtp.tracks // 0)) * 0.9)))
-              then if all(.[]; ((.mmtp.received + 1) * $t) > 1)
-                   then (map(.mmtp.loss_ratio) | add / length)
-                   else "short" end
-              else null end' leg$leg-report-*.json 2>/dev/null) || mean=null
-            [ -n "$mean" ] || mean=null
-            echo "leg${leg}_n=$n leg${leg}_mean_loss=$mean"
-            MEANS="${MEANS:+$MEANS,}$mean"
+          # Per-receipt telemetry BEFORE the mean, so a VOID names the leg and
+          # the field that caused it rather than reporting a bare null.
+          for i in $(seq 1 "$N"); do
+            jq -rc --argjson l "$LEG" --argjson i "$i" \
+              '{leg:$l,tunnel:$i,source,group,packet_count,received:.mmtp.received,
+                in_sequence:.mmtp.in_sequence,tracks:.mmtp.tracks,
+                implausible:.mmtp.implausible,loss_ratio:.mmtp.loss_ratio}' \
+              "leg$LEG-report-$i.json" 2>/dev/null \
+              || echo "{\"leg\":$LEG,\"tunnel\":$i,\"receipt\":\"missing-or-unparseable\"}"
           done
 
-          echo "leg_mean_losses=[$MEANS]"
-          # One jq for the arithmetic: shell cannot compare floats, and awk
-          # would be a second dialect for no gain. Emits TAB-separated
-          # verdict/signal/noise/why so the shell never parses a float.
-          verdict=$(jq -rn --argjson m "[$MEANS]" --argjson t "$THRESH" '
-            if ($m | length) != 3 or any($m[]; . == null)
-            then "VOID\tnull\tnull\tat least one leg produced no usable mean (per-receipt lines above name the field; in_sequence is judged against 0.9 x (packet_count - tracks))"
-            elif any($m[]; . == "short")
-            then "VOID\tnull\tnull\tsample too short to resolve the threshold: every receipt must have (received + 1) > 1/THRESH = \(1 / $t), so that ONE lost packet reads below THRESH, and at least one did not (received is on the per-receipt lines above). late (behind-the-mark) arrivals count in packet_count but not in received, so under reordering received falls well short of it (46328 of 67248 on the BLO-33636 receipt): dispatch with packet_count comfortably above \(1 / $t), not at it"
-            else
-              $m[0] as $a | $m[1] as $b | $m[2] as $c
-              | (($a + $c) / 2)                          as $base
-              | ($b - $base)                             as $signal
-              | (($a - $c) | if . < 0 then -. else . end) as $noise
-              | if   $noise  >= $t then "VOID\t\($signal)\t\($noise)\tnoise floor >= threshold"
-                elif $signal >= $t then "FAIL\t\($signal)\t\($noise)\tfan-out cost >= threshold"
-                else                    "PASS\t\($signal)\t\($noise)\tfan-out cost < threshold" end
+          # Fail CLOSED on every field the mean depends on, and on the COUNT.
+          # A mean taken over the survivors of a partly-failed leg would
+          # silently be a mean over a different N than the leg asked for --
+          # and N is the variable under test, so that is not a degraded
+          # measurement, it is a measurement of something else wearing this
+          # one's label. `length == $n` is the guard that refuses it.
+          #
+          # loss_ratio is amt-verify's own field and is byte-identical to the
+          # AC's `gaps/(gaps+received)` -- verified on run 36474867098's three
+          # receipts, including the non-zero one (25/68487 -> 0.0003650327799
+          # by both). Read it rather than recomputing it, but assert it is a
+          # number: an absent field would otherwise arrive as null and a
+          # null mean would read as 0.
+          #
+          # loss_ratio counts SEQUENCE CONTINUITY, not delivery, so it reads
+          # HIGH under reordering or duplication -- a direction no threshold
+          # on it can detect, because the inflated value is a perfectly
+          # ordinary float. Measured on run 36613263318 (BLO-33636): a leg
+          # reported loss_ratio 0.3242 with implausible=0 while receiving
+          # 67248 packets, the MOST of its round (peers 66920/66923). A third
+          # of the stream was plainly not lost; its sequence space was read
+          # twice. in_sequence is the field that says so.
+          #
+          # in_sequence counts arrivals exactly one past their track's previous
+          # number, so a track's FIRST arrival is never in it (amt-verify
+          # SeqTracker::observe): a perfectly clean stream has in_sequence ==
+          # packet_count - tracks EXACTLY. The bar is 0.9 of that, not of
+          # packet_count -- against packet_count it was unsatisfiable below
+          # ~10 x tracks packets, and PACKETS defaults to 3, so every default
+          # dispatch VOIDed (Ally review, PR #49). The corrupt leg above sat at
+          # 0.507 (in_sequence 34115 of 67248 - 9 tracks). The 15 healthy
+          # receipts taken that day read 0.996..1.000 of packet_count; against
+          # packet_count - tracks, the smaller basis, they can only read
+          # higher. 0.9 sits between those, but note it is set from ONE
+          # corrupt observation: widen it only on more.
+          # The bar also caps what this job can report as FAIL: one track with
+          # G gap runs has in_sequence = packet_count - 1 - G against
+          # 0.9 x (packet_count - 1), so G > 0.1 x (packet_count - 1) is refused
+          # as VOID. The cap is on gap RUNS, not lost packets: isolated
+          # single-packet loss hits it near 9% loss_ratio, bursty loss (mean
+          # bursts of 5-21 in BLO-33456) clears the bar at far higher loss.
+          # Frequent scattered loss reads VOID, not FAIL, by design.
+          # tracks is asserted numeric like the other two; its `// 0` is the
+          # STRICTEST fallback (it restores the packet_count bar), so that
+          # conjunct alone refuses an absent tracks. And tracks <= received:
+          # every track's first arrival is in received (SeqTracker::observe),
+          # so a genuine receipt cannot break it, and without it a corrupt
+          # tracks drives the bar negative and waves any in_sequence through.
+          # Bounded by received rather than packet_count because that is the
+          # invariant amt-verify actually holds, and it leaves the
+          # packet_count > 0 guard its own witness.
+          #
+          # SAMPLE FLOOR. A clean sample of 3 packets has in_sequence 2, which
+          # clears the bar -- but it cannot measure loss at THRESH. One lost
+          # packet reads as 1/(received + 1) (loss_ratio = gaps / (gaps +
+          # received)), so at 3 packets it is 0.25 -- and a lossy short leg
+          # fails the bar besides, since a gap-ending arrival is not
+          # in-sequence. Without a floor a short run returns PASS or VOID and
+          # never FAIL. The floor is derived from THRESH, not chosen: a receipt
+          # counts only if ONE lost packet would read BELOW THRESH, i.e.
+          # (received + 1) x THRESH > 1 -- received >= 500 at 0.002.
+          # received, not packet_count - tracks: received is the ratio's own
+          # denominator term, so this is its resolution exactly. packet_count
+          # also counts duplicate and behind-the-mark arrivals the ratio never
+          # sees -- 20920 of 67248 on the reordering receipt above -- so it
+          # can claim a resolution the ratio does not have. Arithmetic rather
+          # than `>=` so a non-numeric received errors (jq orders strings
+          # above every number) instead of passing. It is checked only once
+          # every other guard has passed, so the leg reports "short" rather
+          # than null, and the VOID names that cause rather than a bare null.
+          #
+          # The in_sequence bar is kept LAST in the conjunction on purpose.
+          # jq's `and` short-circuits, so a guard placed earlier would
+          # swallow the `noloss` and `imp` receipts before their own guards
+          # saw them and silently make those two untestable (BLO-33636: an
+          # inert guard already shipped here once for exactly this reason).
+          THRESH=0.002
+          mean=$(jq -s --arg s "$SOURCE" --arg g "$GROUP" --argjson n "$N" --argjson t "$THRESH" '
+            if (length == $n)
+               and all(.[]; .source == $s and .group == $g
+                            and (.packet_count // 0) > 0
+                            and (.mmtp.implausible // 1) == 0
+                            and ((.mmtp.loss_ratio | type) == "number")
+                            and ((.mmtp.in_sequence | type) == "number")
+                            and ((.mmtp.tracks | type) == "number")
+                            and (.mmtp.tracks <= .mmtp.received)
+                            and (.mmtp.in_sequence >= (((.packet_count // 0) - (.mmtp.tracks // 0)) * 0.9)))
+            then if all(.[]; ((.mmtp.received + 1) * $t) > 1)
+                 then (map(.mmtp.loss_ratio) | add / length)
+                 else "short" end
+            else null end' leg$LEG-report-*.json 2>/dev/null) || mean=null
+          [ -n "$mean" ] || mean=null
+          echo "leg${LEG}_n=$N leg${LEG}_mean_loss=$mean"
+
+          # WITHIN-VANTAGE SPREAD, and it is the control this design was
+          # missing. A leg with N > 1 runs N tunnels from ONE address at one
+          # instant, so the disagreement AMONG them is what two observers
+          # sharing a vantage see -- which is the term the cross-vantage floor
+          # assumes is the whole story. Pairing it with the cross-vantage noise
+          # floor is what makes "the dominant loss is upstream of the vantage"
+          # falsifiable in EVERY run instead of resting on the single
+          # favourable observation that licensed the design.
+          #
+          # REPORTED, NOT GATED, and deliberately so: turning it into a VOID arm
+          # needs a constant, and the ruling that commissioned this design says
+          # a constant comes from data rather than from whoever is writing the
+          # instrument. This emits the data. Null for the N=1 legs, which have
+          # nothing to disagree with. Computed in its own jq so the heavily
+          # mutation-tested mean above is left untouched -- but with the SAME
+          # `length == $n` count guard, for the same reason: jq -s slurps an
+          # empty receipt (a container that died before writing) as zero
+          # values without erroring, so a partly-failed leg would otherwise
+          # publish a spread over the survivors under this leg's N.
+          spread=$(jq -s --argjson n "$N" '[.[].mmtp.loss_ratio]
+            | if (length == $n) and (length > 1) and (all(.[]; type == "number"))
+              then (max - min) else null end' leg$LEG-report-*.json 2>/dev/null) || spread=null
+          [ -n "$spread" ] || spread=null
+          echo "leg${LEG}_within_vantage_spread=$spread"
+
+          # --argjson mean so a null stays a JSON null and a float stays a
+          # float; --arg ip because "unavailable" is a legal value here and the
+          # verdict's distinctness guard must see it as a string, not choke.
+          jq -n --argjson leg "$LEG" --argjson n "$N" --argjson mean "$mean" \
+                --argjson spread "$spread" \
+                --arg ip "$ip" --argjson start "$start" --argjson end "$end" \
+            '{leg:$leg,n:$n,mean:$mean,spread:$spread,ip:$ip,start:$start,end:$end}' \
+            | tee "leg-$LEG.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: amt-loss-delta-leg-${{ matrix.leg }}
+          path: |
+            leg-${{ matrix.leg }}.json
+            leg${{ matrix.leg }}-report-*.json
+            leg${{ matrix.leg }}-verbose-*.log
+
+  loss-delta-verdict:
+    # `!cancelled()` and not `always()`: a cancelled workflow must not emit a
+    # verdict of its own. Gated on preflight SUCCESS so a rejected dispatch
+    # stays exit 92 from one job rather than arriving here as three absent
+    # artifacts and being reported as VOID -- a claim about the path that
+    # nothing about the path supports.
+    #
+    # needs['loss-delta-preflight'], NOT needs.loss-delta-preflight. A bare
+    # property name in the expression grammar is [a-zA-Z_][a-zA-Z0-9_]*, so a
+    # hyphenated job id read with dot syntax is parsed as SUBTRACTION rather
+    # than as a lookup -- and the gate then evaluates to something that is not
+    # the preflight result, silently, with no workflow error. The `needs:` LIST
+    # below is unaffected; it is not an expression.
+    if: ${{ !cancelled() && inputs.mode == 'loss-delta' && needs['loss-delta-preflight'].result == 'success' }}
+    needs: [loss-delta-preflight, loss-delta]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No `issues: write`: this mode is dispatch-only measurement and must never
+    # file an outage row. Routing belongs to the scheduled oneshot probe.
+    permissions:
+      contents: read
+    env:
+      TIMEOUT: ${{ inputs.timeout || '30' }}
+      TUNNELS: ${{ inputs.tunnels || '3' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: amt-loss-delta-leg-*
+          merge-multiple: true
+      - name: fan-out loss delta verdict (concurrent cross-vantage)
+        run: |
+          # From the AC, NOT a dispatch input: a caller must not be able to
+          # declare the threshold that decides their own result.
+          THRESH=0.002
+
+          # Assemble by LEG INDEX, not by filename order or arrival order. The
+          # legs are concurrent and their artifacts land in whatever order the
+          # uploads finished, so sorting is not cosmetic -- $m[1] must be the
+          # treatment leg or the signal is computed from a floor.
+          ls -1 leg-*.json 2>/dev/null || true
+          legs=$(jq -sc 'sort_by(.leg)' leg-*.json 2>/dev/null) || legs='[]'
+          [ -n "$legs" ] || legs='[]'
+          echo "legs=$legs"
+
+          # One jq for everything the shell cannot do: float comparison, set
+          # arithmetic on the vantages, and the window intersection. Emits
+          # TAB-separated verdict/signal/noise/why so the shell never parses a
+          # float. The guard ORDER below is the ruling's: a structurally
+          # invalid run is not scored, it is refused.
+          verdict=$(jq -rn --argjson l "$legs" --argjson t "$THRESH" --argjson tmo "${TIMEOUT:-0}" '
+            ($l | map(.mean))                                   as $m
+          | ($l | map(.ip))                                     as $ips
+          | ($l | map(.leg))                                    as $idx
+          # Joined OUTSIDE the message strings. jq string interpolation \(...)
+          # carries raw jq, where a backslash-escaped quote is a syntax error --
+          # so `join(", ")` cannot be written inline inside one.
+          | ($ips | join(", "))                                 as $ipslist
+          | ($ips | join("/"))                                  as $ipsslash
+          | if ($l | length) != 3 or $idx != [1,2,3]
+            then "VOID\tnull\tnull\tthe run did not produce three legs indexed 1,2,3 (got \($idx)): a leg job was cancelled, never started, or failed before writing its artifact. That is a missing measurement, not a relay verdict."
+
+            # SHAPE. The arithmetic below reads $m[0]/$m[1]/$m[2] positionally
+            # as floor/treatment/floor, and every artifact carries the N it ran
+            # at -- so check it here rather than trusting the matrix. A future
+            # matrix edit then fails at runtime, not only in the test file.
+            elif ($l[0].n == 1 and $l[2].n == 1 and $l[1].n >= 2) | not
+            then "VOID\tnull\tnull\tthe legs are not floor/treatment/floor (n = \($l | map(.n))): legs 1 and 3 must run N=1 and leg 2 N>=2, or the signal is computed against the wrong term. That is a matrix edit, not a relay verdict."
+
+            # DISTINCTNESS IS CHECKED BEFORE THE MEANS, and that order is the
+            # design. Two legs on one address are the collision under test, so
+            # any number they produce is a measurement of the defect wearing
+            # the floor-pair label -- scoring it first would be the withdrawn
+            # bracket rebuilt silently. `unavailable` counts as a collision
+            # too: an unknown vantage cannot be shown distinct, and the guard
+            # fails closed.
+            elif ($ips | unique | length) != 3 or ($ips | any(. == "unavailable"))
+            then "VOID\tnull\tnull\tthe three legs did not draw three distinct, known egress addresses (\($ipslist)). Two legs sharing one address ARE the collision this AC measures, so they cannot be a control pair; an unreadable address cannot be shown distinct and fails closed. Re-dispatch: GitHub does not promise a distinct egress per runner."
+
+            # OVERLAP. max(starts) .. min(ends) is the interval all three legs
+            # were joined at once. Empty means they ran in sequence, which is
+            # the withdrawn design wearing this design label.
+            #
+            # NO APOSTROPHES ANYWHERE IN THIS JQ PROGRAM. It is a shell
+            # single-quoted string, so one closes the quote and bash then
+            # parses the remainder of the program as commands -- which fails
+            # with `syntax error near unexpected token else`, naming a line
+            # nowhere near the apostrophe. Cost an hour once; the test below
+            # asserts it so the next one costs nothing.
+            else ([$l[].start] | max) as $s0
+               | ([$l[].end]   | min) as $e0
+               | (($e0 - $s0) | if . < 0 then 0 else . end) as $ov
+               | (if $tmo > 0 then $ov / $tmo else null end)  as $ovf
+               | if $ov <= 0
+                 then "VOID\tnull\tnull\tthe three legs never ran at the same time (three-way overlap \($ov)s): a floor that did not run WHILE the signal ran is not a floor. Concurrency is what this design buys and it was not obtained -- check for a queued or delayed matrix leg."
+                 elif ($m | any(. == null))
+                 then "VOID\tnull\tnull\tat least one leg produced no usable mean (the per-receipt lines in that leg job name the field; in_sequence is judged against 0.9 x (packet_count - tracks)) [overlap \($ov)s, \($ovf) of timeout]"
+                 elif ($m | any(. == "short"))
+                 then "VOID\tnull\tnull\tsample too short to resolve the threshold: every receipt must have (received + 1) > 1/THRESH = \(1 / $t), so that ONE lost packet reads below THRESH, and at least one did not. late (behind-the-mark) arrivals count in packet_count but not in received, so under reordering received falls well short of it (46328 of 67248 on the BLO-33636 receipt): dispatch with packet_count comfortably above \(1 / $t), not at it [overlap \($ov)s, \($ovf) of timeout]"
+                 else
+                   $m[0] as $a | $m[1] as $b | $m[2] as $c
+                   | (($a + $c) / 2)                          as $base
+                   | ($b - $base)                             as $signal
+                   | (($a - $c) | if . < 0 then -. else . end) as $noise
+                   | (" [overlap \($ov)s, \($ovf) of timeout; vantages \($ipsslash)]") as $ctx
+                   | if   $noise  >= $t then "VOID\t\($signal)\t\($noise)\tnoise floor >= threshold\($ctx)"
+                     elif $signal >= $t then "FAIL\t\($signal)\t\($noise)\tfan-out cost >= threshold\($ctx)"
+                     else                    "PASS\t\($signal)\t\($noise)\tfan-out cost < threshold\($ctx)" end
+                 end
             end') || verdict=$(printf 'VOID\tnull\tnull\tverdict arithmetic failed')
           v=$(printf '%s' "$verdict" | cut -f1)
           signal=$(printf '%s' "$verdict" | cut -f2)
           noise=$(printf '%s' "$verdict" | cut -f3)
           why=$(printf '%s' "$verdict" | cut -f4)
-          # A wide floor has two causes that take DIFFERENT follow-ups, and the
-          # per-leg addresses above already tell them apart -- so say which,
-          # rather than leaving a reader to diff three log lines:
-          #   several addresses -> the egress rotated mid-job. The comparison is
-          #     void for a reason outside the path, and the next run may be fine.
-          #   ONE address       -> the path itself drifted while the vantage held.
-          #     Re-running is not the answer; that vantage is unusable at this
-          #     threshold. Observed on the very first live run (36568716671):
-          #     one IP across all three legs, floor 0.0088.
-          vantage=$(printf '%s' "$IPS" | tr ',' '\n' | sort -u | paste -sd'/' -)
+
+          # The floor DISTRIBUTION, emitted on every run regardless of verdict.
+          # The ruling's condition 4: no PASS is credited until the floor has
+          # been characterized over >= 5 runs, and >2e-4 on any single read is a
+          # stop-and-re-examine rather than a licence to widen THRESH. That is
+          # a claim about a population, so the per-run reading has to be
+          # harvestable from the log by a reader who has not read this comment.
+          vantage=$(jq -rn --argjson l "$legs" '[$l[].ip] | join("/")' 2>/dev/null || echo unknown)
           echo "vantage_addresses=$vantage"
+          echo "floor_legs=$(jq -rn --argjson l "$legs" '[$l[] | select(.n == 1) | .mean | tostring] | join(",")' 2>/dev/null || echo unknown)"
+          # The paired control. `noise` is what two observers on DIFFERENT
+          # vantages disagreed by; this is what N observers on ONE vantage
+          # disagreed by, at the same instant, against the same relay and
+          # stream. The cross-vantage floor is only a floor if the two are
+          # comparable -- if within-vantage agreement is orders of magnitude
+          # tighter, the floor is measuring the vantages rather than the path,
+          # and a wide floor is a property of the DESIGN rather than of the
+          # night. Reported so that question is answerable from any run.
+          within=$(jq -rn --argjson l "$legs" '[$l[] | select(.n > 1) | .spread | tostring] | join(",")' 2>/dev/null || echo unknown)
+          echo "within_vantage_spread=$within"
           echo "fanout_loss_signal=$signal fanout_loss_noise_floor=$noise threshold=$THRESH verdict=$v"
 
           case "$v" in
             PASS)
-              echo "PASS: fan-out to N=$TUNNELS cost $signal loss over the mean of its two bracketing N=1 legs, against a noise floor of $noise and a threshold of $THRESH. Both terms are same-vantage and same-minute, so this is a measurement of the relay and not of the runner's egress."
+              echo "PASS: fan-out to N=$TUNNELS cost $signal loss over the mean of its two concurrent N=1 floor legs, against a noise floor of $noise and a threshold of $THRESH. $why"
+              echo "NOT YET A CREDITED PASS on its own: per the 2026-09-30 ruling (condition 4), the floor distribution must be published from >= 5 runs before any PASS counts, and a floor read above 2e-4 is a signal to re-examine this design rather than to widen the threshold. This run contributes ONE reading: noise_floor=$noise."
               ;;
             # VOID is checked FIRST on purpose. When the floor is wide the
             # signal is uninterpretable in EITHER direction -- a small delta
@@ -1671,11 +1912,11 @@ jobs:
             # is evidence that this run could not ask the question. Scoring it
             # PASS would be the retired clause's defect with the sign flipped.
             VOID)
-              echo "::error::VOID, not FAIL: $why (signal=$signal noise_floor=$noise threshold=$THRESH, vantage=$vantage). This run cannot answer whether fan-out costs loss, and that is NOT a relay verdict -- do not read it as one and do not re-roll hoping for a quiet vantage. If the floor is wide, read vantage= above: SEVERAL addresses means the egress rotated mid-job and the next run may be fine; ONE address means the path itself drifted while the vantage held, and re-running is not the answer -- that vantage is unusable for a measurement at this threshold. If a leg produced no usable mean, read the per-receipt lines above: a leg that failed to ESTABLISH fan-out is oneshot's verdict (exit 91/93), not this job's."
+              echo "::error::VOID, not FAIL: $why (signal=$signal noise_floor=$noise threshold=$THRESH re-examine_above=2e-4 within_vantage_spread=$within, vantages=$vantage). This run cannot answer whether fan-out costs loss, and that is NOT a relay verdict -- do not read it as one. If the floor is what voided it (noise_floor >= threshold), that floor is at least 10x the 2e-4 single read that condition 4 treats as a signal to re-examine this design rather than to widen the threshold, and this run does not say whether the upstream path drifted or the cross-vantage floor is measuring the vantages: within_vantage_spread beside it is the reading that separates the two. A leg that failed to ESTABLISH fan-out is oneshot's verdict (exit 91/93), not this job's."
               exit 91
               ;;
             FAIL)
-              echo "::error::FAIL: fan-out to N=$TUNNELS cost $signal loss over its two bracketing N=1 legs (noise floor $noise, threshold $THRESH). The floor is BELOW the threshold, so the path was stable enough to ask and the cost is attributable to serving N tunnels rather than 1."
+              echo "::error::FAIL: fan-out to N=$TUNNELS cost $signal loss over its two concurrent N=1 floor legs (noise floor $noise, threshold $THRESH). The floor is BELOW the threshold, so the paths were stable enough to ask and the cost is attributable to serving N tunnels rather than 1."
               exit 1
               ;;
             *)
@@ -1686,7 +1927,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: amt-loss-delta
-          path: |
-            leg*-report-*.json
-            leg*-verbose-*.log
+          name: amt-loss-delta-verdict
+          path: leg-*.json
