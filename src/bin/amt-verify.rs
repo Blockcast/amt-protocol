@@ -256,6 +256,78 @@ struct GapEvent {
     missing: u32,
 }
 
+/// Per-track arrival accounting, so a receipt can be read as a RATIO BETWEEN
+/// two tracks and not only as a whole-stream figure.
+///
+/// BLO-35597 defect 2: every FEC block that recovers settles at exactly 31
+/// source + 1 repair symbol, against a published geometry of
+/// `(ssb_length, rsb_length) = (32, 8)` and a measured wire loss of 0.1%. That
+/// is either a receiver off-by-one or a source emitting K−1 source symbols per
+/// block, and the two are indistinguishable from receiver telemetry alone.
+/// Pairing a source track's `received` against its repair track's
+/// `received / rsb_length` decides it from the wire, with no FEC-header
+/// parsing: ~32 means the symbol left the publisher and was lost after the
+/// socket, ~31 means it was never sent.
+///
+/// Two preconditions on that pairing, both readable off the same struct:
+/// `reordered` must be 0 on BOTH tracks (a reordered arrival is a real packet
+/// that arrived and is counted in no `received`, so it biases the reading by
+/// exactly the amount the reading is trying to detect), and the repair track's
+/// `received` must be at least `rsb_length`.
+///
+/// That second precondition is load-bearing, not belt-and-braces. The
+/// truncate-to-zero intuition is Rust's; `jq` divides in IEEE-754, so a window
+/// that caught 1..=7 repair symbols gives a FRACTIONAL denominator and the
+/// reading inflates **silently** — `31 / (4/8)` is `62`, exit 0, no
+/// diagnostic. `jq` raises only when the divisor is exactly 0, i.e. only when
+/// the window caught no repair symbol at all. A `jq` consumer therefore wants
+/// `select(.received >= $rsb)` ahead of the division rather than a reliance on
+/// `jq` erroring; 62 source symbols per block is exactly the plausible-wrong
+/// reading this struct exists to eliminate.
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+struct PidCounts {
+    /// MMTP `packet_id`.
+    pid: u16,
+    /// [`MmtpLoss::received`] restricted to this track. Sums to `received`.
+    received: u64,
+    /// [`MmtpLoss::gaps`] restricted to this track. Sums to `gaps`.
+    gaps: u64,
+    /// [`MmtpLoss::reordered`] restricted to this track: duplicates, and
+    /// arrivals behind the high-water mark. Counted in neither `received` nor
+    /// `gaps`, here or whole-stream, so a non-zero value means this track's
+    /// `received` understates what physically arrived. Attributed per track so
+    /// that one reordered symbol invalidates one track's reading rather than
+    /// the whole receipt. Sums to `reordered`.
+    reordered: u64,
+    /// [`MmtpLoss::implausible`] restricted to this track. Sums to **less
+    /// than** `implausible`: the shortfall is exactly the header-check
+    /// rejections, which are discarded before a `packet_id` can be read and so
+    /// belong to no track. `received`, `gaps` and `reordered` carry no such
+    /// shortfall — they sum exactly.
+    implausible: u64,
+    /// Largest MMTP packet seen on this track. Source and repair symbols differ
+    /// in size (≤1316 B vs 1337 B on the ISS stream), so this classifies a
+    /// track's role from the receipt itself rather than from a remembered
+    /// `packet_id` assignment, which is publisher configuration and moves.
+    ///
+    /// A LOWER BOUND over the observation window, not the track's true maximum:
+    /// it is whatever the largest sampled packet happened to be. Read it
+    /// alongside `received` — a track with `received: 2` is a weak sample, and
+    /// a repair track shows its full 1337 B on the first symbol.
+    max_len: usize,
+}
+
+/// Mutable accumulator behind one [`PidCounts`]. Separate type because the
+/// serialized form carries its own `pid` and the map already keys on it.
+#[derive(Default)]
+struct PidAcc {
+    received: u64,
+    gaps: u64,
+    reordered: u64,
+    implausible: u64,
+    max_len: usize,
+}
+
 /// Receiver-intrinsic loss accounting, parsed from the MMTP packet header
 /// (ISO/IEC 23008-1: `packet_id` at bytes 2..4 and `packet_sequence_number` at
 /// bytes 8..12, both big-endian; `version` is the top 2 bits of byte 0 and is 0
@@ -272,6 +344,10 @@ struct GapEvent {
 struct SeqTracker {
     /// Per-track high-water sequence number.
     last: std::collections::HashMap<u16, u32>,
+    /// Per-track accumulators for [`MmtpLoss::by_pid`]. Incremented at exactly
+    /// the sites that move the whole-stream counters, so the sums are an
+    /// invariant and not an approximation.
+    per_pid: std::collections::HashMap<u16, PidAcc>,
     observed: u64,
     in_sequence: u64,
     gaps: u64,
@@ -302,12 +378,20 @@ impl SeqTracker {
         }
         let pid = u16::from_be_bytes([payload[2], payload[3]]);
         let seq = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+        // Sized on every arrival that cleared the header check, including ones
+        // that go on to count as reordered or implausible: the symbol size is a
+        // property of the packet, not of its sequence number. `last` and
+        // `per_pid` are disjoint fields, so this binding stays live through the
+        // sequence branches below and each one reuses it.
+        let acc = self.per_pid.entry(pid).or_default();
+        acc.max_len = acc.max_len.max(payload.len());
         let Some(&prev) = self.last.get(&pid) else {
             self.last.insert(pid, seq);
             // Nothing before it on this track, so it can neither be in-sequence
             // nor terminate a gap — but it did arrive, and the ratio's
             // denominator is every packet that arrived.
             self.received += 1;
+            acc.received += 1;
             return;
         };
         let delta = seq.wrapping_sub(prev);
@@ -316,13 +400,19 @@ impl SeqTracker {
             // the mark must not move backwards, or the next in-order packet
             // reads as a gap.
             self.reordered += 1;
+            acc.reordered += 1;
             return;
         }
         if delta > MAX_PLAUSIBLE_GAP {
             self.implausible += 1;
+            // Attributable here, unlike the header-check rejection above: that
+            // one is discarded before `packet_id` is read, which is why the
+            // per-pid sum is a lower bound on the whole-stream figure.
+            acc.implausible += 1;
         } else if delta == 1 {
             self.in_sequence += 1;
             self.received += 1;
+            acc.received += 1;
         } else {
             self.gaps += u64::from(delta - 1);
             self.gap_events += 1;
@@ -336,6 +426,8 @@ impl SeqTracker {
             // The arrival that ENDS the gap is itself received. Omitting it is
             // what made the ratio overstate loss (Ally review, PR #23).
             self.received += 1;
+            acc.received += 1;
+            acc.gaps += u64::from(delta - 1);
         }
         self.last.insert(pid, seq);
     }
@@ -344,6 +436,22 @@ impl SeqTracker {
         if self.observed == 0 {
             return None;
         }
+        let tracks = self.last.len();
+        let mut by_pid: Vec<PidCounts> = self
+            .per_pid
+            .into_iter()
+            .map(|(pid, a)| PidCounts {
+                pid,
+                received: a.received,
+                gaps: a.gaps,
+                reordered: a.reordered,
+                implausible: a.implausible,
+                max_len: a.max_len,
+            })
+            .collect();
+        // Sorted so two receipts of the same stream are diffable line for line;
+        // HashMap order is not stable across runs.
+        by_pid.sort_unstable_by_key(|p| p.pid);
         // lost / (lost + received) — the ordinary packet-loss ratio. `received`
         // counts every valid arrival, including each track's first packet and
         // the arrival that terminates a gap; `in_sequence` counts neither, so
@@ -356,7 +464,7 @@ impl SeqTracker {
         let loss_ratio =
             (self.implausible == 0 && denom > 0).then(|| self.gaps as f64 / denom as f64);
         Some(MmtpLoss {
-            tracks: self.last.len(),
+            tracks,
             in_sequence: self.in_sequence,
             gaps: self.gaps,
             gap_events: self.gap_events,
@@ -365,6 +473,7 @@ impl SeqTracker {
             reordered: self.reordered,
             implausible: self.implausible,
             loss_ratio,
+            by_pid,
         })
     }
 }
@@ -378,6 +487,12 @@ struct MmtpLoss {
     /// explained: `packet_id` 0 carried the first packet in both receipts, which
     /// is where MMT conventionally puts signalling, but nothing here has
     /// confirmed that. Do not treat 8 as the expected value.
+    ///
+    /// [`PidCounts::max_len`] is the instrument for closing that question: a
+    /// signalling track would show a distinctly small `max_len` beside the
+    /// ≤1316 B source / 1337 B repair media pair, and `by_pid` carries it on
+    /// every receipt from here on. Read it off the next one rather than
+    /// re-deriving the question.
     tracks: usize,
     /// Adjacent per-track arrivals whose sequence numbers differed by exactly 1.
     in_sequence: u64,
@@ -415,6 +530,11 @@ struct MmtpLoss {
     /// `gaps / (gaps + received)`. `null` when there is nothing to divide, or
     /// when `implausible` is non-zero.
     loss_ratio: Option<f64>,
+    /// Per-track breakdown of `received` and `gaps`, plus each track's largest
+    /// packet, sorted by `pid`. The whole-stream fields above cannot express a
+    /// RATIO between two tracks, which is what BLO-35597 defect 2 needs — see
+    /// [`PidCounts`].
+    by_pid: Vec<PidCounts>,
 }
 
 /// Wall clock as Unix epoch millis. Saturates to 0 before the epoch, which is
@@ -1454,7 +1574,12 @@ mod tests {
 
     /// Minimal MMTP packet: version 0, `packet_id` at 2..4, sequence at 8..12.
     fn mmtp(packet_id: u16, seq: u32) -> Vec<u8> {
-        let mut p = vec![0u8; 32];
+        mmtp_len(packet_id, seq, 32)
+    }
+
+    /// As [`mmtp`], at a chosen total length — the only thing `max_len` reads.
+    fn mmtp_len(packet_id: u16, seq: u32, len: usize) -> Vec<u8> {
+        let mut p = vec![0u8; len];
         p[2..4].copy_from_slice(&packet_id.to_be_bytes());
         p[8..12].copy_from_slice(&seq.to_be_bytes());
         p
@@ -1466,6 +1591,145 @@ mod tests {
             t.observe(&mmtp(id, s));
         }
         t.finish().expect("observed packets yield a report")
+    }
+
+    /// `by_pid` must be a PARTITION of the whole-stream figures, not a second
+    /// independent count of them. A breakdown that does not sum back cannot be
+    /// used as a ratio between two tracks, which is its only purpose.
+    #[test]
+    fn by_pid_partitions_received_and_gaps() {
+        // pid 1: first + gap(11..=13) + in-seq + duplicate. pid 2: first + two
+        // in-seq. Covers every site that moves a whole-stream counter.
+        let got = track(&[(1, 10), (1, 14), (1, 15), (1, 15), (2, 5), (2, 6), (2, 7)]);
+        assert_eq!(
+            got.by_pid,
+            vec![
+                PidCounts {
+                    pid: 1,
+                    received: 3,
+                    gaps: 3,
+                    reordered: 1,
+                    implausible: 0,
+                    max_len: 32
+                },
+                PidCounts {
+                    pid: 2,
+                    received: 3,
+                    gaps: 0,
+                    reordered: 0,
+                    implausible: 0,
+                    max_len: 32
+                },
+            ]
+        );
+        assert_eq!(
+            got.by_pid.iter().map(|p| p.received).sum::<u64>(),
+            got.received
+        );
+        assert_eq!(got.by_pid.iter().map(|p| p.gaps).sum::<u64>(), got.gaps);
+        // The duplicate is excluded from both, exactly as it is whole-stream.
+        assert_eq!(got.reordered, 1);
+        // ...and is ATTRIBUTED, so a consumer discards pid 1's reading rather
+        // than the whole receipt. Without this the breakdown cannot say which
+        // track's `received` understates what arrived.
+        assert_eq!(got.by_pid.iter().map(|p| p.reordered).sum::<u64>(), 1);
+        // `tracks` comes from `last`, `by_pid` from `per_pid`. Equal by
+        // construction today — every packet clearing the header check touches
+        // both — but nothing else pins it.
+        assert_eq!(got.tracks, got.by_pid.len());
+    }
+
+    /// The one asymmetry in the partition, and the reason it is spelled out on
+    /// [`PidCounts::implausible`]: a header-check rejection is discarded before
+    /// `packet_id` can be read, so it belongs to no track. Per-pid `implausible`
+    /// is a LOWER BOUND on the whole-stream figure, where the other three sum
+    /// exactly — which is what makes the shortfall self-documenting rather than
+    /// a dropped count.
+    #[test]
+    fn by_pid_implausible_is_a_lower_bound_on_the_whole_stream_figure() {
+        let mut t = SeqTracker::default();
+        t.observe(&mmtp(1, 0));
+        // Attributable: past MAX_PLAUSIBLE_GAP on a track already established.
+        t.observe(&mmtp(1, MAX_PLAUSIBLE_GAP + 2));
+        // Unattributable: too short to carry a `packet_id` at all.
+        t.observe(&[0u8; 4]);
+        let got = t.finish().expect("observed packets yield a report");
+        assert_eq!(got.implausible, 2);
+        assert_eq!(got.by_pid.iter().map(|p| p.implausible).sum::<u64>(), 1);
+        // The other three still partition exactly, so the shortfall is
+        // `implausible`'s alone and not a general accounting leak.
+        assert_eq!(
+            got.by_pid.iter().map(|p| p.received).sum::<u64>(),
+            got.received
+        );
+        assert_eq!(got.by_pid.iter().map(|p| p.gaps).sum::<u64>(), got.gaps);
+        assert_eq!(
+            got.by_pid.iter().map(|p| p.reordered).sum::<u64>(),
+            got.reordered
+        );
+    }
+
+    /// The BLO-35597 defect-2 reading itself: a source track paired against its
+    /// repair track decides whether the publisher emitted K source symbols per
+    /// block or K−1, which no whole-stream figure can express. Here 8 repair
+    /// symbols = 1 block of `rsb_length` 8, against 31 source arrivals with
+    /// zero gaps — i.e. the 32nd symbol was never sent, not lost in transit.
+    #[test]
+    fn by_pid_reads_source_symbols_per_block_against_the_repair_track() {
+        let mut pkts: Vec<(u16, u32)> = (0..31).map(|i| (1u16, i)).collect();
+        pkts.extend((0..8).map(|i| (32769u16, i)));
+        let got = track(&pkts);
+        let src = got
+            .by_pid
+            .iter()
+            .find(|p| p.pid == 1)
+            .expect("source track");
+        let rep = got
+            .by_pid
+            .iter()
+            .find(|p| p.pid == 32769)
+            .expect("repair track");
+        assert_eq!((src.received, src.gaps), (31, 0));
+        assert_eq!((rep.received, rep.gaps), (8, 0));
+        // 31 source per 8/8 = 1 block. A clean stream reading 31 is the source
+        // short by one, not a receiver off-by-one. The precondition is part of
+        // the recipe, and it guards a SILENT failure rather than an error: the
+        // Rust expression below truncates the denominator to zero and would
+        // panic, but the `jq` consumer the recipe names divides in IEEE-754 and
+        // returns a plausible-looking inflated figure instead.
+        assert!(rep.received >= 8, "recipe needs at least one repair block");
+        assert_eq!(
+            (src.reordered, rep.reordered),
+            (0, 0),
+            "reordered biases it"
+        );
+        assert_eq!(src.received / (rep.received / 8), 31);
+        // What `jq` computes on a window that caught only 4 repair symbols —
+        // both operands exact in binary floating point, so this is the real
+        // value and not an approximation of it. 62 source symbols per block,
+        // exit 0, no diagnostic: hence `select(.received >= $rsb)` in the
+        // consumer rather than a reliance on `jq` raising.
+        assert_eq!(31.0_f64 / (4.0_f64 / 8.0), 62.0);
+    }
+
+    /// `max_len` classifies a track's role from the receipt alone. Source and
+    /// repair symbols differ in size, and the `packet_id` assignment that would
+    /// otherwise have to be remembered is publisher configuration.
+    #[test]
+    fn by_pid_max_len_tracks_the_largest_packet_on_each_track() {
+        let mut t = SeqTracker::default();
+        t.observe(&mmtp_len(1, 0, 900));
+        t.observe(&mmtp_len(1, 1, 1316));
+        t.observe(&mmtp_len(1, 2, 1200)); // smaller: must not lower the mark
+        t.observe(&mmtp_len(32769, 0, 1337));
+        let got = t.finish().expect("observed packets yield a report");
+        assert_eq!(
+            got.by_pid
+                .iter()
+                .map(|p| (p.pid, p.max_len))
+                .collect::<Vec<_>>(),
+            vec![(1, 1316), (32769, 1337)]
+        );
     }
 
     #[test]
