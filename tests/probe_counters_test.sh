@@ -145,9 +145,13 @@ run_counters() {
   rm -rf "$dir"
 }
 
+# The three helpers match against a here-string, never `printf | grep -q`: under
+# pipefail, `grep -q` exiting on its first match can SIGPIPE the printf and make
+# the pipeline 141. In want_absent that sends a PRESENT token to the PASS branch,
+# i.e. the fabricated-zero check silently fails open.
 # Asserts a literal line is present in the captured stdout.
 want() {
-  if printf '%s\n' "$OUT" | grep -qxF "$1"; then
+  if grep -qxF -- "$1" <<<"$OUT"; then
     echo "PASS  $CASE: $1"
   else
     echo "FAIL  $CASE: expected line '$1'"
@@ -158,7 +162,7 @@ want() {
 # Asserts NO line contains the token -- the fabricated-zero guard. Presence of
 # the _invalid line is not enough on its own: a consumer greps for the VALUE.
 want_absent() {
-  if printf '%s\n' "$OUT" | grep -qF "$1"; then
+  if grep -qF -- "$1" <<<"$OUT"; then
     echo "FAIL  $CASE: '$1' must be absent (a fabricated zero is worse than no reading)"
     printf '%s\n' "$OUT" | grep -F "$1" | sed 's/^/        got: /'
     FAILED=1
@@ -167,7 +171,7 @@ want_absent() {
   fi
 }
 want_grep() {
-  if printf '%s\n' "$OUT" | grep -qF "$1"; then
+  if grep -qF -- "$1" <<<"$OUT"; then
     echo "PASS  $CASE: contains '$1'"
   else
     echo "FAIL  $CASE: expected '$1'"
@@ -281,6 +285,22 @@ run_counters "udp header/value width mismatch" \
   "$SNMP_HDR
 Udp: 10 0 0 10 5" "" "$(sn 0000000a 00000010 00000100)" ""
 want_grep "udp_delta_invalid"
+want_absent "RcvbufErrors="
+
+# The case above shortens BOTH samples, so `nh != nb` and `nh != na` each catch
+# it alone and neither arm is held. These two change width BETWEEN the samples
+# (a column appearing or vanishing mid-run), one arm each. `hdr` is read from
+# the after file, so it is full width in both.
+run_counters "udp before narrower than after" \
+  "$SNMP_HDR
+Udp: 10 0 0 10 5" "$SNMP_OK" "$(sn 0000000a 00000010 00000100)" ""
+want "udp_delta_invalid hdr=10 before=6 after=10"
+want_absent "RcvbufErrors="
+
+run_counters "udp after narrower than before" "$SNMP_OK" \
+  "$SNMP_HDR
+Udp: 10 0 0 10 5" "$(sn 0000000a 00000010 00000100)" ""
+want "udp_delta_invalid hdr=10 before=10 after=6"
 want_absent "RcvbufErrors="
 
 # No `Udp:` block at all -- renamed, or /proc/net/snmp reshaped. The header,
