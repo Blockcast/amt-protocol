@@ -72,19 +72,29 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      # BLO-38861. probe_verdict_test.sh and probe_counters_test.sh deliberately
+      # get no PyYAML bootstrap. On the runner the image ships it, so the deleted
+      # `|| pip install ...` fallback does not fire -- this job going green with
+      # no bootstrap is the measurement, since an absent PyYAML drives both of
+      # them to exit 2. (That string is elided on purpose: BLO-38861 AC1 greps
+      # this file for the literal.) Off the runner it bought nothing either --
+      # both already fail closed on their own extraction precondition: `ABORT:
+      # ... or pyyaml absent`, exit 2, with the ModuleNotFoundError left in
+      # front of it as evidence. Re-adding one only moves that into pip's voice.
+      #
+      # The third step below is NOT this case -- do not harmonise it. BLO-38826
+      # gave workflow_expression_budget_test.sh a bootstrap in its own voice by
+      # design: it has no precondition of its own to fail closed on, so it
+      # re-probes after installing and names the bootstrap failure itself.
       - name: tests/probe_verdict_test.sh
-        run: |
-          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
-          bash tests/probe_verdict_test.sh
+        run: bash tests/probe_verdict_test.sh
       # Same job, not a new one: it shares the extraction and the stub pattern,
       # and a second job would double the checkout for one more answer. Its
       # `live dial` case needs a bare runner with working loopback -- which is
       # what this job already is, and the same runner class the probe itself
       # uses, so a failure there is a finding about the instrument.
       - name: tests/probe_counters_test.sh
-        run: |
-          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
-          bash tests/probe_counters_test.sh
+        run: bash tests/probe_counters_test.sh
       # BLO-38732. Static, so it fires on the PR that would break parsing rather
       # than on the first cron after merge -- an unparseable workflow produces a
       # 0-job `completed/failure` run, which on a detector is indistinguishable
