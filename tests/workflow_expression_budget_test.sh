@@ -177,16 +177,32 @@ if not paths:
 #
 # A job VALUE gets the same treatment, one level in: `build:` with no body is
 # None, and `build: oops` / `build: [a]` are a str and a list -- each reaches
-# `.get('steps')` and tracebacks, the same crash-not-verdict shape. Checked in a
-# pre-pass rather than inside the scan loop so that a file with one malformed job
-# contributes NO steps at all; that keeps it a file-level verdict like the two
-# above it, and keeps the shared `so no step in it was scanned` wording true.
+# `.get('steps')` and tracebacks, the same crash-not-verdict shape. So does a
+# `steps:` that is not a list, but it fails the OTHER way: `steps:` written as a
+# mapping (a forgotten `-`) or a scalar is truthy, so `or []` keeps it,
+# `enumerate` walks its keys, and `isinstance(step, dict)` skips every one --
+# zero steps scanned, rc=0, the silent PASS this whole regress exists to remove.
+# Both are checked in one pre-pass rather than inside the scan loop so that a
+# file with one malformed job contributes NO steps at all; that keeps it a
+# file-level verdict like the two above it, and keeps the shared
+# `so no step in it was scanned` wording true.
+#
+# The loop is explicit rather than a `next(...)` generator with a None sentinel:
+# a job key can legitimately BE None (`~:` / `null:`), and a sentinel cannot tell
+# that apart from "no bad job found" -- which silently skipped the pre-pass and
+# let the value fall through to `.get()`, reintroducing the exact traceback this
+# block removes. `0:` and `'':` were always fine; only the None key collided.
+#
+# `steps is not None` is load-bearing and is NOT the same as a truthiness test: a
+# job with no `steps:` at all must keep passing, or this guard rejects every
+# reusable-workflow caller in the repo (see the stopping point below). `steps: []`
+# likewise stays passing -- an explicit empty list is a list.
 #
 # The regress stops here, with the stopping point written down rather than
-# implied: a workflow whose jobs all have empty `steps:` also scans nothing and
-# still exits 0. That case is left open on purpose, and the reason is a concrete
-# valid shape rather than a judgement about what GitHub tolerates -- a caller of
-# a reusable workflow,
+# implied: a workflow whose jobs all have empty or absent `steps:` scans nothing
+# and still exits 0. That case is left open on purpose, and the reason is a
+# concrete valid shape rather than a judgement about what GitHub tolerates -- a
+# caller of a reusable workflow,
 #
 #     jobs:
 #       call:
@@ -197,8 +213,10 @@ if not paths:
 #
 # Also left open, and narrower still: `isinstance(step, dict)` below skips a
 # malformed step inside an otherwise-scanned job without saying so. Unlike the
-# cases above it that is not a file-level verdict -- the rest of the job IS
-# attested -- so it is recorded here as open rather than silently covered.
+# cases above it that is not a file-level verdict -- `steps:` is a list and the
+# rest of the job IS attested, so only that one element goes unmeasured. That
+# claim is only true because a non-list `steps:` is now caught above; while it
+# was not, "the rest of the job" could be nothing at all.
 unusable = []
 
 for path in paths:
@@ -214,10 +232,20 @@ for path in paths:
         unusable.append((rel, 'loads as a mapping but carries no `jobs:` mapping '
                               '(missing, empty, or not a mapping)'))
         continue
-    bad_job = next((j for j, v in jobs.items() if not isinstance(v, dict)), None)
+    bad_job = None
+    for jname, job in jobs.items():
+        if not isinstance(job, dict):
+            bad_job = (jname, 'is not a mapping (a typed job key with no body, '
+                              'or a scalar/list value)')
+            break
+        steps = job.get('steps')
+        if steps is not None and not isinstance(steps, list):
+            bad_job = (jname, 'has a `steps:` that is not a list (a forgotten '
+                              '`-`, or a scalar)')
+            break
     if bad_job is not None:
-        unusable.append((rel, f'job `{bad_job}` is not a mapping (a typed job '
-                              f'key with no body, or a scalar/list value)'))
+        jn, why = bad_job
+        unusable.append((rel, f'job `{jn}` {why}'))
         continue
     for jname, job in jobs.items():
         for i, step in enumerate(job.get('steps') or []):
