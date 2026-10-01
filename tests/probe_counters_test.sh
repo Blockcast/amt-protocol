@@ -181,6 +181,43 @@ want_grep() {
 }
 
 # ---------------------------------------------------------------------------
+# Harness self-check: want_absent must fail CLOSED on a large $OUT.
+#
+# The here-string above is the guard, and until this case it had no failing
+# mutation -- reverting it to `printf | grep -q` left the suite green at 33
+# PASS, because no fixture produces an $OUT bigger than the 64 KiB pipe buffer
+# and the SIGPIPE therefore never fires. That made the hardening a comment on
+# the one assertion family carrying the fabricated-zero contract.
+#
+# ORDER IS THE WHOLE GUARD: the needle goes FIRST and the filler BEHIND it.
+# SIGPIPE needs `grep -q` to exit while printf still has more than a pipe
+# buffer left to write, so a needle at the END is read only after printf has
+# already written everything -- no SIGPIPE, mutant survives, case inert. That
+# was measured, not reasoned: with the needle last this case passed under the
+# very mutation it exists to kill.
+#
+# Deterministic, not probabilistic: matching in the first line leaves ~280 KiB
+# unwritten against a 64 KiB buffer, so the pipe form takes the else (PASS)
+# branch every time. Needs no fixture and no probe -- it drives the helper
+# directly.
+# ---------------------------------------------------------------------------
+CASE="want_absent fails closed"
+_saved_failed=$FAILED
+OUT="softnet_delta dropped=0 time_squeeze=0 cpus=2 nf=15
+$(yes 'filler line that is not the needle' | head -8000)"
+FAILED=0
+want_absent "dropped=" >/dev/null
+if [ "$FAILED" = 1 ]; then
+  echo "PASS  $CASE: present needle in a ${#OUT}-byte \$OUT took the FAIL branch"
+  FAILED=$_saved_failed
+else
+  echo "FAIL  $CASE: a PRESENT needle took the PASS branch -- want_absent is"
+  echo "      failing OPEN, so every fabricated-zero assertion below is inert."
+  FAILED=1
+fi
+unset _saved_failed
+
+# ---------------------------------------------------------------------------
 # softnet_delta -- happy path. Two CPUs, both counters advancing by DIFFERENT
 # amounts, so a parser that summed the wrong column, double-counted a CPU, or
 # transposed dropped and time_squeeze produces a different number rather than
@@ -230,7 +267,7 @@ run_counters "nf changed" "$SNMP_OK" "" \
   "$(sn 0000000a 00000010 00000100)" \
   "0000001a 00000015 00000110 00000000"
 want_grep "softnet_delta_invalid reason=shape_changed"
-want_absent "softnet_delta dropped="
+want_absent "dropped="
 
 # CPU count moved -- hotplug, or a partial read. Summing over a different
 # population before and after is not a delta.
@@ -238,7 +275,7 @@ run_counters "cpu count changed" "$SNMP_OK" "" \
   "$(sn 0000000a 00000010 00000100; sn 0000000b 00000020 00000200)" \
   "$(sn 0000001a 00000015 00000110)"
 want_grep "softnet_delta_invalid reason=shape_changed"
-want_absent "softnet_delta dropped="
+want_absent "dropped="
 
 # A row too SHORT to carry the fields, with the same width in both samples so
 # the shape_changed guard cannot fire. w[2]/w[3] are then unset, and hex2dec's
@@ -253,7 +290,7 @@ run_counters "short row, consistent width" "$SNMP_OK" "" \
   "0000000a 00000010" \
   "0000001a 00000015"
 want_grep "softnet_delta_invalid reason=unparseable"
-want_absent "softnet_delta dropped="
+want_absent "dropped="
 
 # Non-hex payload: /proc replaced, or a format change. hex2dec returns -1 and
 # the row is refused rather than silently parsed as a prefix.
@@ -261,13 +298,13 @@ run_counters "non-hex field" "$SNMP_OK" "" \
   "$(sn 0000000a 00000010 00000100)" \
   "$(sn 0000001a zzzzzzzz 00000110)"
 want_grep "softnet_delta_invalid reason=unparseable"
-want_absent "softnet_delta dropped="
+want_absent "dropped="
 
 # File absent entirely. This is the case the whole fail-closed posture is for:
 # unguarded, awk prints a complete, well-formed `dropped=0 time_squeeze=0`.
 run_counters "softnet file absent" "$SNMP_OK" "" "" ""
 want_grep "softnet_delta_invalid reason=unparseable"
-want_absent "softnet_delta dropped="
+want_absent "dropped="
 
 # A counter that went BACKWARDS. CPU renumbering, hotplug or a wrap: the
 # subtraction is meaningless, not small. Unguarded this prints a NEGATIVE
@@ -276,7 +313,7 @@ run_counters "counter went backwards" "$SNMP_OK" "" \
   "$(sn 0000000a 00000090 00000100)" \
   "$(sn 0000001a 00000010 00000110)"
 want_grep "softnet_delta_invalid reason=went_backwards"
-want_absent "softnet_delta dropped="
+want_absent "dropped="
 
 # ---------------------------------------------------------------------------
 # udp_delta width guard. Pre-existing and, until this file, untested.
