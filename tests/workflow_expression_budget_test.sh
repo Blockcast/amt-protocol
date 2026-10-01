@@ -103,9 +103,16 @@ if [ "${1:-}" = --self-test ]; then
         fi
     }
 
-    # A `run:` block that compiles past the budget. Built here so both the
-    # over-budget leg and the suppression control share one definition.
+    # A `run:` block that compiles past the budget, and the one-job workflow
+    # that carries it. Built here so all three legs that need an over-budget
+    # `big` job -- `over-budget`, `job-suppresses-scan` and its control -- share
+    # one definition rather than three heredocs maintained in parallel.
     over=$(head -c 25000 /dev/zero | tr '\0' x)
+    scan_body="jobs:
+  big:
+    steps:
+      - run: |
+          $over \${{ github.sha }}"
 
     leg glob-none 1 'no workflows matched' '' --no-workflows
     leg happy 0 'scanned 1 workflow(s)' <<<'jobs: {b: {steps: [{run: echo hi}]}}'
@@ -151,33 +158,22 @@ if [ "${1:-}" = --self-test ]; then
     leg steps-empty 0 'scanned 1 workflow(s)' '' '' '' yaml \
         <<<'jobs: {b: {steps: []}}'
 
-    leg over-budget 1 'job `big` step' <<YAML
-jobs:
-  big:
-    steps:
-      - run: |
-          $over \${{ github.sha }}
-YAML
+    leg over-budget 1 'job `big` step' <<<"$scan_body"
 
     # The negative expectation and its control. Same file; the malformed job is
     # the only difference. Suppression must swallow an over-budget step that the
     # control proves is otherwise reported -- without the control, a fixture that
     # never scanned anything would pass this leg for the wrong reason.
-    leg job-suppresses-scan 1 'job `bad` is not a mapping' 'job `big` step' <<YAML
-jobs:
-  big:
-    steps:
-      - run: |
-          $over \${{ github.sha }}
-  bad: oops
-YAML
-    leg job-suppresses-scan-control 1 'job `big` step' <<YAML
-jobs:
-  big:
-    steps:
-      - run: |
-          $over \${{ github.sha }}
-YAML
+    #
+    # `$scan_body` is shared rather than re-typed so that "same file minus the
+    # malformed job" is structural instead of a thing two heredocs happen to
+    # agree on. Maintained separately, an edit to one `big:` job would leave the
+    # control silently no longer controlling anything -- green, which is the
+    # failure this whole mode exists to make impossible.
+    leg job-suppresses-scan 1 'job `bad` is not a mapping' 'job `big` step' \
+        <<<"$scan_body
+  bad: oops"
+    leg job-suppresses-scan-control 1 'job `big` step' <<<"$scan_body"
 
     # The bootstrap guard (BLO-38826) is the one leg whose fixture is an
     # interpreter rather than a workflow: shadow python3 with a stub that cannot
