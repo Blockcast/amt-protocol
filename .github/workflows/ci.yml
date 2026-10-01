@@ -72,19 +72,21 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      # BLO-38861. Deliberately no PyYAML bootstrap on any step here. The runner
+      # image ships it, so the old `|| pip install ...` fallback never fired on
+      # CI; and off the runner it bought nothing, because both scripts below
+      # already fail closed on their own extraction precondition -- `ABORT: ...
+      # or pyyaml absent`, exit 2, with the ModuleNotFoundError left in front of
+      # it as evidence. Re-adding a bootstrap only moves that into pip's voice.
       - name: tests/probe_verdict_test.sh
-        run: |
-          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
-          bash tests/probe_verdict_test.sh
+        run: bash tests/probe_verdict_test.sh
       # Same job, not a new one: it shares the extraction and the stub pattern,
       # and a second job would double the checkout for one more answer. Its
       # `live dial` case needs a bare runner with working loopback -- which is
       # what this job already is, and the same runner class the probe itself
       # uses, so a failure there is a finding about the instrument.
       - name: tests/probe_counters_test.sh
-        run: |
-          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
-          bash tests/probe_counters_test.sh
+        run: bash tests/probe_counters_test.sh
       # BLO-38732. Static, so it fires on the PR that would break parsing rather
       # than on the first cron after merge -- an unparseable workflow produces a
       # 0-job `completed/failure` run, which on a detector is indistinguishable
