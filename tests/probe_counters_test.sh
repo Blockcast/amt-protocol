@@ -283,6 +283,19 @@ Udp: 10 0 0 10 5" "" "$(sn 0000000a 00000010 00000100)" ""
 want_grep "udp_delta_invalid"
 want_absent "RcvbufErrors="
 
+# No `Udp:` block at all -- renamed, or /proc/net/snmp reshaped. The header,
+# before and after then all split to 0 fields and AGREE, so the two equality
+# arms pass and only `nh < 2` refuses the read; without it the probe prints a
+# bare, field-less `udp_delta`. The mismatch case above cannot reach that arm.
+#
+# Pinned as the EXACT _invalid line, with no want_absent: the bare line is a
+# prefix of `udp_delta_invalid`, so no substring check can tell the two apart,
+# and `want_absent "udp_delta "` passes under the very mutation this case kills.
+run_counters "udp block absent" \
+  "Ip: Forwarding DefaultTTL
+Ip: 1 64" "" "$(sn 0000000a 00000010 00000100)" ""
+want "udp_delta_invalid hdr=0 before=0 after=0"
+
 # ---------------------------------------------------------------------------
 # The positive control.
 #
