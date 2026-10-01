@@ -369,8 +369,133 @@ jobs:
           #
           # Truncation is visible as gap_positions|length < gap_events; a
           # truncated list makes `shared` a lower bound, not a verdict.
-          udp_counters() { awk '/^Udp:/{n++; if (n==2) print}' /proc/net/snmp; }
+          # Both /proc paths are seams, not configuration. Production always
+          # takes the default; the unit test injects fixtures so that the guards
+          # below are exercised against THIS shell rather than a copy of it that
+          # can drift. Every other stub in that test is a PATH-shadowed binary,
+          # which cannot work for a file read.
+          PROC_SNMP="${PROC_SNMP:-/proc/net/snmp}"
+          PROC_SOFTNET="${PROC_SOFTNET:-/proc/net/softnet_stat}"
+          udp_counters() { awk '/^Udp:/{n++; if (n==2) print}' "$PROC_SNMP"; }
+          softnet_lines() { cat "$PROC_SOFTNET" 2>/dev/null; }
+          #
+          # ---- POSITIVE CONTROL for RcvbufErrors (BLO-33636) --------------------
+          #
+          # The width check further down establishes CAPTURE validity. It says
+          # nothing about FIELD RESPONSIVENESS, and that gap is not academic:
+          # the prediction this leg exists to test is "udp_delta non-zero on N=3,
+          # zero on N=1". A DEAD DIAL reads zero on BOTH -- which presents as
+          # REFUTING the receive-side hypothesis and re-indicting the relay. It
+          # fails in the expensive direction and is indistinguishable from a real
+          # refutation. The known-clean sessions cannot catch it either: a dead
+          # counter and a quiet one both read 0.
+          #
+          # So drive the counter deliberately and watch it move. Loopback UDP
+          # into a deliberately tiny SO_RCVBUF that is never read from, in this
+          # netns -- the same netns `--network host` gives the probe containers,
+          # so it is the same counter they will be judged by.
+          #
+          # ⚠ ORDERING IS A CORRECTNESS CONSTRAINT, NOT A PREFERENCE (PlatformSRE
+          # review, 2026-10-01). The control's own drops land in the SAME netns-wide
+          # counter the probe reads. It must therefore run to COMPLETION BEFORE
+          # `udp_before` is sampled, so its drops sit in the baseline and cancel
+          # out of `after - before`. A control still running concurrently with the
+          # probe is a contaminant, not a control. It is called synchronously here
+          # and never backgrounded; `tests/probe_counters_test.sh` asserts the
+          # source order so an edit cannot quietly reverse it.
+          #
+          # ⚠ A CONTROL LICENSES THE INSTRUMENT, NOT THE THRESHOLD. Forcing a 4 KiB
+          # buffer with a flood proves the counter is not dead. It does NOT
+          # establish that the probe's ~1.3k pkt/s at the default rcvbuf would move
+          # it. The magnitudes are therefore emitted NEXT TO the verdict, so a
+          # downstream zero can only claim what the control licenses: "no pressure
+          # at or above the forced scale", never "no pressure".
+          #
+          # Fails closed on the COUNTER, never on the run: if python3 is missing or
+          # the control does not fire, emit `udp_counter_unvalidated` and carry on.
+          # A consumer seeing that token must record the N=1/N=3 reading as
+          # UNTESTED -- never as refuted.
+          udp_control_out=$(PROC_SNMP="$PROC_SNMP" python3 - <<'PYCTL' 2>/dev/null || true
+          import re, socket, sys, time, os
+
+          SNMP = os.environ.get("PROC_SNMP", "/proc/net/snmp")
+          DATAGRAMS, PAYLOAD, RCVBUF = 20000, 1024, 2048
+
+          def rcvbuf_errors():
+              # Label-keyed off the `Udp:` header for the same reason the shell
+              # delta is: a kernel that adds a field must not shift the value
+              # onto a neighbour. Returns None when the field is unreadable, so
+              # "cannot measure" stays distinct from "measured zero".
+              try:
+                  lines = [l for l in open(SNMP) if l.startswith("Udp:")]
+                  hdr, val = lines[0].split(), lines[1].split()
+              except (OSError, IndexError):
+                  return None
+              if len(hdr) != len(val) or "RcvbufErrors" not in hdr:
+                  return None
+              return int(val[hdr.index("RcvbufErrors")])
+
+          def rmem_default():
+              try:
+                  return int(open("/proc/sys/net/core/rmem_default").read().strip())
+              except (OSError, ValueError):
+                  return -1
+
+          before = rcvbuf_errors()
+          rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          rx.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
+          rx.bind(("127.0.0.1", 0))
+          # The kernel doubles the requested value and enforces a floor, so report
+          # what it ACTUALLY gave us -- the requested number would misstate the
+          # forcing magnitude this control is being recorded for.
+          effective = rx.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+          port = rx.getsockname()[1]
+          tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          buf = b"\0" * PAYLOAD
+          t0 = time.monotonic()
+          sent = 0
+          for _ in range(DATAGRAMS):
+              try:
+                  tx.sendto(buf, ("127.0.0.1", port))
+                  sent += 1
+              except OSError:
+                  # ENOBUFS on the send side is local pressure, not a receiver
+                  # drop. Keep going; `sent` records what actually went out.
+                  pass
+          elapsed_ms = int((time.monotonic() - t0) * 1000)
+          # Nothing is ever read from rx: that is the whole mechanism. Close only
+          # after the send loop, so every datagram meets a full buffer.
+          tx.close(); rx.close()
+          after = rcvbuf_errors()
+
+          delta = None if (before is None or after is None) else after - before
+          rate = int(sent * 1000 / elapsed_ms) if elapsed_ms > 0 else -1
+          fired = delta is not None and delta > 0
+          print(
+              "udp_control=%s ctl_rcvbuf_bytes=%d ctl_rmem_default_bytes=%d "
+              "ctl_datagrams_sent=%d ctl_payload_bytes=%d ctl_elapsed_ms=%d "
+              "ctl_rate_pps=%d ctl_RcvbufErrors_delta=%s"
+              % (
+                  "fired" if fired else "unvalidated",
+                  effective, rmem_default(), sent, PAYLOAD, elapsed_ms, rate,
+                  "unreadable" if delta is None else delta,
+              )
+          )
+          PYCTL
+          )
+          # An empty `udp_control_out` means python3 was absent or the interpreter
+          # itself died -- treat exactly as a control that did not fire.
+          case "$udp_control_out" in
+            udp_control=fired*) echo "$udp_control_out" ;;
+            udp_control=*)      echo "$udp_control_out"; echo "udp_counter_unvalidated" ;;
+            *)                  echo "udp_control=unvalidated ctl_error=no_output"
+                                echo "udp_counter_unvalidated" ;;
+          esac
+          # ---- end positive control --------------------------------------------
+          #
+          # Sampled only now: everything the control dropped is in the baseline.
           udp_before=$(udp_counters)
+          softnet_before=$(softnet_lines)
           t0=$(date +%s%3N)
           # BLO-26574 step 1 (harness ceiling). One tunnel per PROCESS, all in
           # the runner netns. At TUNNELS=1 this is byte-identical in behaviour
@@ -454,6 +579,7 @@ jobs:
           done
           t1=$(date +%s%3N)
           udp_after=$(udp_counters)
+          softnet_after=$(softnet_lines)
           set -e
           # Delta, labelled off the header line so a kernel that adds a field
           # cannot silently shift `RcvbufErrors` onto a neighbour's value.
@@ -471,11 +597,13 @@ jobs:
           # and a failed step discards report.json, re-introducing the AC1 defect
           # this issue exists to fix. Fail closed on the counter, not on the run.
           #
-          # This is about CAPTURE validity only. It does nothing for FIELD
-          # responsiveness: `RcvbufErrors` has never been driven non-zero on this
-          # runner, so a dead-dial reading of that specific counter is still not
-          # excluded. That needs a deliberately-starved receiver, not a width check.
-          awk -v hdr="$(awk '/^Udp:/{print; exit}' /proc/net/snmp)" \
+          # This is about CAPTURE validity only. FIELD responsiveness is a
+          # separate question and is answered separately, by the positive control
+          # above: it drives `RcvbufErrors` non-zero in this netns before the
+          # baseline is taken, and emits `udp_counter_unvalidated` when it cannot.
+          # Read the two together -- a `udp_delta ... RcvbufErrors=0` alongside
+          # `udp_counter_unvalidated` is NOT a measured zero.
+          awk -v hdr="$(awk '/^Udp:/{print; exit}' "$PROC_SNMP")" \
               -v b="$udp_before" -v a="$udp_after" '
             BEGIN {
               nh = split(hdr, H); nb = split(b, B); na = split(a, A)
@@ -487,6 +615,100 @@ jobs:
               for (i = 2; i <= nh; i++) out = out sprintf(" %s=%d", H[i], A[i] - B[i])
               printf "udp_delta%s\n", out
             }'
+          # ---- /proc/net/softnet_stat delta (BLO-33636) -------------------------
+          #
+          # `RcvbufErrors` counts drops at the SOCKET buffer. It cannot see a drop
+          # that happened UPSTREAM of the socket -- in the per-CPU backlog or at
+          # the NIC. So a `udp_delta ... RcvbufErrors=0` is not "this host did not
+          # drop"; it is "this host did not drop AT THE SOCKET". softnet_stat is
+          # the counter for the hop before it.
+          #
+          # ⚠ THIS FILE HAS NO HEADER LINE, so the label-keying that protects
+          # `udp_delta` HAS NO ANALOGUE HERE (PlatformSRE, 2026-10-01, measured on
+          # 6.8.0-142: 15 bare hex columns, no labels). Position is the only
+          # addressing available and the column count is kernel-dependent. The
+          # honest substitutes are (a) a WIDTH CHECK -- emit `softnet_delta_invalid`
+          # if the field count or the CPU count moves between before and after --
+          # and (b) emitting the RAW LINES either way, so a reader who finds the
+          # layout differs on their kernel can re-derive the numbers rather than
+          # having to trust this parse.
+          #
+          # ⚠ FIELD INDICES ARE PINNED EXPLICITLY because "column 2" is ambiguous
+          # between 0- and 1-indexing, and the wrong pick reports a large
+          # time_squeeze as drops. In awk's 1-based numbering:
+          #     $1 processed   $2 dropped   $3 time_squeeze
+          # Confirmed against a live 6.8.0-142 host where $2=0 while $3=0x899=2201.
+          #
+          # BOTH are emitted, because that same host is the argument for it: a
+          # dropped-only read would have reported "no backlog pressure" on a host
+          # that had squeezed 2201 times. time_squeeze is NAPI budget exhaustion --
+          # the backlog pressure immediately upstream of the socket -- so it is the
+          # better dial for the receive-side hypothesis, and it is free in the same
+          # read. Which one is implicated is NOT asserted here; both are recorded
+          # and the data elects.
+          #
+          # Counters are per-CPU and summed. Same fail-closed posture as `udp_delta`:
+          # on any validity failure emit NO `softnet_delta` line at all, so a grep
+          # for `dropped=` finds nothing rather than a fabricated zero.
+          printf '%s\n' "softnet_raw_before=$(printf '%s' "$softnet_before" | tr '\n' '|')"
+          printf '%s\n' "softnet_raw_after=$(printf '%s' "$softnet_after" | tr '\n' '|')"
+          awk -v b="$softnet_before" -v a="$softnet_after" '
+            # mawk has no strtonum(), and the runner awk is mawk. Parse hex by
+            # hand so this does not silently depend on gawk. Returns -1 on any
+            # non-hex character, which the caller treats as a validity failure.
+            function hex2dec(s,   i, c, v, n) {
+              s = tolower(s); n = 0
+              if (length(s) == 0) return -1
+              for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                v = index("0123456789abcdef", c) - 1
+                if (v < 0) return -1
+                n = n * 16 + v
+              }
+              return n
+            }
+            # Sums $2 and $3 over every CPU line, and reports the field count and
+            # line count so the caller can require they agree across the samples.
+            function scan(blob, agg,   i, nl, lines, nf, w, d, s) {
+              nl = split(blob, lines, "\n")
+              agg["cpus"] = 0; agg["dropped"] = 0; agg["squeeze"] = 0; agg["nf"] = 0
+              for (i = 1; i <= nl; i++) {
+                if (lines[i] ~ /^[ \t]*$/) continue
+                # Default FS semantics: splits on whitespace RUNS and ignores
+                # leading/trailing whitespace, so a space-indented line does not
+                # produce a phantom empty first field and shift every index by one.
+                nf = split(lines[i], w)
+                if (agg["nf"] == 0) agg["nf"] = nf
+                else if (nf != agg["nf"]) { agg["nf"] = -1; return }
+                # No separate `nf < 3` check: a row too short to have the fields
+                # leaves w[2]/w[3] unset, and hex2dec refuses an empty string.
+                # Mutation-testing showed an explicit width check here could not
+                # be made to fail -- hex2dec caught every case first -- and a
+                # guard with no failing mutation is a comment, not a guard.
+                d = hex2dec(w[2]); s = hex2dec(w[3])
+                if (d < 0 || s < 0) { agg["nf"] = -1; return }
+                agg["dropped"] += d; agg["squeeze"] += s; agg["cpus"]++
+              }
+            }
+            BEGIN {
+              scan(b, B); scan(a, A)
+              if (B["nf"] <= 0 || A["nf"] <= 0 || B["cpus"] == 0 || A["cpus"] == 0) {
+                printf "softnet_delta_invalid reason=unparseable nf_before=%d nf_after=%d cpus_before=%d cpus_after=%d\n", \
+                  B["nf"], A["nf"], B["cpus"], A["cpus"]; exit 0
+              }
+              if (B["nf"] != A["nf"] || B["cpus"] != A["cpus"]) {
+                printf "softnet_delta_invalid reason=shape_changed nf_before=%d nf_after=%d cpus_before=%d cpus_after=%d\n", \
+                  B["nf"], A["nf"], B["cpus"], A["cpus"]; exit 0
+              }
+              # A counter that went backwards means CPU renumbering, hotplug or a
+              # wrap -- the subtraction is then meaningless, not small.
+              if (A["dropped"] < B["dropped"] || A["squeeze"] < B["squeeze"]) {
+                printf "softnet_delta_invalid reason=went_backwards nf=%d cpus=%d\n", A["nf"], A["cpus"]; exit 0
+              }
+              printf "softnet_delta dropped=%d time_squeeze=%d cpus=%d nf=%d\n", \
+                A["dropped"] - B["dropped"], A["squeeze"] - B["squeeze"], A["cpus"], A["nf"]
+            }'
+          # ---- end softnet_stat delta ------------------------------------------
           echo "tunnels_receiving=$ok/$TUNNELS"
           # BLO-27413: receiver-side saturation witness. The relay fans one
           # multicast stream into N unicast tunnels, so the receiving vantage
