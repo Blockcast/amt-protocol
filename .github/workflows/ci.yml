@@ -72,12 +72,20 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      # BLO-38861. Deliberately no PyYAML bootstrap on any step here. The runner
-      # image ships it, so the old `|| pip install ...` fallback never fired on
-      # CI; and off the runner it bought nothing, because both scripts below
-      # already fail closed on their own extraction precondition -- `ABORT: ...
-      # or pyyaml absent`, exit 2, with the ModuleNotFoundError left in front of
-      # it as evidence. Re-adding a bootstrap only moves that into pip's voice.
+      # BLO-38861. probe_verdict_test.sh and probe_counters_test.sh deliberately
+      # get no PyYAML bootstrap. On the runner the image ships it, so the deleted
+      # `|| pip install ...` fallback does not fire -- this job going green with
+      # no bootstrap is the measurement, since an absent PyYAML drives both of
+      # them to exit 2. (That string is elided on purpose: BLO-38861 AC1 greps
+      # this file for the literal.) Off the runner it bought nothing either --
+      # both already fail closed on their own extraction precondition: `ABORT:
+      # ... or pyyaml absent`, exit 2, with the ModuleNotFoundError left in
+      # front of it as evidence. Re-adding one only moves that into pip's voice.
+      #
+      # The third step below is NOT this case -- do not harmonise it. BLO-38826
+      # gave workflow_expression_budget_test.sh a bootstrap in its own voice by
+      # design: it has no precondition of its own to fail closed on, so it
+      # re-probes after installing and names the bootstrap failure itself.
       - name: tests/probe_verdict_test.sh
         run: bash tests/probe_verdict_test.sh
       # Same job, not a new one: it shares the extraction and the stub pattern,
