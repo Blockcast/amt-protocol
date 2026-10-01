@@ -416,7 +416,7 @@ jobs:
           # A consumer seeing that token must record the N=1/N=3 reading as
           # UNTESTED -- never as refuted.
           udp_control_out=$(PROC_SNMP="$PROC_SNMP" python3 - <<'PYCTL' 2>/dev/null || true
-          import re, socket, sys, time, os
+          import socket, time, os
 
           SNMP = os.environ.get("PROC_SNMP", "/proc/net/snmp")
           DATAGRAMS, PAYLOAD, RCVBUF = 20000, 1024, 2048

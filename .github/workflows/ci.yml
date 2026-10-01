@@ -82,7 +82,9 @@ jobs:
       # what this job already is, and the same runner class the probe itself
       # uses, so a failure there is a finding about the instrument.
       - name: tests/probe_counters_test.sh
-        run: bash tests/probe_counters_test.sh
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+          bash tests/probe_counters_test.sh
 
   test:
     # Keep these job names stable — they are the required-check names in branch
