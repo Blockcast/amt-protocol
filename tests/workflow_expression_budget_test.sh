@@ -164,6 +164,66 @@ if not paths:
 # `(none)` and exits 0, byte-identical to a clean scan. Collected and failed on
 # rather than merely counted: a guard that scanned nothing usable has not
 # attested anything, and GitHub will not run such a file either.
+#
+# That `safe_load` stays unguarded on purpose, and it is the one exemption from
+# the crash-not-verdict standard below: a syntax error aborts with a
+# `yaml.parser.ParserError` naming the file, line AND column, so the traceback IS
+# the verdict -- where the shapes below traceback without saying anything useful.
+# Cost accepted, not overlooked: it aborts mid-loop, so one syntax error
+# suppresses the `scanned N` summary and every sibling FAIL in the same run.
+#
+# `jobs:` is the last notch of that family (BLO-38855). A `name:`/`description:`
+# stub, a stray `action.yml`, a half-written file -- all load as mappings, carry
+# no job, contribute zero steps, and are counted in `scanned N`: PASS over
+# something never attested, same signature, one notch narrower. `or not jobs`
+# is deliberate and is NOT redundant with the isinstance: an explicit `jobs: {}`
+# IS a mapping and still scans zero steps, so it is the same defect. The
+# isinstance half is also what keeps `jobs:` as a LIST from reaching `.items()`
+# -- unguarded that is an AttributeError traceback, which is rc=1 but a crash,
+# not a verdict, and that is the shape BLO-38826 just removed from the bootstrap.
+#
+# A job VALUE gets the same treatment, one level in: `build:` with no body is
+# None, and `build: oops` / `build: [a]` are a str and a list -- each reaches
+# `.get('steps')` and tracebacks, the same crash-not-verdict shape. So does a
+# `steps:` that is not a list, but it fails the OTHER way: `steps:` written as a
+# mapping (a forgotten `-`) or a scalar is truthy, so `or []` keeps it,
+# `enumerate` walks its keys, and `isinstance(step, dict)` skips every one --
+# zero steps scanned, rc=0, the silent PASS this whole regress exists to remove.
+# Both are checked in one pre-pass rather than inside the scan loop so that a
+# file with one malformed job contributes NO steps at all; that keeps it a
+# file-level verdict like the two above it, and keeps the shared
+# `so no step in it was scanned` wording true.
+#
+# The loop is explicit rather than a `next(...)` generator with a None sentinel:
+# a job key can legitimately BE None (`~:` / `null:`), and a sentinel cannot tell
+# that apart from "no bad job found" -- which silently skipped the pre-pass and
+# let the value fall through to `.get()`, reintroducing the exact traceback this
+# block removes. `0:` and `'':` were always fine; only the None key collided.
+#
+# `steps is not None` is load-bearing and is NOT the same as a truthiness test: a
+# job with no `steps:` at all must keep passing, or this guard rejects every
+# reusable-workflow caller in the repo (see the stopping point below). `steps: []`
+# likewise stays passing -- an explicit empty list is a list.
+#
+# The regress stops here, with the stopping point written down rather than
+# implied: a workflow whose jobs all have empty or absent `steps:` scans nothing
+# and still exits 0. That case is left open on purpose, and the reason is a
+# concrete valid shape rather than a judgement about what GitHub tolerates -- a
+# caller of a reusable workflow,
+#
+#     jobs:
+#       call:
+#         uses: ./.github/workflows/ci.yml
+#
+# has no `steps:` anywhere, is entirely valid, and scans zero steps. One notch
+# further in and this guard rejects every such caller in the repo.
+#
+# Also left open, and narrower still: `isinstance(step, dict)` below skips a
+# malformed step inside an otherwise-scanned job without saying so. Unlike the
+# cases above it that is not a file-level verdict -- `steps:` is a list and the
+# rest of the job IS attested, so only that one element goes unmeasured. That
+# claim is only true because a non-list `steps:` is now caught above; while it
+# was not, "the rest of the job" could be nothing at all.
 unusable = []
 
 for path in paths:
@@ -171,9 +231,30 @@ for path in paths:
     with open(path) as fh:
         doc = yaml.safe_load(fh)
     if not isinstance(doc, dict):
-        unusable.append(rel)
+        unusable.append((rel, 'does not load as a YAML mapping (empty file, or '
+                              'a bare scalar)'))
         continue
-    for jname, job in (doc.get('jobs') or {}).items():
+    jobs = doc.get('jobs')
+    if not isinstance(jobs, dict) or not jobs:
+        unusable.append((rel, 'loads as a mapping but carries no `jobs:` mapping '
+                              '(missing, empty, or not a mapping)'))
+        continue
+    bad_job = None
+    for jname, job in jobs.items():
+        if not isinstance(job, dict):
+            bad_job = (jname, 'is not a mapping (a typed job key with no body, '
+                              'or a scalar/list value)')
+            break
+        steps = job.get('steps')
+        if steps is not None and not isinstance(steps, list):
+            bad_job = (jname, 'has a `steps:` that is not a list (a forgotten '
+                              '`-`, or a scalar)')
+            break
+    if bad_job is not None:
+        jn, why = bad_job
+        unusable.append((rel, f'job `{jn}` {why}'))
+        continue
+    for jname, job in jobs.items():
         for i, step in enumerate(job.get('steps') or []):
             if not isinstance(step, dict):
                 continue
@@ -203,10 +284,10 @@ for path in paths:
 print(f'scanned {len(paths)} workflow(s); largest interpolated block: {largest} '
       f'compiled chars ({worst or "none"}), budget {budget}, hard limit 21000')
 
-for rel in unusable:
-    print(f'FAIL {rel}: does not load as a YAML mapping (empty file, or a bare '
-          f'scalar), so no step in it was scanned. A guard that skipped a '
-          f'workflow has not attested it; GitHub will not run it either.')
+for rel, why in unusable:
+    print(f'FAIL {rel}: {why}, so no step in it was scanned. A guard that '
+          f'skipped a workflow has not attested it; GitHub will not run it '
+          f'either.')
 
 sys.exit(1 if bad or unusable else 0)
 PY
