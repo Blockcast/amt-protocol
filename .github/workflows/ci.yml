@@ -76,6 +76,13 @@ jobs:
         run: |
           python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
           bash tests/probe_verdict_test.sh
+      # Same job, not a new one: it shares the extraction and the stub pattern,
+      # and a second job would double the checkout for one more answer. Its
+      # `live dial` case needs a bare runner with working loopback -- which is
+      # what this job already is, and the same runner class the probe itself
+      # uses, so a failure there is a finding about the instrument.
+      - name: tests/probe_counters_test.sh
+        run: bash tests/probe_counters_test.sh
 
   test:
     # Keep these job names stable — they are the required-check names in branch
