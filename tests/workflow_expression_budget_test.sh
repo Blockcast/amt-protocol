@@ -44,6 +44,147 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
+# --self-test (BLO-38880). Every guard below lives on a path no real workflow in
+# this repo takes, so CI's one invocation stays green with all of them deleted:
+# the next edit to this file had no failing mutation to catch it, which is the
+# condition the guards themselves exist to prevent, one level up. Each leg builds
+# a fixture repo under a temp dir, copies THIS script into its `tests/` so
+# REPO_ROOT resolves there by the same BASH_SOURCE path a real run uses, and
+# asserts rc plus a substring of the expected verdict.
+#
+# Two traps this harness is shaped against, both paid for on #65:
+#
+#   * A LEG MUST BE PROVED TO HAVE RUN. Asserting that something did NOT happen
+#     passes just as well when the subject never ran. Every FAIL leg here asserts
+#     text only the guard reading that fixture can emit, and the rc=0 legs assert
+#     `scanned 1`, which no empty run produces. Two legs cannot self-witness that
+#     way and carry explicit controls: `glob-none`, whose message comes from
+#     finding nothing, is controlled by `happy` -- same harness, file present,
+#     scanned 1; and `job-suppresses-scan`, the one genuine negative expectation,
+#     by `job-suppresses-scan-control` -- identical file minus the malformed job,
+#     which then DOES report the over-budget step the other leg claims is
+#     suppressed. Without that pair, a fixture that scanned nothing at all would
+#     satisfy the suppression leg for the wrong reason.
+#   * AN EMPTY-FILE FIXTURE MUST ACTUALLY BE EMPTY. #65's leg-runner wrote the
+#     file only `if [ -n "$2" ]`, so the empty leg silently wrote nothing and
+#     re-ran the control, reporting rc=0 as a pass. `cat >` here is
+#     unconditional -- empty stdin yields a 0-byte file, it cannot skip -- and
+#     the leg asserts that byte count rather than trusting the construction.
+if [ "${1:-}" = --self-test ]; then
+    tmp=$(mktemp -d) || exit 1
+    trap 'rm -rf "$tmp"' EXIT
+    me=${BASH_SOURCE[0]}; base=$(basename "$me")
+    # Pin the budget for children: an exported override in the ambient env would
+    # otherwise move the over-budget legs' verdict out from under them.
+    export WORKFLOW_EXPRESSION_BUDGET=20500
+    legs=0 fails=0
+
+    # leg <name> <want-rc> <want-text> [reject-text] [--no-workflows] [path-dir]
+    # The workflow yaml is read from stdin unless --no-workflows is passed.
+    leg() {
+        local name=$1 want=$2 text=$3 reject=${4:-} nowf=${5:-} pre=${6:-} \
+              d=$tmp/$1 out rc
+        mkdir -p "$d/tests"; cp "$me" "$d/tests/$base"
+        if [ "$nowf" != --no-workflows ]; then
+            mkdir -p "$d/.github/workflows"; cat >"$d/.github/workflows/wf.yml"
+        fi
+        legs=$((legs + 1))
+        out=$(PATH="${pre:+$pre:}$PATH" bash "$d/tests/$base" 2>&1); rc=$?
+        if [ "$rc" != "$want" ] || ! grep -qF -- "$text" <<<"$out" \
+           || { [ -n "$reject" ] && grep -qF -- "$reject" <<<"$out"; }; then
+            fails=$((fails + 1))
+            printf 'SELF-TEST FAIL [%s]: want rc=%s containing %q%s\n' \
+                "$name" "$want" "$text" \
+                "${reject:+ and NOT containing $(printf %q "$reject")}"
+            printf '  got rc=%s:\n' "$rc"; sed 's/^/    /' <<<"$out"
+        fi
+    }
+
+    # A `run:` block that compiles past the budget. Built here so both the
+    # over-budget leg and the suppression control share one definition.
+    over=$(head -c 25000 /dev/zero | tr '\0' x)
+
+    leg glob-none 1 'no workflows matched' '' --no-workflows
+    leg happy 0 'scanned 1 workflow(s)' <<<'jobs: {b: {steps: [{run: echo hi}]}}'
+
+    leg empty-file    1 'does not load as a YAML mapping' </dev/null
+    leg bare-scalar   1 'does not load as a YAML mapping' <<<'just a string'
+    leg no-jobs-key   1 'carries no `jobs:` mapping' <<<'name: stub'
+    leg jobs-empty    1 'carries no `jobs:` mapping' <<<'jobs: {}'
+    leg jobs-list     1 'carries no `jobs:` mapping' <<<'jobs: [a, b]'
+    leg jobs-null     1 'carries no `jobs:` mapping' <<<'jobs:'
+    leg job-null      1 'job `build` is not a mapping' <<<'jobs: {build: }'
+    leg job-str       1 'job `build` is not a mapping' <<<'jobs: {build: oops}'
+    leg job-list      1 'job `build` is not a mapping' <<<'jobs: {build: [a]}'
+
+    # Deliberate rc=0 cases: the regress stops short of `steps`, so a reusable-
+    # workflow caller and an explicitly empty `steps:` must stay passing. If
+    # either of these goes red, the guard has started rejecting valid workflows.
+    leg reusable-caller 0 'scanned 1 workflow(s)' \
+        <<<'jobs: {call: {uses: ./.github/workflows/ci.yml}}'
+    leg steps-empty 0 'scanned 1 workflow(s)' <<<'jobs: {b: {steps: []}}'
+
+    leg over-budget 1 'job `big` step' <<YAML
+jobs:
+  big:
+    steps:
+      - run: |
+          $over \${{ github.sha }}
+YAML
+
+    # The negative expectation and its control. Same file; the malformed job is
+    # the only difference. Suppression must swallow an over-budget step that the
+    # control proves is otherwise reported -- without the control, a fixture that
+    # never scanned anything would pass this leg for the wrong reason.
+    leg job-suppresses-scan 1 'job `bad` is not a mapping' 'job `big` step' <<YAML
+jobs:
+  big:
+    steps:
+      - run: |
+          $over \${{ github.sha }}
+  bad: oops
+YAML
+    leg job-suppresses-scan-control 1 'job `big` step' <<YAML
+jobs:
+  big:
+    steps:
+      - run: |
+          $over \${{ github.sha }}
+YAML
+
+    # The bootstrap guard (BLO-38826) is the one leg whose fixture is an
+    # interpreter rather than a workflow: shadow python3 with a stub that cannot
+    # import yaml and whose `-m pip install` refuses, which is what a PEP
+    # 668-managed interpreter does. The workflow present here is deliberately
+    # VALID -- a bootstrap failure has to win before any file is read, and
+    # asserting pip's own text proves the stub ran rather than the real python3.
+    stub=$tmp/stub; mkdir -p "$stub"
+    cat >"$stub/python3" <<'STUB'
+#!/bin/sh
+case "$*" in *pip*) echo "error: externally-managed-environment" >&2; exit 1;; esac
+echo "ModuleNotFoundError: No module named 'yaml'" >&2; exit 1
+STUB
+    chmod +x "$stub/python3"
+    leg bootstrap 1 'error: externally-managed-environment' '' '' "$stub" \
+        <<<'jobs: {b: {steps: [{run: echo hi}]}}'
+
+    wf=$tmp/empty-file/.github/workflows/wf.yml
+    if [ ! -f "$wf" ] || [ -s "$wf" ]; then
+        fails=$((fails + 1))
+        echo "SELF-TEST FAIL [empty-file]: fixture is not a 0-byte file -- the" \
+             "leg re-ran the control and its rc=1 means nothing."
+    fi
+
+    if [ "$fails" != 0 ]; then
+        echo "self-test: $fails of $legs leg(s) diverged"; exit 1
+    fi
+    echo "self-test: $legs legs passed"
+    exit 0
+elif [ $# -gt 0 ]; then
+    echo "usage: $(basename "$0") [--self-test]" >&2
+    exit 2
+fi
+
 # The real ceiling is 21,000, measured against the compiled expression. The only
 # remaining slack is this model's fidelity to GitHub's compiler, so ~2.4% is
 # enough -- a step crossing the line fails here, where the message names the

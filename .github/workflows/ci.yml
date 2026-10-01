@@ -101,6 +101,12 @@ jobs:
       # from a clean one. Same job for the same reason as above: one checkout.
       - name: tests/workflow_expression_budget_test.sh
         run: bash tests/workflow_expression_budget_test.sh
+      # The guard's value is in its failure legs, and no real workflow here takes
+      # any of those paths -- the step above stays green with every one of them
+      # deleted (BLO-38880). --self-test is what gives this file a failing
+      # mutation; run it in the same job so a guard cannot be removed silently.
+      - name: tests/workflow_expression_budget_test.sh --self-test
+        run: bash tests/workflow_expression_budget_test.sh --self-test
 
   test:
     # Keep these job names stable — they are the required-check names in branch
