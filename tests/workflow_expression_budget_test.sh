@@ -50,7 +50,29 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # step, rather than at dispatch, where it takes the whole workflow down silently.
 BUDGET=${WORKFLOW_EXPRESSION_BUDGET:-20500}
 
-python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+# PyYAML is this guard's only dependency, and a bootstrap that cannot supply it
+# has to fail in its own voice. Unguarded, `pip install` is refused on a PEP
+# 668-managed interpreter (`error: externally-managed-environment`), there is no
+# `set -e` above, so the script carries on and the heredoc dies on `import yaml`:
+# rc=1 whose terminal output is a bare `ModuleNotFoundError` traceback. rc=1 is
+# the safe direction, but it is the same silence-reads-as-health shape as the
+# rest of this guard one level out -- nothing was scanned, and the only thing
+# telling that apart from a real budget FAIL is reading the text. Re-probe after
+# the install and name the bootstrap; `python3 -m pip` so the installer and the
+# probe are provably the same interpreter (BLO-38826).
+if ! python3 -c 'import yaml' 2>/dev/null; then
+    python3 -m pip install --quiet pyyaml >/dev/null 2>&1
+    python3 -c 'import yaml' 2>/dev/null || { cat >&2 <<'BOOTSTRAP'
+FAIL: bootstrap -- PyYAML is missing and `python3 -m pip install pyyaml` did not
+      supply it (usually PEP 668: `error: externally-managed-environment`).
+      NO WORKFLOW WAS SCANNED. This is a bootstrap failure, not a budget verdict.
+      Fix: install it from the system packager (`apt-get install python3-yaml`),
+      or run this guard from a venv --
+        python3 -m venv /tmp/wb && /tmp/wb/bin/pip -q install pyyaml
+        PATH=/tmp/wb/bin:$PATH bash tests/workflow_expression_budget_test.sh
+BOOTSTRAP
+        exit 1; }
+fi
 
 python3 - "$REPO_ROOT" "$BUDGET" <<'PY'
 import glob, os, re, sys, yaml
