@@ -127,8 +127,14 @@ if [ "${1:-}" = --self-test ]; then
     # every one was skipped -- zero steps scanned, rc=0. And a null job key
     # (`~:`) collided with the old `next(..., None)` sentinel, skipping the
     # pre-pass and reaching `.get()` as a traceback.
-    leg steps-map    1 'has a `steps:` that is not a list' \
-        <<<'jobs: {b: {steps: {run: echo hi}}}'
+    #
+    # The two non-list legs straddle truthiness ON PURPOSE, and swapping either
+    # side back costs a mutation: `steps-map`'s `{}` is falsy, `steps-scalar`'s
+    # `x` is truthy. That is what witnesses the `is not None` comment below --
+    # with both truthy (`{run: echo hi}` here, as this leg first shipped),
+    # rewriting the guard to `if steps and not isinstance(...)` left this mode
+    # green at 21/21 while silently passing `steps: {}`, `''` and `0`.
+    leg steps-map    1 'has a `steps:` that is not a list' <<<'jobs: {b: {steps: {}}}'
     leg steps-scalar 1 'has a `steps:` that is not a list' <<<'jobs: {b: {steps: x}}'
     leg job-key-null 1 'job `None` is not a mapping' <<<'jobs: {~: oops}'
 
@@ -203,6 +209,17 @@ STUB
         fails=$((fails + 1))
         echo "SELF-TEST FAIL [empty-file]: fixture is not a 0-byte file -- the" \
              "leg re-ran the control and its rc=1 means nothing."
+    fi
+
+    # Same shape, for the other fixture whose construction carries a claim the
+    # assertion cannot see. `steps-empty`'s `yaml` rides in the 7th positional
+    # slot behind three placeholders; mis-slot it and `ext` falls back to `yml`,
+    # the leg still passes on `scanned 1`, and the `*.yaml` glob arm silently
+    # loses its only failing mutation.
+    if [ ! -f "$tmp/steps-empty/.github/workflows/wf.yaml" ]; then
+        fails=$((fails + 1))
+        echo "SELF-TEST FAIL [steps-empty]: fixture is not wf.yaml -- the \`ext\`" \
+             "slot was mis-passed and the \`*.yaml\` glob arm is now uncovered."
     fi
 
     # The usage branch below, which `leg` cannot reach because it passes the
