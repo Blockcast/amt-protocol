@@ -29,18 +29,26 @@
 # already exceeds it and parsed. Those are the INDENTED block as it appears in
 # the file; the 10-space step indent over ~346 lines inflates it by ~3.4k, which
 # is exactly enough to carry a 19,709 scalar across the line. On the quantity
-# GitHub actually parses there is no anomaly: 19,709 < 21,000 < 30,584. Modelling
-# the format() escaping on top (`'`->`''`, `{`->`{{`) moves both by ~0.5% --
-# 19,807 and 30,731 -- and changes no verdict, so the scalar length is the
-# working instrument.
+# GitHub actually parses there is no anomaly: 19,709 < 21,000 < 30,584.
+#
+# AND MEASURE THE COMPILED EXPRESSION, NOT THE SCALAR. What GitHub bounds is
+# `format('<literals>', <exprs>)`, in which every `'` `{` `}` in the literal text
+# is doubled. That inflation is a function of quote/brace DENSITY, not a
+# constant: measured here it is +0.48% on the probe block but +1.50% on ci.yml's
+# `cargo test` block, and a shell block full of `awk '{print $1}'` / `jq -r
+# '{a:.b}'` runs ~20%. At 20% a 20,000-char scalar compiles to ~24,100 -- GitHub
+# refuses and a scalar-length guard reports PASS, which is exactly the silent
+# failure this guard exists to prevent. So the model below is applied and the
+# budget sits near the real ceiling instead of padding against an unknown.
 set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
-# The real ceiling is 21,000. ~5% under it: enough that a step crossing the line
-# fails here, where the message names the step, rather than at dispatch, where it
-# takes the whole workflow down silently.
-BUDGET=${WORKFLOW_EXPRESSION_BUDGET:-20000}
+# The real ceiling is 21,000, measured against the compiled expression. The only
+# remaining slack is this model's fidelity to GitHub's compiler, so ~2.4% is
+# enough -- a step crossing the line fails here, where the message names the
+# step, rather than at dispatch, where it takes the whole workflow down silently.
+BUDGET=${WORKFLOW_EXPRESSION_BUDGET:-20500}
 
 python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
 
@@ -48,9 +56,43 @@ python3 - "$REPO_ROOT" "$BUDGET" <<'PY'
 import glob, os, re, sys, yaml
 
 root, budget = sys.argv[1], int(sys.argv[2])
-EXPR = re.compile(r'\$\{\{.*?\}\}', re.S)
+EXPR = re.compile(r'\$\{\{(.*?)\}\}', re.S)
 bad = largest = 0
 worst = None
+
+
+def compiled_len(text):
+    """Chars GitHub measures: the `format('<lits>', <exprs>)` the scalar becomes.
+
+    Literal text is escaped `'`->`''`, `{`->`{{`, `}`->`}}`, so the inflation
+    tracks quote/brace density and is not a constant. Returns 0 when there is no
+    interpolation -- such a scalar is a plain literal and is never compiled to an
+    expression, so this limit does not apply to it at all.
+    """
+    exprs = EXPR.findall(text)
+    if not exprs:
+        return 0
+    lits = ''.join(EXPR.split(text)[::2])
+    return (len("format('")
+            + len(lits) + lits.count("'") + lits.count('{') + lits.count('}')
+            + sum(len('{%d}' % i) for i in range(len(exprs)))
+            + len("'")
+            + sum(len(', ') + len(e.strip()) for e in exprs)
+            + len(')'))
+
+
+def scalars(step):
+    """Every step field compiled as an expression: `run`, and each `with:` input.
+
+    `with:` is the same expression plane and the same ceiling -- an interpolated
+    `actions/github-script` `script:` is the usual way a repo grows a large one.
+    """
+    if isinstance(step.get('run'), str):
+        yield 'run', step['run']
+    for key, val in (step.get('with') or {}).items():
+        if isinstance(val, str):
+            yield f'with.{key}', val
+
 
 for path in sorted(glob.glob(os.path.join(root, '.github/workflows/*.yml'))
                    + glob.glob(os.path.join(root, '.github/workflows/*.yaml'))):
@@ -61,30 +103,32 @@ for path in sorted(glob.glob(os.path.join(root, '.github/workflows/*.yml'))
         continue
     for jname, job in (doc.get('jobs') or {}).items():
         for i, step in enumerate(job.get('steps') or []):
-            if not (isinstance(step, dict) and isinstance(step.get('run'), str)):
+            if not isinstance(step, dict):
                 continue
-            run = step['run']
             sname = step.get('name') or step.get('id') or f'step[{i}]'
-            n = len(EXPR.findall(run))
-            if not n:
-                continue
-            if len(run) > largest:
-                largest, worst = len(run), f'{rel} {jname} / {sname}'
-            if len(run) > budget:
-                bad += 1
-                print(f'FAIL {rel}: job `{jname}` step `{sname}`: run block is '
-                      f'{len(run)} scalar chars and contains {n} ${{{{ }}}} '
-                      f'expression(s); budget is {budget}, GitHub refuses at '
-                      f'21000.')
-                print('     Fix: move the interpolated value into `env:` and '
-                      'read it as a shell variable -- that takes the block out '
-                      'of the expression plane entirely and leaves it unbounded. '
-                      'Splitting the step also works. Do NOT just trim: over the '
-                      'limit the WHOLE WORKFLOW stops parsing, which presents as '
-                      'a 0-job `completed/failure` run, not as an error anyone '
-                      'reads.')
+            for field, text in scalars(step):
+                size = compiled_len(text)
+                if not size:
+                    continue
+                n = len(EXPR.findall(text))
+                if size > largest:
+                    largest, worst = size, f'{rel} {jname} / {sname} ({field})'
+                if size > budget:
+                    bad += 1
+                    print(f'FAIL {rel}: job `{jname}` step `{sname}`: `{field}` '
+                          f'is {len(text)} scalar chars and contains {n} '
+                          f'${{{{ }}}} expression(s), so GitHub compiles it to a '
+                          f'{size}-char format() expression; budget is {budget}, '
+                          f'GitHub refuses at 21000.')
+                    print('     Fix: move the interpolated value into `env:` and '
+                          'read it as a shell variable -- that takes the block out '
+                          'of the expression plane entirely and leaves it unbounded. '
+                          'Splitting the step also works. Do NOT just trim: over the '
+                          'limit the WHOLE WORKFLOW stops parsing, which presents as '
+                          'a 0-job `completed/failure` run, not as an error anyone '
+                          'reads.')
 
-print(f'largest interpolated run block: {largest} scalar chars '
+print(f'largest interpolated block: {largest} compiled chars '
       f'({worst or "none"}), budget {budget}, hard limit 21000')
 sys.exit(1 if bad else 0)
 PY
