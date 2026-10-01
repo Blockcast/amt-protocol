@@ -304,7 +304,7 @@ jobs:
             echo "::error::tunnels must be an integer in 1..$MAX_TUNNELS, got '$TUNNELS'"; exit 92
           fi
           docker pull -q $IMAGE || docker build -q -t $IMAGE \
-            --label org.opencontainers.image.revision=${{ github.sha }} .
+            --label org.opencontainers.image.revision=$GITHUB_SHA .
           echo "image_digest=$(docker inspect --format='{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}local-build{{end}}' $IMAGE)"
           # BLO-21823 AC#3 wants the client commit alongside the artifact hash.
           echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"
