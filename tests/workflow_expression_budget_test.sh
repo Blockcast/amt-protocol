@@ -126,11 +126,20 @@ if not paths:
              f'in place as tests/workflow_expression_budget_test.sh, not from a '
              f'copy somewhere else.')
 
+# Same shape one level in. `yaml.safe_load` raising is loud; loading to None (an
+# empty file) or to a bare scalar is not -- the file is skipped, no step in it is
+# ever measured, and a directory of entirely unusable workflows prints
+# `(none)` and exits 0, byte-identical to a clean scan. Collected and failed on
+# rather than merely counted: a guard that scanned nothing usable has not
+# attested anything, and GitHub will not run such a file either.
+unusable = []
+
 for path in paths:
     rel = os.path.relpath(path, root)
     with open(path) as fh:
         doc = yaml.safe_load(fh)
     if not isinstance(doc, dict):
+        unusable.append(rel)
         continue
     for jname, job in (doc.get('jobs') or {}).items():
         for i, step in enumerate(job.get('steps') or []):
@@ -159,7 +168,13 @@ for path in paths:
                           'a 0-job `completed/failure` run, not as an error anyone '
                           'reads.')
 
-print(f'largest interpolated block: {largest} compiled chars '
-      f'({worst or "none"}), budget {budget}, hard limit 21000')
-sys.exit(1 if bad else 0)
+print(f'scanned {len(paths)} workflow(s); largest interpolated block: {largest} '
+      f'compiled chars ({worst or "none"}), budget {budget}, hard limit 21000')
+
+for rel in unusable:
+    print(f'FAIL {rel}: does not load as a YAML mapping (empty file, or a bare '
+          f'scalar), so no step in it was scanned. A guard that skipped a '
+          f'workflow has not attested it; GitHub will not run it either.')
+
+sys.exit(1 if bad or unusable else 0)
 PY
