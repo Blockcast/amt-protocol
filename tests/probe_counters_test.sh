@@ -200,22 +200,41 @@ want_grep() {
 # unwritten against a 64 KiB buffer, so the pipe form takes the else (PASS)
 # branch every time. Needs no fixture and no probe -- it drives the helper
 # directly.
+#
+# SIZE IS A PREMISE, SO IT IS MEASURED RATHER THAN ASSUMED. If $OUT ever fits
+# in the pipe buffer, printf finishes before grep exits, no SIGPIPE fires, and
+# this case passes under the pipe-form mutant -- inert, in the same silent
+# direction it exists to catch. Measured: shrink the filler to 200 lines and
+# the mutant survives at 34 PASS / exit 0, the PASS line printing its own
+# 7051-byte $OUT as though that proved something. Both ends can drift, so read
+# the live capacity (F_GETPIPE_SZ) instead of hardcoding 64 KiB: a shrunk
+# fixture is the likelier regression, an enlarged runner buffer the one the
+# review flagged. 2x is a floor, not the shipped margin -- grep reads ahead in
+# blocks, so OUT must exceed buffer + one read, and the fixture ships at ~4.3x.
 # ---------------------------------------------------------------------------
 CASE="want_absent fails closed"
 _saved_failed=$FAILED
 OUT="softnet_delta dropped=0 time_squeeze=0 cpus=2 nf=15
 $(yes 'filler line that is not the needle' | head -8000)"
+_pipe_sz=$(python3 -c 'import fcntl,os;_,w=os.pipe();print(fcntl.fcntl(w,1032))' 2>/dev/null) || _pipe_sz=65536
 FAILED=0
 want_absent "dropped=" >/dev/null
-if [ "$FAILED" = 1 ]; then
-  echo "PASS  $CASE: present needle in a ${#OUT}-byte \$OUT took the FAIL branch"
-  FAILED=$_saved_failed
-else
+_absent_failed=$FAILED
+FAILED=$_saved_failed
+if [ "$_absent_failed" != 1 ]; then
   echo "FAIL  $CASE: a PRESENT needle took the PASS branch -- want_absent is"
   echo "      failing OPEN, so every fabricated-zero assertion below is inert."
   FAILED=1
+elif [ "${#OUT}" -le "$((_pipe_sz * 2))" ]; then
+  echo "FAIL  $CASE: \$OUT is ${#OUT} B against a ${_pipe_sz} B pipe buffer. Too"
+  echo "      small to force SIGPIPE, so this case cannot kill the pipe-form"
+  echo "      mutant and holds nothing -- it would pass either way."
+  FAILED=1
+else
+  echo "PASS  $CASE: present needle in a ${#OUT}-byte \$OUT took the FAIL branch"
+  echo "      (pipe buffer ${_pipe_sz} B, margin $((${#OUT} / _pipe_sz))x)"
 fi
-unset _saved_failed
+unset _saved_failed _absent_failed _pipe_sz
 
 # ---------------------------------------------------------------------------
 # softnet_delta -- happy path. Two CPUs, both counters advancing by DIFFERENT
