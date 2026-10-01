@@ -256,6 +256,42 @@ struct GapEvent {
     missing: u32,
 }
 
+/// Per-track arrival accounting, so a receipt can be read as a RATIO BETWEEN
+/// two tracks and not only as a whole-stream figure.
+///
+/// BLO-35597 defect 2: every FEC block that recovers settles at exactly 31
+/// source + 1 repair symbol, against a published geometry of
+/// `(ssb_length, rsb_length) = (32, 8)` and a measured wire loss of 0.1%. That
+/// is either a receiver off-by-one or a source emitting K−1 source symbols per
+/// block, and the two are indistinguishable from receiver telemetry alone.
+/// Pairing a source track's `received` against its repair track's
+/// `received / rsb_length` decides it from the wire, with no FEC-header
+/// parsing: ~32 means the symbol left the publisher and was lost after the
+/// socket, ~31 means it was never sent.
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+struct PidCounts {
+    /// MMTP `packet_id`.
+    pid: u16,
+    /// [`MmtpLoss::received`] restricted to this track. Sums to `received`.
+    received: u64,
+    /// [`MmtpLoss::gaps`] restricted to this track. Sums to `gaps`.
+    gaps: u64,
+    /// Largest MMTP packet seen on this track. Source and repair symbols differ
+    /// in size (≤1316 B vs 1337 B on the ISS stream), so this classifies a
+    /// track's role from the receipt itself rather than from a remembered
+    /// `packet_id` assignment, which is publisher configuration and moves.
+    max_len: usize,
+}
+
+/// Mutable accumulator behind one [`PidCounts`]. Separate type because the
+/// serialized form carries its own `pid` and the map already keys on it.
+#[derive(Default)]
+struct PidAcc {
+    received: u64,
+    gaps: u64,
+    max_len: usize,
+}
+
 /// Receiver-intrinsic loss accounting, parsed from the MMTP packet header
 /// (ISO/IEC 23008-1: `packet_id` at bytes 2..4 and `packet_sequence_number` at
 /// bytes 8..12, both big-endian; `version` is the top 2 bits of byte 0 and is 0
@@ -272,6 +308,10 @@ struct GapEvent {
 struct SeqTracker {
     /// Per-track high-water sequence number.
     last: std::collections::HashMap<u16, u32>,
+    /// Per-track accumulators for [`MmtpLoss::by_pid`]. Incremented at exactly
+    /// the sites that move the whole-stream counters, so the sums are an
+    /// invariant and not an approximation.
+    per_pid: std::collections::HashMap<u16, PidAcc>,
     observed: u64,
     in_sequence: u64,
     gaps: u64,
@@ -302,12 +342,20 @@ impl SeqTracker {
         }
         let pid = u16::from_be_bytes([payload[2], payload[3]]);
         let seq = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+        {
+            // Sized on every arrival that cleared the header check, including
+            // ones that go on to count as reordered or implausible: the symbol
+            // size is a property of the packet, not of its sequence number.
+            let acc = self.per_pid.entry(pid).or_default();
+            acc.max_len = acc.max_len.max(payload.len());
+        }
         let Some(&prev) = self.last.get(&pid) else {
             self.last.insert(pid, seq);
             // Nothing before it on this track, so it can neither be in-sequence
             // nor terminate a gap — but it did arrive, and the ratio's
             // denominator is every packet that arrived.
             self.received += 1;
+            self.per_pid.entry(pid).or_default().received += 1;
             return;
         };
         let delta = seq.wrapping_sub(prev);
@@ -323,6 +371,7 @@ impl SeqTracker {
         } else if delta == 1 {
             self.in_sequence += 1;
             self.received += 1;
+            self.per_pid.entry(pid).or_default().received += 1;
         } else {
             self.gaps += u64::from(delta - 1);
             self.gap_events += 1;
@@ -336,6 +385,9 @@ impl SeqTracker {
             // The arrival that ENDS the gap is itself received. Omitting it is
             // what made the ratio overstate loss (Ally review, PR #23).
             self.received += 1;
+            let acc = self.per_pid.entry(pid).or_default();
+            acc.received += 1;
+            acc.gaps += u64::from(delta - 1);
         }
         self.last.insert(pid, seq);
     }
@@ -344,6 +396,20 @@ impl SeqTracker {
         if self.observed == 0 {
             return None;
         }
+        let tracks = self.last.len();
+        let mut by_pid: Vec<PidCounts> = self
+            .per_pid
+            .into_iter()
+            .map(|(pid, a)| PidCounts {
+                pid,
+                received: a.received,
+                gaps: a.gaps,
+                max_len: a.max_len,
+            })
+            .collect();
+        // Sorted so two receipts of the same stream are diffable line for line;
+        // HashMap order is not stable across runs.
+        by_pid.sort_unstable_by_key(|p| p.pid);
         // lost / (lost + received) — the ordinary packet-loss ratio. `received`
         // counts every valid arrival, including each track's first packet and
         // the arrival that terminates a gap; `in_sequence` counts neither, so
@@ -356,7 +422,7 @@ impl SeqTracker {
         let loss_ratio =
             (self.implausible == 0 && denom > 0).then(|| self.gaps as f64 / denom as f64);
         Some(MmtpLoss {
-            tracks: self.last.len(),
+            tracks,
             in_sequence: self.in_sequence,
             gaps: self.gaps,
             gap_events: self.gap_events,
@@ -365,6 +431,7 @@ impl SeqTracker {
             reordered: self.reordered,
             implausible: self.implausible,
             loss_ratio,
+            by_pid,
         })
     }
 }
@@ -415,6 +482,11 @@ struct MmtpLoss {
     /// `gaps / (gaps + received)`. `null` when there is nothing to divide, or
     /// when `implausible` is non-zero.
     loss_ratio: Option<f64>,
+    /// Per-track breakdown of `received` and `gaps`, plus each track's largest
+    /// packet, sorted by `pid`. The whole-stream fields above cannot express a
+    /// RATIO between two tracks, which is what BLO-35597 defect 2 needs — see
+    /// [`PidCounts`].
+    by_pid: Vec<PidCounts>,
 }
 
 /// Wall clock as Unix epoch millis. Saturates to 0 before the epoch, which is
@@ -1454,7 +1526,12 @@ mod tests {
 
     /// Minimal MMTP packet: version 0, `packet_id` at 2..4, sequence at 8..12.
     fn mmtp(packet_id: u16, seq: u32) -> Vec<u8> {
-        let mut p = vec![0u8; 32];
+        mmtp_len(packet_id, seq, 32)
+    }
+
+    /// As [`mmtp`], at a chosen total length — the only thing `max_len` reads.
+    fn mmtp_len(packet_id: u16, seq: u32, len: usize) -> Vec<u8> {
+        let mut p = vec![0u8; len];
         p[2..4].copy_from_slice(&packet_id.to_be_bytes());
         p[8..12].copy_from_slice(&seq.to_be_bytes());
         p
@@ -1466,6 +1543,87 @@ mod tests {
             t.observe(&mmtp(id, s));
         }
         t.finish().expect("observed packets yield a report")
+    }
+
+    /// `by_pid` must be a PARTITION of the whole-stream figures, not a second
+    /// independent count of them. A breakdown that does not sum back cannot be
+    /// used as a ratio between two tracks, which is its only purpose.
+    #[test]
+    fn by_pid_partitions_received_and_gaps() {
+        // pid 1: first + gap(11..=13) + in-seq + duplicate. pid 2: first + two
+        // in-seq. Covers every site that moves a whole-stream counter.
+        let got = track(&[(1, 10), (1, 14), (1, 15), (1, 15), (2, 5), (2, 6), (2, 7)]);
+        assert_eq!(
+            got.by_pid,
+            vec![
+                PidCounts {
+                    pid: 1,
+                    received: 3,
+                    gaps: 3,
+                    max_len: 32
+                },
+                PidCounts {
+                    pid: 2,
+                    received: 3,
+                    gaps: 0,
+                    max_len: 32
+                },
+            ]
+        );
+        assert_eq!(
+            got.by_pid.iter().map(|p| p.received).sum::<u64>(),
+            got.received
+        );
+        assert_eq!(got.by_pid.iter().map(|p| p.gaps).sum::<u64>(), got.gaps);
+        // The duplicate is excluded from both, exactly as it is whole-stream.
+        assert_eq!(got.reordered, 1);
+    }
+
+    /// The BLO-35597 defect-2 reading itself: a source track paired against its
+    /// repair track decides whether the publisher emitted K source symbols per
+    /// block or K−1, which no whole-stream figure can express. Here 8 repair
+    /// symbols = 1 block of `rsb_length` 8, against 31 source arrivals with
+    /// zero gaps — i.e. the 32nd symbol was never sent, not lost in transit.
+    #[test]
+    fn by_pid_reads_source_symbols_per_block_against_the_repair_track() {
+        let mut pkts: Vec<(u16, u32)> = (0..31).map(|i| (1u16, i)).collect();
+        pkts.extend((0..8).map(|i| (32769u16, i)));
+        let got = track(&pkts);
+        let src = got
+            .by_pid
+            .iter()
+            .find(|p| p.pid == 1)
+            .expect("source track");
+        let rep = got
+            .by_pid
+            .iter()
+            .find(|p| p.pid == 32769)
+            .expect("repair track");
+        assert_eq!((src.received, src.gaps), (31, 0));
+        assert_eq!((rep.received, rep.gaps), (8, 0));
+        // 31 source per 8/8 = 1 block. A clean stream reading 31 is the source
+        // short by one, not a receiver off-by-one.
+        assert_eq!(src.received / (rep.received / 8), 31);
+    }
+
+    /// `max_len` classifies a track's role from the receipt alone. Source and
+    /// repair symbols differ in size, and the `packet_id` assignment that would
+    /// otherwise have to be remembered is publisher configuration.
+    #[test]
+    fn by_pid_max_len_tracks_the_largest_packet_on_each_track() {
+        let mut t = SeqTracker::default();
+        t.observe(&mmtp_len(1, 0, 900));
+        t.observe(&mmtp_len(1, 1, 1316));
+        t.observe(&mmtp_len(1, 2, 1200)); // smaller: must not lower the mark
+        t.observe(&mmtp_len(32769, 0, 1337));
+        let got = t.finish().expect("observed packets yield a report");
+        assert_eq!(
+            got.by_pid
+                .iter()
+                .map(|p| (p.pid, p.max_len))
+                .collect::<Vec<_>>(),
+            vec![(1, 1316), (32769, 1337)]
+        );
     }
 
     #[test]
