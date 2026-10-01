@@ -50,7 +50,39 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # step, rather than at dispatch, where it takes the whole workflow down silently.
 BUDGET=${WORKFLOW_EXPRESSION_BUDGET:-20500}
 
-python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+# PyYAML is this guard's only dependency, and a bootstrap that cannot supply it
+# has to fail in its own voice. Unguarded, `pip install` is refused on a PEP
+# 668-managed interpreter (`error: externally-managed-environment`), there is no
+# `set -e` above, so the script carries on and the heredoc dies on `import yaml`:
+# rc=1 whose terminal output is a bare `ModuleNotFoundError` traceback. rc=1 is
+# the safe direction, but it is the same silence-reads-as-health shape as the
+# rest of this guard one level out -- nothing was scanned, and the only thing
+# telling that apart from a real budget FAIL is reading the text. Re-probe after
+# the install and name the bootstrap; `python3 -m pip` so the installer and the
+# probe are provably the same interpreter (BLO-38826).
+#
+# Our voice and pip's are not in tension: PEP 668 is only the common cause, not
+# the only one (absent pip, no network, a half-written wheel whose real error is
+# an `ImportError`, not a `ModuleNotFoundError`). Discarding both diagnostics
+# and then naming PEP 668 as fact is confidently wrong in every other case with
+# nothing left to correct it, so capture them and print them under the framing.
+if ! python3 -c 'import yaml' 2>/dev/null; then
+    pip_said=$(python3 -m pip install pyyaml 2>&1)
+    if ! import_said=$(python3 -c 'import yaml' 2>&1); then
+        cat >&2 <<'BOOTSTRAP'
+FAIL: bootstrap -- PyYAML is not importable and `python3 -m pip install pyyaml`
+      did not supply it (most often PEP 668: `externally-managed-environment`).
+      NO WORKFLOW WAS SCANNED. This is a bootstrap failure, not a budget verdict.
+      Fix: install it from the system packager (`apt-get install python3-yaml`),
+      or run this guard from a venv --
+        v=$(mktemp -d) && python3 -m venv "$v" && "$v"/bin/pip -q install pyyaml
+        PATH="$v/bin:$PATH" bash tests/workflow_expression_budget_test.sh
+BOOTSTRAP
+        { echo "      pip said:";    sed 's/^/        /' <<<"$pip_said"
+          echo "      import said:"; sed 's/^/        /' <<<"$import_said"; } >&2
+        exit 1
+    fi
+fi
 
 python3 - "$REPO_ROOT" "$BUDGET" <<'PY'
 import glob, os, re, sys, yaml
