@@ -68,6 +68,12 @@ def compiled_len(text):
     tracks quote/brace density and is not a constant. Returns 0 when there is no
     interpolation -- such a scalar is a plain literal and is never compiled to an
     expression, so this limit does not apply to it at all.
+
+    `len(e)` counts the expression WITH its source padding, deliberately. Whether
+    GitHub re-serialises `${{ github.sha }}` to `github.sha` or keeps the source
+    text is not settleable from outside its compiler, and the two readings differ
+    by 2 chars per expression. `len(e)` is correct under the second and
+    over-counts under the first; a guard may only ever over-count.
     """
     exprs = EXPR.findall(text)
     if not exprs:
@@ -77,8 +83,19 @@ def compiled_len(text):
             + len(lits) + lits.count("'") + lits.count('{') + lits.count('}')
             + sum(len('{%d}' % i) for i in range(len(exprs)))
             + len("'")
-            + sum(len(', ') + len(e.strip()) for e in exprs)
+            + sum(len(', ') + len(e) for e in exprs)
             + len(')'))
+
+
+# compiled_len is the load-bearing half of this guard: understate it and the
+# budget silently reverts to measuring the raw scalar, which is the exact
+# false-PASS the header exists to prevent. Pin the escaping on all three paths
+# against hand-built format() strings. Inputs are unpadded so these hold under
+# either reading of the whitespace question above.
+assert compiled_len("plain text, no interpolation") == 0
+assert compiled_len("a${{b}}c") == len("format('a{0}c', b)")
+assert compiled_len("x${{y}}z${{w}}") == len("format('x{0}z{1}', y, w)")
+assert compiled_len("it's {a}${{s}}") == len("format('it''s {{a}}{0}', s)")
 
 
 def scalars(step):
