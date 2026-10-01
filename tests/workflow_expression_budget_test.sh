@@ -120,6 +120,18 @@ if [ "${1:-}" = --self-test ]; then
     leg job-str       1 'job `build` is not a mapping' <<<'jobs: {build: oops}'
     leg job-list      1 'job `build` is not a mapping' <<<'jobs: {build: [a]}'
 
+    # The three guards 5fcdc46 added to the same pre-pass, which landed with no
+    # leg of their own -- the gap this whole mode exists to close, reappearing
+    # one commit later. A non-list `steps:` failed the OPPOSITE way to the rest
+    # of this block: truthy, so `or []` kept it, `enumerate` walked its keys and
+    # every one was skipped -- zero steps scanned, rc=0. And a null job key
+    # (`~:`) collided with the old `next(..., None)` sentinel, skipping the
+    # pre-pass and reaching `.get()` as a traceback.
+    leg steps-map    1 'has a `steps:` that is not a list' \
+        <<<'jobs: {b: {steps: {run: echo hi}}}'
+    leg steps-scalar 1 'has a `steps:` that is not a list' <<<'jobs: {b: {steps: x}}'
+    leg job-key-null 1 'job `None` is not a mapping' <<<'jobs: {~: oops}'
+
     # Deliberate rc=0 cases: the regress stops short of `steps`, so a reusable-
     # workflow caller and an explicitly empty `steps:` must stay passing. If
     # either of these goes red, the guard has started rejecting valid workflows.
