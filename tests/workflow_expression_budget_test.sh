@@ -111,8 +111,22 @@ def scalars(step):
             yield f'with.{key}', val
 
 
-for path in sorted(glob.glob(os.path.join(root, '.github/workflows/*.yml'))
-                   + glob.glob(os.path.join(root, '.github/workflows/*.yaml'))):
+paths = sorted(glob.glob(os.path.join(root, '.github/workflows/*.yml'))
+               + glob.glob(os.path.join(root, '.github/workflows/*.yaml')))
+
+# Scanning nothing must not read as passing. `root` comes from this script's own
+# location, so a copy invoked from anywhere else globs an empty directory, prints
+# `(none)` and would exit 0 -- byte-identical output for a correct workflow, for
+# the broken one this guard exists to catch, and for no input at all. That is the
+# same silence-reads-as-health shape as the 0-job run in the header, one level up:
+# a verifier mutation-testing this guard gets a PASS and concludes it is inert.
+if not paths:
+    sys.exit(f'FAIL: no workflows matched {root}/.github/workflows/*.y[a]ml. '
+             f'This guard resolves its root from its own file location -- run it '
+             f'in place as tests/workflow_expression_budget_test.sh, not from a '
+             f'copy somewhere else.')
+
+for path in paths:
     rel = os.path.relpath(path, root)
     with open(path) as fh:
         doc = yaml.safe_load(fh)
