@@ -284,6 +284,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # ⚠ KEEP THIS STEP FREE OF `${{ }}`. BLO-38732: this block is 30,569
+      # characters of YAML scalar, and GitHub refuses a `run:` block at 21,000 --
+      # but ONLY when it contains an interpolation, because that is what compiles
+      # it to a `format(...)` expression. The revision label below used to read
+      # `${{ github.sha }}`; at 30,584 scalar chars that one expression took the
+      # WHOLE WORKFLOW unparseable from 2026-10-01T07:12Z, i.e. the detector went
+      # silent while every surface said `completed/failure` with zero jobs.
+      # `$GITHUB_SHA` is the same value from the runner env and costs nothing.
+      # Measured: 19,709 scalar + 1 expr parsed (43a6ba2d); 30,584 + 1 did not;
+      # 30,569 + 0 does. Read the SCALAR, not the indented file text -- the
+      # 10-space indent over ~346 lines inflates it ~3.4k and is what made the
+      # original bracket look like a refutation of the 21,000 limit.
+      # Held by tests/workflow_expression_budget_test.sh.
       - name: amt-verify (real client, public vantage)
         run: |
           # Ally review (head 0ad7198), Important (2). `tunnels` is an unbounded
@@ -304,7 +317,7 @@ jobs:
             echo "::error::tunnels must be an integer in 1..$MAX_TUNNELS, got '$TUNNELS'"; exit 92
           fi
           docker pull -q $IMAGE || docker build -q -t $IMAGE \
-            --label org.opencontainers.image.revision=${{ github.sha }} .
+            --label org.opencontainers.image.revision=$GITHUB_SHA .
           echo "image_digest=$(docker inspect --format='{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}local-build{{end}}' $IMAGE)"
           # BLO-21823 AC#3 wants the client commit alongside the artifact hash.
           echo "client_commit=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMAGE)"

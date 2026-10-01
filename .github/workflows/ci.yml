@@ -85,6 +85,12 @@ jobs:
         run: |
           python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
           bash tests/probe_counters_test.sh
+      # BLO-38732. Static, so it fires on the PR that would break parsing rather
+      # than on the first cron after merge -- an unparseable workflow produces a
+      # 0-job `completed/failure` run, which on a detector is indistinguishable
+      # from a clean one. Same job for the same reason as above: one checkout.
+      - name: tests/workflow_expression_budget_test.sh
+        run: bash tests/workflow_expression_budget_test.sh
 
   test:
     # Keep these job names stable — they are the required-check names in branch
