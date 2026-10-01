@@ -80,13 +80,16 @@ if [ "${1:-}" = --self-test ]; then
     legs=0 fails=0
 
     # leg <name> <want-rc> <want-text> [reject-text] [--no-workflows] [path-dir]
-    # The workflow yaml is read from stdin unless --no-workflows is passed.
+    #     [ext]
+    # The workflow yaml is read from stdin unless --no-workflows is passed, and
+    # is written as `wf.<ext>` -- `yml` unless a leg asks otherwise, which is
+    # what gives the discovery glob's `*.yaml` arm a failing mutation.
     leg() {
         local name=$1 want=$2 text=$3 reject=${4:-} nowf=${5:-} pre=${6:-} \
-              d=$tmp/$1 out rc
+              ext=${7:-yml} d=$tmp/$1 out rc
         mkdir -p "$d/tests"; cp "$me" "$d/tests/$base"
         if [ "$nowf" != --no-workflows ]; then
-            mkdir -p "$d/.github/workflows"; cat >"$d/.github/workflows/wf.yml"
+            mkdir -p "$d/.github/workflows"; cat >"$d/.github/workflows/wf.$ext"
         fi
         legs=$((legs + 1))
         out=$(PATH="${pre:+$pre:}$PATH" bash "$d/tests/$base" 2>&1); rc=$?
@@ -120,9 +123,15 @@ if [ "${1:-}" = --self-test ]; then
     # Deliberate rc=0 cases: the regress stops short of `steps`, so a reusable-
     # workflow caller and an explicitly empty `steps:` must stay passing. If
     # either of these goes red, the guard has started rejecting valid workflows.
+    # `steps-empty` carries the `.yaml` extension as well: discovery globs both
+    # `*.yml` and `*.yaml`, and with every fixture a `.yml` the `*.yaml` arm had
+    # no failing mutation -- deleting it left this self-test green, and the file
+    # it would then skip is skipped in exactly the silence this guard exists to
+    # break. `scanned 1 workflow(s)` is the witness that the file was found.
     leg reusable-caller 0 'scanned 1 workflow(s)' \
         <<<'jobs: {call: {uses: ./.github/workflows/ci.yml}}'
-    leg steps-empty 0 'scanned 1 workflow(s)' <<<'jobs: {b: {steps: []}}'
+    leg steps-empty 0 'scanned 1 workflow(s)' '' '' '' yaml \
+        <<<'jobs: {b: {steps: []}}'
 
     leg over-budget 1 'job `big` step' <<YAML
 jobs:
@@ -156,23 +165,46 @@ YAML
     # interpreter rather than a workflow: shadow python3 with a stub that cannot
     # import yaml and whose `-m pip install` refuses, which is what a PEP
     # 668-managed interpreter does. The workflow present here is deliberately
-    # VALID -- a bootstrap failure has to win before any file is read, and
-    # asserting pip's own text proves the stub ran rather than the real python3.
+    # VALID -- a bootstrap failure has to win before any file is read.
+    #
+    # ASSERT A MARKER ONLY THE STUB CAN EMIT, not pip's own text. On a PEP
+    # 668-managed host that lacks PyYAML the REAL `python3 -m pip install pyyaml`
+    # prints `error: externally-managed-environment` byte-identically, so a leg
+    # asserting that string passes with the stub contributing nothing -- the
+    # fixture is not proved to have run, which is this harness's first trap in
+    # the one place it was still unguarded. The guard echoes pip's stderr back
+    # verbatim under `pip said:`, so a sentinel in it is carried through.
     stub=$tmp/stub; mkdir -p "$stub"
     cat >"$stub/python3" <<'STUB'
 #!/bin/sh
-case "$*" in *pip*) echo "error: externally-managed-environment" >&2; exit 1;; esac
+case "$*" in *pip*)
+  echo "error: externally-managed-environment [self-test stub]" >&2; exit 1;;
+esac
 echo "ModuleNotFoundError: No module named 'yaml'" >&2; exit 1
 STUB
     chmod +x "$stub/python3"
-    leg bootstrap 1 'error: externally-managed-environment' '' '' "$stub" \
-        <<<'jobs: {b: {steps: [{run: echo hi}]}}'
+    leg bootstrap 1 'externally-managed-environment [self-test stub]' '' '' \
+        "$stub" <<<'jobs: {b: {steps: [{run: echo hi}]}}'
 
     wf=$tmp/empty-file/.github/workflows/wf.yml
     if [ ! -f "$wf" ] || [ -s "$wf" ]; then
         fails=$((fails + 1))
         echo "SELF-TEST FAIL [empty-file]: fixture is not a 0-byte file -- the" \
              "leg re-ran the control and its rc=1 means nothing."
+    fi
+
+    # The usage branch below, which `leg` cannot reach because it passes the
+    # child no argv. Uncovered it is the same shape as everything else here:
+    # replacing it with `elif false` leaves this self-test green while an
+    # unknown argument falls through and runs the full scan as if it had been
+    # invoked bare. Reuses the `happy` fixture -- a valid repo, so rc=2 can only
+    # come from the argument.
+    legs=$((legs + 1))
+    out=$(bash "$tmp/happy/tests/$base" --bogus 2>&1); rc=$?
+    if [ "$rc" != 2 ] || ! grep -qF -- 'usage:' <<<"$out"; then
+        fails=$((fails + 1))
+        printf 'SELF-TEST FAIL [usage]: want rc=2 containing "usage:"\n'
+        printf '  got rc=%s:\n' "$rc"; sed 's/^/    /' <<<"$out"
     fi
 
     if [ "$fails" != 0 ]; then
@@ -359,12 +391,23 @@ if not paths:
 # has no `steps:` anywhere, is entirely valid, and scans zero steps. One notch
 # further in and this guard rejects every such caller in the repo.
 #
-# Also left open, and narrower still: `isinstance(step, dict)` below skips a
-# malformed step inside an otherwise-scanned job without saying so. Unlike the
-# cases above it that is not a file-level verdict -- `steps:` is a list and the
-# rest of the job IS attested, so only that one element goes unmeasured. That
-# claim is only true because a non-list `steps:` is now caught above; while it
-# was not, "the rest of the job" could be nothing at all.
+# Also left open, and narrower still: the three type checks below that skip a
+# malformed STEP inside an otherwise-scanned job without saying so --
+# `isinstance(step, dict)`, `isinstance(step.get('run'), str)` and
+# `isinstance(val, str)`. Unlike the cases above them these are not file-level
+# verdicts -- `steps:` is a list and the rest of the job IS attested, so only
+# that one element goes unmeasured. That claim is only true because a non-list
+# `steps:` is now caught above; while it was not, "the rest of the job" could be
+# nothing at all.
+#
+# Naming the SET rather than one member: all three are green under mutation in
+# `--self-test`, so a reader who checks only the one member named here would
+# conclude the other two are covered. `job.get('steps') or []` and
+# `step.get('with') or {}` look like the same family and are NOT in it --
+# dropping either fallback reds (`reusable-caller` by name, and `happy`). Those
+# reds are crashes the mutation introduces rather than the pre-mutation
+# behaviour, but that is the point of the idiom: the fallback exists to tolerate
+# the absent key, so removing it is the defect.
 unusable = []
 
 for path in paths:
