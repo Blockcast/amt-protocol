@@ -165,6 +165,13 @@ if not paths:
 # rather than merely counted: a guard that scanned nothing usable has not
 # attested anything, and GitHub will not run such a file either.
 #
+# That `safe_load` stays unguarded on purpose, and it is the one exemption from
+# the crash-not-verdict standard below: a syntax error aborts with a
+# `yaml.parser.ParserError` naming the file, line AND column, so the traceback IS
+# the verdict -- where the shapes below traceback without saying anything useful.
+# Cost accepted, not overlooked: it aborts mid-loop, so one syntax error
+# suppresses the `scanned N` summary and every sibling FAIL in the same run.
+#
 # `jobs:` is the last notch of that family (BLO-38855). A `name:`/`description:`
 # stub, a stray `action.yml`, a half-written file -- all load as mappings, carry
 # no job, contribute zero steps, and are counted in `scanned N`: PASS over
