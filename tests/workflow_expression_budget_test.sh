@@ -175,11 +175,30 @@ if not paths:
 # -- unguarded that is an AttributeError traceback, which is rc=1 but a crash,
 # not a verdict, and that is the shape BLO-38826 just removed from the bootstrap.
 #
+# A job VALUE gets the same treatment, one level in: `build:` with no body is
+# None, and `build: oops` / `build: [a]` are a str and a list -- each reaches
+# `.get('steps')` and tracebacks, the same crash-not-verdict shape. Checked in a
+# pre-pass rather than inside the scan loop so that a file with one malformed job
+# contributes NO steps at all; that keeps it a file-level verdict like the two
+# above it, and keeps the shared `so no step in it was scanned` wording true.
+#
 # The regress stops here, with the stopping point written down rather than
 # implied: a workflow whose jobs all have empty `steps:` also scans nothing and
-# still exits 0. That case is left open on purpose -- unlike the four above it,
-# GitHub accepts and runs such a file, so it is not unusable by this guard's own
-# standard, and failing on it would make the guard reject valid workflows.
+# still exits 0. That case is left open on purpose, and the reason is a concrete
+# valid shape rather than a judgement about what GitHub tolerates -- a caller of
+# a reusable workflow,
+#
+#     jobs:
+#       call:
+#         uses: ./.github/workflows/ci.yml
+#
+# has no `steps:` anywhere, is entirely valid, and scans zero steps. One notch
+# further in and this guard rejects every such caller in the repo.
+#
+# Also left open, and narrower still: `isinstance(step, dict)` below skips a
+# malformed step inside an otherwise-scanned job without saying so. Unlike the
+# cases above it that is not a file-level verdict -- the rest of the job IS
+# attested -- so it is recorded here as open rather than silently covered.
 unusable = []
 
 for path in paths:
@@ -194,6 +213,11 @@ for path in paths:
     if not isinstance(jobs, dict) or not jobs:
         unusable.append((rel, 'loads as a mapping but carries no `jobs:` mapping '
                               '(missing, empty, or not a mapping)'))
+        continue
+    bad_job = next((j for j, v in jobs.items() if not isinstance(v, dict)), None)
+    if bad_job is not None:
+        unusable.append((rel, f'job `{bad_job}` is not a mapping (a typed job '
+                              f'key with no body, or a scalar/list value)'))
         continue
     for jname, job in jobs.items():
         for i, step in enumerate(job.get('steps') or []):
