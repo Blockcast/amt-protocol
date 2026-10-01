@@ -273,9 +273,17 @@ struct GapEvent {
 /// `reordered` must be 0 on BOTH tracks (a reordered arrival is a real packet
 /// that arrived and is counted in no `received`, so it biases the reading by
 /// exactly the amount the reading is trying to detect), and the repair track's
-/// `received` must be at least `rsb_length` (below one full block the
-/// denominator truncates to zero — a `jq` consumer errors there rather than
-/// returning null).
+/// `received` must be at least `rsb_length`.
+///
+/// That second precondition is load-bearing, not belt-and-braces. The
+/// truncate-to-zero intuition is Rust's; `jq` divides in IEEE-754, so a window
+/// that caught 1..=7 repair symbols gives a FRACTIONAL denominator and the
+/// reading inflates **silently** — `31 / (4/8)` is `62`, exit 0, no
+/// diagnostic. `jq` raises only when the divisor is exactly 0, i.e. only when
+/// the window caught no repair symbol at all. A `jq` consumer therefore wants
+/// `select(.received >= $rsb)` ahead of the division rather than a reliance on
+/// `jq` erroring; 62 source symbols per block is exactly the plausible-wrong
+/// reading this struct exists to eliminate.
 #[derive(serde::Serialize, Debug, PartialEq, Eq)]
 struct PidCounts {
     /// MMTP `packet_id`.
@@ -370,20 +378,20 @@ impl SeqTracker {
         }
         let pid = u16::from_be_bytes([payload[2], payload[3]]);
         let seq = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
-        {
-            // Sized on every arrival that cleared the header check, including
-            // ones that go on to count as reordered or implausible: the symbol
-            // size is a property of the packet, not of its sequence number.
-            let acc = self.per_pid.entry(pid).or_default();
-            acc.max_len = acc.max_len.max(payload.len());
-        }
+        // Sized on every arrival that cleared the header check, including ones
+        // that go on to count as reordered or implausible: the symbol size is a
+        // property of the packet, not of its sequence number. `last` and
+        // `per_pid` are disjoint fields, so this binding stays live through the
+        // sequence branches below and each one reuses it.
+        let acc = self.per_pid.entry(pid).or_default();
+        acc.max_len = acc.max_len.max(payload.len());
         let Some(&prev) = self.last.get(&pid) else {
             self.last.insert(pid, seq);
             // Nothing before it on this track, so it can neither be in-sequence
             // nor terminate a gap — but it did arrive, and the ratio's
             // denominator is every packet that arrived.
             self.received += 1;
-            self.per_pid.entry(pid).or_default().received += 1;
+            acc.received += 1;
             return;
         };
         let delta = seq.wrapping_sub(prev);
@@ -392,7 +400,7 @@ impl SeqTracker {
             // the mark must not move backwards, or the next in-order packet
             // reads as a gap.
             self.reordered += 1;
-            self.per_pid.entry(pid).or_default().reordered += 1;
+            acc.reordered += 1;
             return;
         }
         if delta > MAX_PLAUSIBLE_GAP {
@@ -400,11 +408,11 @@ impl SeqTracker {
             // Attributable here, unlike the header-check rejection above: that
             // one is discarded before `packet_id` is read, which is why the
             // per-pid sum is a lower bound on the whole-stream figure.
-            self.per_pid.entry(pid).or_default().implausible += 1;
+            acc.implausible += 1;
         } else if delta == 1 {
             self.in_sequence += 1;
             self.received += 1;
-            self.per_pid.entry(pid).or_default().received += 1;
+            acc.received += 1;
         } else {
             self.gaps += u64::from(delta - 1);
             self.gap_events += 1;
@@ -418,7 +426,6 @@ impl SeqTracker {
             // The arrival that ENDS the gap is itself received. Omitting it is
             // what made the ratio overstate loss (Ally review, PR #23).
             self.received += 1;
-            let acc = self.per_pid.entry(pid).or_default();
             acc.received += 1;
             acc.gaps += u64::from(delta - 1);
         }
@@ -480,6 +487,12 @@ struct MmtpLoss {
     /// explained: `packet_id` 0 carried the first packet in both receipts, which
     /// is where MMT conventionally puts signalling, but nothing here has
     /// confirmed that. Do not treat 8 as the expected value.
+    ///
+    /// [`PidCounts::max_len`] is the instrument for closing that question: a
+    /// signalling track would show a distinctly small `max_len` beside the
+    /// ≤1316 B source / 1337 B repair media pair, and `by_pid` carries it on
+    /// every receipt from here on. Read it off the next one rather than
+    /// re-deriving the question.
     tracks: usize,
     /// Adjacent per-track arrivals whose sequence numbers differed by exactly 1.
     in_sequence: u64,
@@ -1680,8 +1693,10 @@ mod tests {
         assert_eq!((rep.received, rep.gaps), (8, 0));
         // 31 source per 8/8 = 1 block. A clean stream reading 31 is the source
         // short by one, not a receiver off-by-one. The precondition is part of
-        // the recipe: below one full repair block the denominator truncates to
-        // zero, and a `jq` consumer errors there rather than returning null.
+        // the recipe, and it guards a SILENT failure rather than an error: the
+        // Rust expression below truncates the denominator to zero and would
+        // panic, but the `jq` consumer the recipe names divides in IEEE-754 and
+        // returns a plausible-looking inflated figure instead.
         assert!(rep.received >= 8, "recipe needs at least one repair block");
         assert_eq!(
             (src.reordered, rep.reordered),
@@ -1689,6 +1704,12 @@ mod tests {
             "reordered biases it"
         );
         assert_eq!(src.received / (rep.received / 8), 31);
+        // What `jq` computes on a window that caught only 4 repair symbols —
+        // both operands exact in binary floating point, so this is the real
+        // value and not an approximation of it. 62 source symbols per block,
+        // exit 0, no diagnostic: hence `select(.received >= $rsb)` in the
+        // consumer rather than a reliance on `jq` raising.
+        assert_eq!(31.0_f64 / (4.0_f64 / 8.0), 62.0);
     }
 
     /// `max_len` classifies a track's role from the receipt alone. Source and
