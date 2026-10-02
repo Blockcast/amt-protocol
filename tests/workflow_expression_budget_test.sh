@@ -240,7 +240,14 @@ SELFTEST_DEP
     # the one place it was still unguarded. The guard echoes pip's stderr back
     # verbatim under `pip said:`, so a sentinel in it is carried through.
     # $stub goes FIRST on PATH wherever it is used, so it shadows every command
-    # the child resolves, not just python3 -- including the `timeout` below.
+    # the child resolves, not just python3. It ALSO shadows the `timeout` in the
+    # `PATH=... timeout 60 bash ...` line below -- but by a different route,
+    # worth keeping straight because the two have different blast radii. That
+    # line is a command-prefix assignment, so the PARENT resolves `timeout` at
+    # exec time; the child never looks it up. The hazard survives the
+    # correction: measured under bash 5.2.37, the parent performs that lookup
+    # through the ASSIGNED PATH rather than its own, so a `$stub/timeout` would
+    # capture the bound itself, not merely be shadowed inside the child.
     # Harmless while python3 is the only file here; if you add a second stub,
     # check nothing downstream resolves that name through this directory.
     stub=$tmp/stub; mkdir -p "$stub"
@@ -259,12 +266,21 @@ STUB
     # the same reason as `usage` below: it needs `--self-test` in the child's
     # argv. In CI PyYAML is present, so the gate's condition is always false and
     # deleting the whole block leaves this self-test green. That gate and the
-    # `timeout 60` bound below are the two guards here with no failing mutation,
-    # and they are the complete list -- both bound a path CI never takes, so
-    # neither can be covered from inside this suite. Keep this inventory current:
-    # a third such guard added without being named here is the stale-control
-    # shape the rest of the file is built against. (Measured at this head:
-    # deleting `timeout 60` leaves `22 legs passed`, rc=0.)
+    # `timeout 60` bound below are the complete list of guards that CANNOT be
+    # covered from inside this suite -- both bound a path CI never takes, so no
+    # leg can reach either. Keep THAT inventory current: a third uncoverable
+    # guard added without being named here is the stale-control shape the rest
+    # of the file is built against. (Measured at this head: deleting
+    # `timeout 60` leaves `22 legs passed`, rc=0.)
+    #
+    # Scope matters, because "no failing mutation" alone is a WIDER predicate
+    # and this is not the only place it holds: the three `isinstance` checks at
+    # the foot of the scanner are green under mutation too (see the block above
+    # `unusable = []`). They are a different category -- uncovered but
+    # COVERABLE. Measured here: a leg feeding `jobs: {b: {steps: [1]}}` is rc=0
+    # today and rc=1 with `isinstance(step, dict)` neutered (AttributeError:
+    # 'int' object has no attribute 'get'), so a leg would close it. The two
+    # named above admit no such leg at any effort. Do not merge the two lists.
     #
     # Run a child self-test under the import-refusing stub. Assert
     # `NO LEG WAS RUN`, which only the gate emits, and the stub's
@@ -332,6 +348,15 @@ STUB
         # coverage question -- deliberately out of scope here. If you run the
         # BLO-39230 checklist by hand, reap afterwards:
         #     pkill -9 -f 'workflow_expression_budget_test[.]sh'
+        #
+        # PORTABILITY: `timeout` is this file's only GNU-coreutils dependency
+        # (python3/mktemp/grep/sed/awk are all POSIX here, so there is no
+        # precedent to inherit). Stock macOS ships it as `gtimeout` only, where
+        # this leg reds as [dependency-gate] rc=127. Left as a note, not a
+        # `command -v` preflight: bash's `command not found` goes to fd 2 and
+        # `2>&1` captures it into $out, so the failure already names its own
+        # cause, and CI is Linux. A preflight would be a THIRD guard that no
+        # leg can cover -- precisely what the register above warns against.
         out=$(EXPRESSION_BUDGET_SELFTEST_NESTED=1 PATH="$stub:$PATH" \
               timeout 60 bash "$tmp/happy/tests/$base" --self-test 2>&1); rc=$?
         if [ "$rc" != 3 ] || ! grep -qF -- 'NO LEG WAS RUN' <<<"$out" \
@@ -571,7 +596,14 @@ if not paths:
 #
 # Naming the SET rather than one member: all three are green under mutation in
 # `--self-test`, so a reader who checks only the one member named here would
-# conclude the other two are covered. `job.get('steps') or []` and
+# conclude the other two are covered. They are NOT part of the uncoverable-guard
+# register in the `--self-test` branch (the dependency gate and its `timeout 60`)
+# -- that register is deliberately narrower, and this trio is excluded from it on
+# purpose rather than omitted. The difference is coverability, not coverage: a
+# leg feeding `jobs: {b: {steps: [1]}}` would red `isinstance(step, dict)`, so
+# these are closable whenever someone wants them closed. The register's two
+# admit no such leg.
+# `job.get('steps') or []` and
 # `step.get('with') or {}` look like the same family and are NOT in it --
 # dropping either fallback reds (`reusable-caller` by name, and `happy`). Those
 # reds are crashes the mutation introduces rather than the pre-mutation
