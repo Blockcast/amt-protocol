@@ -231,11 +231,35 @@ SELFTEST_DEP
 case "$*" in *pip*)
   echo "error: externally-managed-environment [self-test stub]" >&2; exit 1;;
 esac
-echo "ModuleNotFoundError: No module named 'yaml'" >&2; exit 1
+echo "ModuleNotFoundError: No module named 'yaml' [self-test stub]" >&2; exit 1
 STUB
     chmod +x "$stub/python3"
     leg bootstrap 1 'externally-managed-environment [self-test stub]' '' '' \
         "$stub" <<<'jobs: {b: {steps: [{run: echo hi}]}}'
+
+    # The dependency gate at the top of this branch, which `leg` cannot reach for
+    # the same reason as `usage` below: it needs `--self-test` in the child's
+    # argv. In CI PyYAML is present, so the gate's condition is always false and
+    # deleting the whole block leaves this self-test green -- the one guard here
+    # with no failing mutation. Run a child self-test under the import-refusing
+    # stub. Assert `NO LEG WAS RUN`, which only the gate emits, and the stub's
+    # sentinel, which proves the stub is the interpreter it probed: a real
+    # PyYAML-less host prints the bare ModuleNotFoundError identically.
+    # The child is marked NESTED and skips this leg: with the gate deleted it
+    # would otherwise run its own copy of this leg, and so on without end. With
+    # the mark it runs the other legs under the stub, they diverge, and this
+    # leg fails on the missing `NO LEG WAS RUN` instead of hanging.
+    if [ -z "${EXPRESSION_BUDGET_SELFTEST_NESTED:-}" ]; then
+        legs=$((legs + 1))
+        out=$(EXPRESSION_BUDGET_SELFTEST_NESTED=1 PATH="$stub:$PATH" \
+              bash "$tmp/happy/tests/$base" --self-test 2>&1); rc=$?
+        if [ "$rc" != 1 ] || ! grep -qF -- 'NO LEG WAS RUN' <<<"$out" \
+           || ! grep -qF -- "No module named 'yaml' [self-test stub]" <<<"$out"; then
+            fails=$((fails + 1))
+            printf 'SELF-TEST FAIL [dependency-gate]: want rc=1 containing "NO LEG WAS RUN" and the stub sentinel\n'
+            printf '  got rc=%s:\n' "$rc"; sed 's/^/    /' <<<"$out"
+        fi
+    fi
 
     wf=$tmp/empty-file/.github/workflows/wf.yml
     if [ ! -f "$wf" ] || [ -s "$wf" ]; then
