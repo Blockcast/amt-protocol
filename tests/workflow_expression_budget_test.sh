@@ -239,6 +239,17 @@ SELFTEST_DEP
     # fixture is not proved to have run, which is this harness's first trap in
     # the one place it was still unguarded. The guard echoes pip's stderr back
     # verbatim under `pip said:`, so a sentinel in it is carried through.
+    # $stub goes FIRST on PATH wherever it is used, so it shadows every command
+    # the child resolves, not just python3. It ALSO shadows the `timeout` in the
+    # `PATH=... timeout 60 bash ...` line below -- but by a different route,
+    # worth keeping straight because the two have different blast radii. That
+    # line is a command-prefix assignment, so the PARENT resolves `timeout` at
+    # exec time; the child never looks it up. The hazard survives the
+    # correction: measured under bash 5.2.37, the parent performs that lookup
+    # through the ASSIGNED PATH rather than its own, so a `$stub/timeout` would
+    # capture the bound itself, not merely be shadowed inside the child.
+    # Harmless while python3 is the only file here; if you add a second stub,
+    # check nothing downstream resolves that name through this directory.
     stub=$tmp/stub; mkdir -p "$stub"
     cat >"$stub/python3" <<'STUB'
 #!/bin/sh
@@ -254,9 +265,25 @@ STUB
     # The dependency gate at the top of this branch, which `leg` cannot reach for
     # the same reason as `usage` below: it needs `--self-test` in the child's
     # argv. In CI PyYAML is present, so the gate's condition is always false and
-    # deleting the whole block leaves this self-test green -- the one guard here
-    # with no failing mutation. Run a child self-test under the import-refusing
-    # stub. Assert `NO LEG WAS RUN`, which only the gate emits, and the stub's
+    # deleting the whole block leaves this self-test green. That gate and the
+    # `timeout 60` bound below are the complete list of guards that CANNOT be
+    # covered from inside this suite -- both bound a path CI never takes, so no
+    # leg can reach either. Keep THAT inventory current: a third uncoverable
+    # guard added without being named here is the stale-control shape the rest
+    # of the file is built against. (Measured at this head: deleting
+    # `timeout 60` leaves `22 legs passed`, rc=0.)
+    #
+    # Scope matters, because "no failing mutation" alone is a WIDER predicate
+    # and this is not the only place it holds: the three `isinstance` checks at
+    # the foot of the scanner are green under mutation too (see the block above
+    # `unusable = []`). They are a different category -- uncovered but
+    # COVERABLE. Measured here: a leg feeding `jobs: {b: {steps: [1]}}` is rc=0
+    # today and rc=1 with `isinstance(step, dict)` neutered (AttributeError:
+    # 'int' object has no attribute 'get'), so a leg would close it. The two
+    # named above admit no such leg at any effort. Do not merge the two lists.
+    #
+    # Run a child self-test under the import-refusing stub. Assert
+    # `NO LEG WAS RUN`, which only the gate emits, and the stub's
     # sentinel, which proves the stub is the interpreter it probed: a real
     # PyYAML-less host prints the bare ModuleNotFoundError identically.
     # The child is marked NESTED and skips this leg: with the gate deleted it
@@ -267,15 +294,82 @@ STUB
     # rc=3 is the gate's own code, distinct from the `leg(s) diverged` 1 below,
     # so this leg also carries the failing mutation for that distinction:
     # reverting the gate to `exit 1` reds here.
+    #
+    # The mark is read from the ambient environment, so an inherited
+    # EXPRESSION_BUDGET_SELFTEST_NESTED=1 silently drops this leg (`21 legs
+    # passed`, rc=0). Left as-is deliberately (BLO-39230 item 2): it is not a
+    # false green -- the leg count visibly changes -- and the only fix that
+    # actually closes it is moving the mark out of the environment into argv,
+    # where an outer shell cannot reach it. That means touching the argv
+    # parsing shared by all 22 legs and by the byte-identical-default
+    # constraint standing since BLO-38820, which is a poor trade against a
+    # cosmetic read. Revisit only if the mark ever gates something whose
+    # absence is NOT visible in the count.
     if [ -z "${EXPRESSION_BUDGET_SELFTEST_NESTED:-}" ]; then
         legs=$((legs + 1))
+        # Bound the child. The NESTED mark above is the recursion guard and it
+        # is correct, but its FAILURE mode is an unbounded fork chain, not a
+        # red: delete the gate AND force the mark true and every level spawns
+        # another, each holding a `mktemp -d` (measured on this rig: 99 live
+        # processes at 91s, no output). That is worth a bound rather than
+        # tolerating, because CI makes the degenerate case LESS visible than a
+        # plain red -- under `timeout-minutes` a hung job surfaces as
+        # `cancelled`, and `failure()` does not see `cancelled` (BLO-38880).
+        # rc=124 lands in the `!= 3` arm below and reds as [dependency-gate].
+        #
+        # 60s is deliberate order-of-magnitude headroom against an unknown-slow
+        # rig, NOT a fit to a measurement. Be precise about WHAT it bounds: the
+        # child below runs with $stub first on PATH, so its own `import yaml`
+        # probe fails, it trips the dependency gate above and `exit 3`s -- it
+        # never reaches the `mktemp -d` that starts a leg. Measured at this head
+        # on the CephFS-backed tree this runs from, 5 runs: 30/34/34/32/36ms,
+        # rc=3. So on the green path the bound is ~1800x the work and can never
+        # bind. (An earlier version of this comment cited the OUTER 22-leg run,
+        # ~3.4s, and argued headroom from "forks an interpreter over a network
+        # filesystem". Both describe a workload this leg does not run -- the
+        # number was right, its stated basis was not. Caught in review on #72.)
+        #
+        # The bound exists only for the degenerate case, where it is the gate
+        # being disabled that lets the child run legs at all. There is no
+        # measured upper bound on that path -- it is the unbounded chain -- so
+        # 60s is chosen to be far above any plausible green run rather than
+        # fitted to one. Do not shrink it toward the 30ms above: that figure is
+        # the floor of what this leg costs, not a budget to trim against.
+        #
+        # KNOWN RESIDUAL, measured, not an oversight: this bounds the VERDICT,
+        # not the process tree. Under the double mutation the top-level call
+        # returns rc=124 at 60s and reds here, but the orphaned subtree keeps
+        # going -- each nested `timeout` setpgid()s into its OWN process group,
+        # so the parent's SIGTERM cannot reach it, and every new level gets a
+        # fresh 60s. Measured: 116 processes and 90 temp dirs still climbing
+        # 20s AFTER the leg reported. Depth stays ~10; it leaks in time, not
+        # depth. Closing that needs a bound that does not live in the mark the
+        # mutation removes (a depth counter), i.e. another guard with its own
+        # coverage question -- deliberately out of scope here. If you run the
+        # BLO-39230 checklist by hand, reap afterwards:
+        #     pkill -9 -f 'workflow_expression_budget_test[.]sh'
+        #
+        # PORTABILITY: `timeout` is this file's only GNU-coreutils dependency,
+        # so there is no precedent to inherit. The nearest existing miss is
+        # `head -c` at :161 -- not POSIX (POSIX head defines only -n) but
+        # present on BSD, so it costs nothing on macOS. No roster here on
+        # purpose: an inline inventory is the stale-at-birth shape the register
+        # above warns about, and the previous one named `awk`, which this file
+        # never invokes. macOS ships `timeout` as `gtimeout` only, where
+        # this leg reds as [dependency-gate] rc=127. Left as a note, not a
+        # `command -v` preflight: bash's `command not found` goes to fd 2 and
+        # `2>&1` captures it into $out, so the failure already names its own
+        # cause, and CI is Linux. A preflight would be a THIRD guard that no
+        # leg can cover -- precisely what the register above warns against.
         out=$(EXPRESSION_BUDGET_SELFTEST_NESTED=1 PATH="$stub:$PATH" \
-              bash "$tmp/happy/tests/$base" --self-test 2>&1); rc=$?
+              timeout 60 bash "$tmp/happy/tests/$base" --self-test 2>&1); rc=$?
         if [ "$rc" != 3 ] || ! grep -qF -- 'NO LEG WAS RUN' <<<"$out" \
            || ! grep -qF -- "No module named 'yaml' [self-test stub]" <<<"$out"; then
             fails=$((fails + 1))
             printf 'SELF-TEST FAIL [dependency-gate]: want rc=3 containing "NO LEG WAS RUN" and the stub sentinel\n'
-            printf '  got rc=%s:\n' "$rc"; sed 's/^/    /' <<<"$out"
+            printf '  got rc=%s%s:\n' "$rc" \
+                "$([ "$rc" = 124 ] && printf ' (124 = the 60s bound above tripped; the child did not finish)')"
+            sed 's/^/    /' <<<"$out"
         fi
     fi
 
@@ -506,12 +600,20 @@ if not paths:
 #
 # Naming the SET rather than one member: all three are green under mutation in
 # `--self-test`, so a reader who checks only the one member named here would
-# conclude the other two are covered. `job.get('steps') or []` and
-# `step.get('with') or {}` look like the same family and are NOT in it --
-# dropping either fallback reds (`reusable-caller` by name, and `happy`). Those
-# reds are crashes the mutation introduces rather than the pre-mutation
-# behaviour, but that is the point of the idiom: the fallback exists to tolerate
-# the absent key, so removing it is the defect.
+# conclude the other two are covered. They are NOT part of the uncoverable-guard
+# register in the `--self-test` branch (the dependency gate and its `timeout 60`)
+# -- that register is deliberately narrower, and this trio is excluded from it on
+# purpose rather than omitted. The difference is coverability, not coverage: a
+# leg feeding `jobs: {b: {steps: [1]}}` would red `isinstance(step, dict)`, so
+# these are closable whenever someone wants them closed. The register's two
+# admit no such leg.
+#
+# `job.get('steps') or []` and `step.get('with') or {}` look like the same
+# family and are NOT in that set of three -- dropping either fallback reds
+# (`reusable-caller` by name, and `happy`). Those reds are crashes the mutation
+# introduces rather than the pre-mutation behaviour, but that is the point of
+# the idiom: the fallback exists to tolerate the absent key, so removing it is
+# the defect.
 unusable = []
 
 for path in paths:
