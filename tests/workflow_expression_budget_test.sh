@@ -267,10 +267,50 @@ STUB
     # rc=3 is the gate's own code, distinct from the `leg(s) diverged` 1 below,
     # so this leg also carries the failing mutation for that distinction:
     # reverting the gate to `exit 1` reds here.
+    #
+    # The mark is read from the ambient environment, so an inherited
+    # EXPRESSION_BUDGET_SELFTEST_NESTED=1 silently drops this leg (`21 legs
+    # passed`, rc=0). Left as-is deliberately (BLO-39230 item 2): it is not a
+    # false green -- the leg count visibly changes -- and the only fix that
+    # actually closes it is moving the mark out of the environment into argv,
+    # where an outer shell cannot reach it. That means touching the argv
+    # parsing shared by all 22 legs and by the byte-identical-default
+    # constraint standing since BLO-38820, which is a poor trade against a
+    # cosmetic read. Revisit only if the mark ever gates something whose
+    # absence is NOT visible in the count.
     if [ -z "${EXPRESSION_BUDGET_SELFTEST_NESTED:-}" ]; then
         legs=$((legs + 1))
+        # Bound the child. The NESTED mark above is the recursion guard and it
+        # is correct, but its FAILURE mode is an unbounded fork chain, not a
+        # red: delete the gate AND force the mark true and every level spawns
+        # another, each holding a `mktemp -d` (measured on this rig: 99 live
+        # processes at 91s, no output). That is worth a bound rather than
+        # tolerating, because CI makes the degenerate case LESS visible than a
+        # plain red -- under `timeout-minutes` a hung job surfaces as
+        # `cancelled`, and `failure()` does not see `cancelled` (BLO-38880).
+        # rc=124 lands in the `!= 3` arm below and reds as [dependency-gate].
+        #
+        # 60s is ~10x the measured work, NOT a fit to it: green control 6.3s,
+        # single-mutation (`exit 3`->`exit 1`) red 4.5s, both on the
+        # CephFS-backed tree this runs from. Sized for headroom on purpose --
+        # this leg forks a child interpreter over a network filesystem, so a
+        # bound trimmed toward those times would turn a slow rig into a flake,
+        # which is the opposite of the failure it closes. Do not shrink it.
+        #
+        # KNOWN RESIDUAL, measured, not an oversight: this bounds the VERDICT,
+        # not the process tree. Under the double mutation the top-level call
+        # returns rc=124 at 60s and reds here, but the orphaned subtree keeps
+        # going -- each nested `timeout` setpgid()s into its OWN process group,
+        # so the parent's SIGTERM cannot reach it, and every new level gets a
+        # fresh 60s. Measured: 116 processes and 90 temp dirs still climbing
+        # 20s AFTER the leg reported. Depth stays ~10; it leaks in time, not
+        # depth. Closing that needs a bound that does not live in the mark the
+        # mutation removes (a depth counter), i.e. another guard with its own
+        # coverage question -- deliberately out of scope here. If you run the
+        # BLO-39230 checklist by hand, reap afterwards:
+        #     pkill -9 -f 'workflow_expression_budget_test[.]sh'
         out=$(EXPRESSION_BUDGET_SELFTEST_NESTED=1 PATH="$stub:$PATH" \
-              bash "$tmp/happy/tests/$base" --self-test 2>&1); rc=$?
+              timeout 60 bash "$tmp/happy/tests/$base" --self-test 2>&1); rc=$?
         if [ "$rc" != 3 ] || ! grep -qF -- 'NO LEG WAS RUN' <<<"$out" \
            || ! grep -qF -- "No module named 'yaml' [self-test stub]" <<<"$out"; then
             fails=$((fails + 1))
