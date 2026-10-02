@@ -239,6 +239,10 @@ SELFTEST_DEP
     # fixture is not proved to have run, which is this harness's first trap in
     # the one place it was still unguarded. The guard echoes pip's stderr back
     # verbatim under `pip said:`, so a sentinel in it is carried through.
+    # $stub goes FIRST on PATH wherever it is used, so it shadows every command
+    # the child resolves, not just python3 -- including the `timeout` below.
+    # Harmless while python3 is the only file here; if you add a second stub,
+    # check nothing downstream resolves that name through this directory.
     stub=$tmp/stub; mkdir -p "$stub"
     cat >"$stub/python3" <<'STUB'
 #!/bin/sh
@@ -254,9 +258,16 @@ STUB
     # The dependency gate at the top of this branch, which `leg` cannot reach for
     # the same reason as `usage` below: it needs `--self-test` in the child's
     # argv. In CI PyYAML is present, so the gate's condition is always false and
-    # deleting the whole block leaves this self-test green -- the one guard here
-    # with no failing mutation. Run a child self-test under the import-refusing
-    # stub. Assert `NO LEG WAS RUN`, which only the gate emits, and the stub's
+    # deleting the whole block leaves this self-test green. That gate and the
+    # `timeout 60` bound below are the two guards here with no failing mutation,
+    # and they are the complete list -- both bound a path CI never takes, so
+    # neither can be covered from inside this suite. Keep this inventory current:
+    # a third such guard added without being named here is the stale-control
+    # shape the rest of the file is built against. (Measured at this head:
+    # deleting `timeout 60` leaves `22 legs passed`, rc=0.)
+    #
+    # Run a child self-test under the import-refusing stub. Assert
+    # `NO LEG WAS RUN`, which only the gate emits, and the stub's
     # sentinel, which proves the stub is the interpreter it probed: a real
     # PyYAML-less host prints the bare ModuleNotFoundError identically.
     # The child is marked NESTED and skips this leg: with the gate deleted it
@@ -290,12 +301,24 @@ STUB
         # `cancelled`, and `failure()` does not see `cancelled` (BLO-38880).
         # rc=124 lands in the `!= 3` arm below and reds as [dependency-gate].
         #
-        # 60s is ~10x the measured work, NOT a fit to it: green control 6.3s,
-        # single-mutation (`exit 3`->`exit 1`) red 4.5s, both on the
-        # CephFS-backed tree this runs from. Sized for headroom on purpose --
-        # this leg forks a child interpreter over a network filesystem, so a
-        # bound trimmed toward those times would turn a slow rig into a flake,
-        # which is the opposite of the failure it closes. Do not shrink it.
+        # 60s is deliberate order-of-magnitude headroom against an unknown-slow
+        # rig, NOT a fit to a measurement. Be precise about WHAT it bounds: the
+        # child below runs with $stub first on PATH, so its own `import yaml`
+        # probe fails, it trips the dependency gate above and `exit 3`s -- it
+        # never reaches the `mktemp -d` that starts a leg. Measured at this head
+        # on the CephFS-backed tree this runs from, 5 runs: 30/34/34/32/36ms,
+        # rc=3. So on the green path the bound is ~1800x the work and can never
+        # bind. (An earlier version of this comment cited the OUTER 22-leg run,
+        # ~3.4s, and argued headroom from "forks an interpreter over a network
+        # filesystem". Both describe a workload this leg does not run -- the
+        # number was right, its stated basis was not. Caught in review on #72.)
+        #
+        # The bound exists only for the degenerate case, where it is the gate
+        # being disabled that lets the child run legs at all. There is no
+        # measured upper bound on that path -- it is the unbounded chain -- so
+        # 60s is chosen to be far above any plausible green run rather than
+        # fitted to one. Do not shrink it toward the 30ms above: that figure is
+        # the floor of what this leg costs, not a budget to trim against.
         #
         # KNOWN RESIDUAL, measured, not an oversight: this bounds the VERDICT,
         # not the process tree. Under the double mutation the top-level call
@@ -315,7 +338,9 @@ STUB
            || ! grep -qF -- "No module named 'yaml' [self-test stub]" <<<"$out"; then
             fails=$((fails + 1))
             printf 'SELF-TEST FAIL [dependency-gate]: want rc=3 containing "NO LEG WAS RUN" and the stub sentinel\n'
-            printf '  got rc=%s:\n' "$rc"; sed 's/^/    /' <<<"$out"
+            printf '  got rc=%s%s:\n' "$rc" \
+                "$([ "$rc" = 124 ] && printf ' (124 = the 60s bound above tripped; the child did not finish)')"
+            sed 's/^/    /' <<<"$out"
         fi
     fi
 
