@@ -71,6 +71,43 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 #     unconditional -- empty stdin yields a 0-byte file, it cannot skip -- and
 #     the leg asserts that byte count rather than trusting the construction.
 if [ "${1:-}" = --self-test ]; then
+    # DEPENDENCY GATE (BLO-39023). 19 of the 21 legs below run this script as a
+    # child against a fixture repo, so on an interpreter without PyYAML every one
+    # of them dies in the bootstrap guard at the bottom of this file and the leg
+    # dumps that guard's 33-line verdict: 666 lines, 19 reported divergences, one
+    # missing import. Probe once, here, and say it once.
+    #
+    # Three options were weighed; this is the third.
+    #   * Hoist the whole bootstrap guard above this dispatch. Rejected: that
+    #     guard runs `python3 -m pip install pyyaml`, so --self-test would MUTATE
+    #     the host interpreter. That is exactly what silently healed this rig
+    #     mid-investigation on BLO-38880 and left a stale "PyYAML is not
+    #     importable here" note reading as current. A test mode must not repair
+    #     the condition it reports on.
+    #   * Probe and warn without exiting. Rejected: keeps all 21 legs, but still
+    #     emits the 666 lines this exists to suppress -- it fails the one
+    #     requirement while costing nothing else.
+    #   * Probe read-only and exit, below.
+    #
+    # THE COST, STATED: this gives up the only two legs that do NOT need PyYAML
+    # and are therefore the only two that still ran on such a host --
+    # `bootstrap`, which fakes the failure with a PATH stub rather than the real
+    # interpreter, and `usage`, which returns at the argv branch above the guard.
+    # Accepted: a 2-of-21 run is not a verdict worth acting on, and both legs run
+    # in CI, where PyYAML is present (BLO-38861).
+    if ! dep_said=$(python3 -c 'import yaml' 2>&1); then
+        cat >&2 <<'SELFTEST_DEP'
+FAIL: --self-test -- PyYAML is not importable by this interpreter. 19 of the 21
+      legs run this script as a child, so they would all fail in the bootstrap
+      guard and report a single missing import as 19 diverged legs.
+      NO LEG WAS RUN. This is a dependency failure, not a self-test verdict.
+      Fix: run the self-test from a venv --
+        v=$(mktemp -d) && python3 -m venv "$v" && "$v"/bin/pip -q install pyyaml
+        PATH="$v/bin:$PATH" bash tests/workflow_expression_budget_test.sh --self-test
+SELFTEST_DEP
+        { echo "      import said:"; sed 's/^/        /' <<<"$dep_said"; } >&2
+        exit 1
+    fi
     tmp=$(mktemp -d) || exit 1
     trap 'rm -rf "$tmp"' EXIT
     me=${BASH_SOURCE[0]}; base=$(basename "$me")
