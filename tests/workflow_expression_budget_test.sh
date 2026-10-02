@@ -71,7 +71,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 #     unconditional -- empty stdin yields a 0-byte file, it cannot skip -- and
 #     the leg asserts that byte count rather than trusting the construction.
 if [ "${1:-}" = --self-test ]; then
-    # DEPENDENCY GATE (BLO-39023). 19 of the 21 legs below run this script as a
+    # DEPENDENCY GATE (BLO-39023). 19 of the 22 legs below run this script as a
     # child against a fixture repo, so on an interpreter without PyYAML every one
     # of them dies in the bootstrap guard at the bottom of this file and the leg
     # dumps that guard's 33-line verdict: 666 lines, 19 reported divergences, one
@@ -84,29 +84,43 @@ if [ "${1:-}" = --self-test ]; then
     #     mid-investigation on BLO-38880 and left a stale "PyYAML is not
     #     importable here" note reading as current. A test mode must not repair
     #     the condition it reports on.
-    #   * Probe and warn without exiting. Rejected: keeps all 21 legs, but still
+    #   * Probe and warn without exiting. Rejected: keeps all 22 legs, but still
     #     emits the 666 lines this exists to suppress -- it fails the one
     #     requirement while costing nothing else.
     #   * Probe read-only and exit, below.
     #
-    # THE COST, STATED: this gives up the only two legs that do NOT need PyYAML
-    # and are therefore the only two that still ran on such a host --
+    # THE COST, STATED: this gives up the only three legs that do NOT need PyYAML
+    # and are therefore the only three that still ran on such a host --
     # `bootstrap`, which fakes the failure with a PATH stub rather than the real
-    # interpreter, and `usage`, which returns at the argv branch above the guard.
-    # Accepted: a 2-of-21 run is not a verdict worth acting on, and both legs run
+    # interpreter; `usage`, which returns at the argv branch above the guard; and
+    # `dependency-gate`, which covers this block and runs under that same stub.
+    # Accepted: a 3-of-22 run is not a verdict worth acting on, and all three run
     # in CI, where PyYAML is present (BLO-38861).
+    #
+    # The headline names the PROBE, not PyYAML: an absent python3 lands in this
+    # same branch, with `command not found` under `import said:` and a venv
+    # remedy that cannot run either. One probe and one headline true of both --
+    # a second branch for the absent-interpreter case would be another guard
+    # with no failing mutation, which is the defect this block is answering.
     if ! dep_said=$(python3 -c 'import yaml' 2>&1); then
         cat >&2 <<'SELFTEST_DEP'
-FAIL: --self-test -- PyYAML is not importable by this interpreter. 19 of the 21
+FAIL: --self-test -- `python3 -c 'import yaml'` failed here: no PyYAML, or no
+      python3 at all. `import said:` below carries the real cause. 19 of the 22
       legs run this script as a child, so they would all fail in the bootstrap
       guard and report a single missing import as 19 diverged legs.
       NO LEG WAS RUN. This is a dependency failure, not a self-test verdict.
-      Fix: run the self-test from a venv --
+      Fix: run the self-test from a venv (installing python3 first if that is
+      what is missing) --
         v=$(mktemp -d) && python3 -m venv "$v" && "$v"/bin/pip -q install pyyaml
         PATH="$v/bin:$PATH" bash tests/workflow_expression_budget_test.sh --self-test
 SELFTEST_DEP
         { echo "      import said:"; sed 's/^/        /' <<<"$dep_said"; } >&2
-        exit 1
+        # rc=3, not 1: 1 is `$fails of $legs leg(s) diverged` below, and sharing
+        # it makes the one distinction this block exists to draw invisible to
+        # anything reading the status code. Not 2 (that is bad argv), and not
+        # the conventional 77 -- a harness reading 77 as skip-and-pass would
+        # turn a dependency failure green, which is this file's whole subject.
+        exit 3
     fi
     tmp=$(mktemp -d) || exit 1
     trap 'rm -rf "$tmp"' EXIT
@@ -249,14 +263,18 @@ STUB
     # would otherwise run its own copy of this leg, and so on without end. With
     # the mark it runs the other legs under the stub, they diverge, and this
     # leg fails on the missing `NO LEG WAS RUN` instead of hanging.
+    #
+    # rc=3 is the gate's own code, distinct from the `leg(s) diverged` 1 below,
+    # so this leg also carries the failing mutation for that distinction:
+    # reverting the gate to `exit 1` reds here.
     if [ -z "${EXPRESSION_BUDGET_SELFTEST_NESTED:-}" ]; then
         legs=$((legs + 1))
         out=$(EXPRESSION_BUDGET_SELFTEST_NESTED=1 PATH="$stub:$PATH" \
               bash "$tmp/happy/tests/$base" --self-test 2>&1); rc=$?
-        if [ "$rc" != 1 ] || ! grep -qF -- 'NO LEG WAS RUN' <<<"$out" \
+        if [ "$rc" != 3 ] || ! grep -qF -- 'NO LEG WAS RUN' <<<"$out" \
            || ! grep -qF -- "No module named 'yaml' [self-test stub]" <<<"$out"; then
             fails=$((fails + 1))
-            printf 'SELF-TEST FAIL [dependency-gate]: want rc=1 containing "NO LEG WAS RUN" and the stub sentinel\n'
+            printf 'SELF-TEST FAIL [dependency-gate]: want rc=3 containing "NO LEG WAS RUN" and the stub sentinel\n'
             printf '  got rc=%s:\n' "$rc"; sed 's/^/    /' <<<"$out"
         fi
     fi
