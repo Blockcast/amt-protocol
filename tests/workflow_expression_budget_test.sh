@@ -349,9 +349,13 @@ STUB
         # BLO-39230 checklist by hand, reap afterwards:
         #     pkill -9 -f 'workflow_expression_budget_test[.]sh'
         #
-        # PORTABILITY: `timeout` is this file's only GNU-coreutils dependency
-        # (python3/mktemp/grep/sed/awk are all POSIX here, so there is no
-        # precedent to inherit). Stock macOS ships it as `gtimeout` only, where
+        # PORTABILITY: `timeout` is this file's only GNU-coreutils dependency,
+        # so there is no precedent to inherit. The nearest existing miss is
+        # `head -c` at :161 -- not POSIX (POSIX head defines only -n) but
+        # present on BSD, so it costs nothing on macOS. No roster here on
+        # purpose: an inline inventory is the stale-at-birth shape the register
+        # above warns about, and the previous one named `awk`, which this file
+        # never invokes. macOS ships `timeout` as `gtimeout` only, where
         # this leg reds as [dependency-gate] rc=127. Left as a note, not a
         # `command -v` preflight: bash's `command not found` goes to fd 2 and
         # `2>&1` captures it into $out, so the failure already names its own
@@ -603,12 +607,13 @@ if not paths:
 # leg feeding `jobs: {b: {steps: [1]}}` would red `isinstance(step, dict)`, so
 # these are closable whenever someone wants them closed. The register's two
 # admit no such leg.
-# `job.get('steps') or []` and
-# `step.get('with') or {}` look like the same family and are NOT in it --
-# dropping either fallback reds (`reusable-caller` by name, and `happy`). Those
-# reds are crashes the mutation introduces rather than the pre-mutation
-# behaviour, but that is the point of the idiom: the fallback exists to tolerate
-# the absent key, so removing it is the defect.
+#
+# `job.get('steps') or []` and `step.get('with') or {}` look like the same
+# family and are NOT in that set of three -- dropping either fallback reds
+# (`reusable-caller` by name, and `happy`). Those reds are crashes the mutation
+# introduces rather than the pre-mutation behaviour, but that is the point of
+# the idiom: the fallback exists to tolerate the absent key, so removing it is
+# the defect.
 unusable = []
 
 for path in paths:
