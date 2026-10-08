@@ -51,6 +51,15 @@ jobs:
   fuzz:
     name: libFuzzer (bounded)
     runs-on: ubuntu-latest
+    # `cargo fuzz` needs nightly, and `dtolnay/rust-toolchain@nightly` below only
+    # gets it there via `rustup default nightly`. rust-toolchain.toml (BLO-41503)
+    # outranks `rustup default`, so without this every cargo call in this job
+    # would silently run on the pinned stable and cargo-fuzz would fail.
+    # RUSTUP_TOOLCHAIN in turn outranks rust-toolchain.toml — measured, not
+    # assumed: with a toml present `rustup which cargo` tried to sync the toml's
+    # channel, and `RUSTUP_TOOLCHAIN=stable rustup which cargo` did not.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

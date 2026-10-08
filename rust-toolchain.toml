@@ -1,0 +1,22 @@
+# Pins the rustc/clippy/rustfmt version this repo builds and lints with.
+#
+# Why: `lint (default-wasm|ffi|native)` runs `cargo clippy --all-targets -- -D
+# warnings` and all three became required checks on `main` on 2026-10-07. With a
+# floating `stable`, every new clippy lint shipping in a Rust release makes every
+# open PR unmergeable until someone burns down lints unrelated to their diff — on
+# the crate production go-amt links against. BLO-31600 is the same class on
+# quinn-wasm. See BLO-41503.
+#
+# The trade this accepts: a stale pin lints against an older clippy. That is the
+# right way round — it lints slightly less, it does not block merges.
+#
+# BUMP CADENCE: manually, by whoever next touches this repo's CI, and at minimum
+# whenever a dependency needs a newer rustc. There is no bot and no schedule.
+# A stale pin is not an outage, so nothing here pages anyone.
+#
+# Keep `channel` equal to the `dtolnay/rust-toolchain@<rev>` pins in
+# .github/workflows/ci.yml. That file's `test` job is the drift detector; see the
+# comment there.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
