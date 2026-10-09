@@ -13,7 +13,14 @@
 #      toml in the build context the image's rustup proxy honours the toml over
 #      that pin. publish-amt-verify.yml runs only on push to main, so no PR check
 #      would see the substitution.
-#   3. Every dependency-resolving cargo call in ci.yml passes `--locked`, which
+#   3. The Dockerfile's `FROM rust:<ver>` equals the toml's `channel`, patch
+#      included. That image builds the published amt-verify binary, so without
+#      this the `lint (native)` / `test (native)` jobs are evidence about a
+#      different compiler than the one that ships. Matched case-insensitively
+#      because Docker accepts `from`, and a lowercased line escaping this check
+#      is the subset match the count below cannot see. A non-numeric tag
+#      (`rust:latest`) captures nothing and fails: it is not a pin.
+#   4. Every dependency-resolving cargo call in ci.yml passes `--locked`, which
 #      is what ci.yml's top-level env comment promises. `cargo fmt` resolves no
 #      dependencies and takes no `--locked`, so it is not checked. The optional
 #      leading `- ` matters: a one-line `- run: cargo build` step is the commonest
@@ -48,6 +55,18 @@ if ! grep -qxF 'rust-toolchain.toml' .dockerignore; then
   fail=1
 fi
 
+froms=0
+while IFS= read -r hit; do
+  froms=$((froms + 1))
+  ver=$(printf '%s' "${hit#*:}" | tr 'A-Z' 'a-z' \
+    | sed -n 's/.*from[[:space:]]\{1,\}rust:\([0-9][0-9.]*\).*/\1/p')
+  if [ "$ver" != "$channel" ]; then
+    echo "FAIL: Dockerfile:${hit%%:*} builds amt-verify with rust:${ver:-<non-numeric tag>}; rust-toolchain.toml channel is $channel"
+    fail=1
+  fi
+done < <(grep -niE '^[[:space:]]*FROM[[:space:]]+rust:' Dockerfile)
+[ "$froms" -gt 0 ] || { echo "FAIL: matched no FROM rust: pins in Dockerfile"; fail=1; }
+
 calls=0
 while IFS= read -r hit; do
   calls=$((calls + 1))
@@ -58,6 +77,6 @@ while IFS= read -r hit; do
 done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?cargo[[:space:]]+(build|check|clippy|test|run|doc|fetch|install)([[:space:]]|$)' .github/workflows/ci.yml)
 [ "$calls" -gt 0 ] || { echo "FAIL: matched no cargo calls in ci.yml"; fail=1; }
 
-echo "checked ${pins} toolchain pins against channel ${channel}, ${calls} ci.yml cargo calls"
+echo "checked ${pins} toolchain pins and ${froms} Dockerfile FROM rust: pins against channel ${channel}, ${calls} ci.yml cargo calls"
 [ "$fail" -eq 0 ] && echo PASS
 exit "$fail"
