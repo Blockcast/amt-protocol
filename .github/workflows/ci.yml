@@ -34,7 +34,8 @@ env:
   # dependency-resolving cargo invocation here passes `--locked` (`cargo fmt`
   # resolves none), so dep versions do not float either — both of this comment's
   # original premises are obsolete (BLO-41503). tests/toolchain_pin_test.sh holds
-  # the `--locked` claim and the toolchain pins below.
+  # the `--locked` claim and the toolchain pins below, as a step of the required
+  # `lint (native)` check, so a red verdict blocks the merge.
   #
   # The remaining float was the toolchain itself, which rust-toolchain.toml now
   # pins: a new clippy lint arrives when someone bumps that pin, not on the day
@@ -57,6 +58,17 @@ jobs:
             flags: --no-default-features --features native
     steps:
       - uses: actions/checkout@v4
+
+      # BLO-41503. Static: every rust-toolchain pin equals rust-toolchain.toml,
+      # the Docker build context excludes that toml, and ci.yml's cargo calls
+      # pass --locked. It is the sole enforcement of all three, so it lives in a
+      # required check: in `probe-verdict` (not required) a red verdict stayed
+      # mergeable. One leg only -- it is static, the other two would repeat the
+      # answer. Before the toolchain install, so a pin mismatch is reported even
+      # when that install fails. The script also holds this placement.
+      - name: tests/toolchain_pin_test.sh
+        if: matrix.id == 'native'
+        run: bash tests/toolchain_pin_test.sh
 
       # Version-pinned, not `@stable`, and kept equal to rust-toolchain.toml's
       # `channel` — see that file for why and for the bump cadence.
@@ -85,7 +97,10 @@ jobs:
   # The vantage probe's verdict is shell inside a workflow, so no cargo target
   # covers it -- and it has already shipped two verdict bugs (exiting with
   # tunnel 1's status; renaming the TUNNELS=1 artifacts). New job rather than a
-  # step on `lint`, whose matrix would run it three times for one answer.
+  # step on `lint`, whose matrix would run it three times for one answer. This
+  # job is NOT a required check, so its steps are advisory; a guard that must
+  # block merges belongs on `lint` behind a one-leg `if:`, as
+  # tests/toolchain_pin_test.sh does.
   probe-verdict:
     name: probe verdict logic
     runs-on: ubuntu-latest
@@ -127,11 +142,6 @@ jobs:
       # mutation; run it in the same job so a guard cannot be removed silently.
       - name: tests/workflow_expression_budget_test.sh --self-test
         run: bash tests/workflow_expression_budget_test.sh --self-test
-      # BLO-41503. Static: every rust-toolchain pin equals rust-toolchain.toml,
-      # the Docker build context excludes that toml, and ci.yml's cargo calls
-      # pass --locked. Same job, one checkout.
-      - name: tests/toolchain_pin_test.sh
-        run: bash tests/toolchain_pin_test.sh
 
   test:
     # Keep these job names stable — they are the required-check names in branch
