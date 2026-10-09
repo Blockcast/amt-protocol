@@ -1,0 +1,32 @@
+# Pins the rustc/clippy/rustfmt version this repo builds and lints with.
+#
+# Why: `lint (default-wasm|ffi|native)` runs `cargo clippy --all-targets -- -D
+# warnings` and all three became required checks on `main` on 2026-10-07. With a
+# floating `stable`, every new clippy lint shipping in a Rust release makes every
+# open PR unmergeable until someone burns down lints unrelated to their diff — on
+# the crate production go-amt links against. BLO-31600 is the same class on
+# quinn-wasm. See BLO-41503.
+#
+# The trade this accepts: a stale pin lints against an older clippy. That is the
+# right way round — it lints slightly less, it does not block merges.
+#
+# BUMP CADENCE: manually, by whoever next touches this repo's CI, and at minimum
+# whenever a dependency needs a newer rustc. There is no bot and no schedule.
+# A stale pin is not an outage, so nothing here pages anyone.
+#
+# PINNED 2026-10-08 — rustc 1.99.0 (b940084d7 2026-09-28). Update this line when
+# you move `channel`, so staleness is readable without a `git log`.
+#
+# Keep `channel` equal to every `dtolnay/rust-toolchain@<rev>` pin in
+# .github/workflows/ (the driad-parser fuzz job's `@nightly` excepted: it selects
+# nightly with RUSTUP_TOOLCHAIN, which outranks this file).
+# tests/toolchain_pin_test.sh fails on any other rev; ci.yml's `test` job is the
+# runtime drift detector (see the comment there).
+#
+# The Dockerfile's `FROM rust:<ver>` is a THIRD, deliberately separate pin: it
+# builds the published amt-verify binary. .dockerignore keeps this file out of
+# the image build context so it cannot override that pin. Bump the Dockerfile on
+# its own, as a production change.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

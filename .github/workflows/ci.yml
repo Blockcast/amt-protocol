@@ -24,11 +24,22 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # Deliberately no `RUSTFLAGS: -D warnings`: RUSTFLAGS also applies to
-  # dependencies, and Cargo.lock is gitignored here, so dep versions float on
-  # every run. One upstream release with a deprecation warning would turn this
-  # required check red for reasons unrelated to the PR. Deny-warnings belongs
-  # with `cargo clippy`, which lints only the local crate — see BLO-29411 for
-  # why that is deferred rather than landed here.
+  # dependencies, so one upstream release carrying a deprecation warning would
+  # turn these required checks red for reasons unrelated to the PR. Deny-warnings
+  # belongs with `cargo clippy`, which lints only the local crate.
+  #
+  # That is no longer deferred: it landed in BLO-29424, the `lint` job below runs
+  # both `cargo fmt --check` and `cargo clippy -D warnings`, and all three `lint`
+  # legs are required checks on `main`. Cargo.lock is also committed now and every
+  # dependency-resolving cargo invocation here passes `--locked` (`cargo fmt`
+  # resolves none), so dep versions do not float either — both of this comment's
+  # original premises are obsolete (BLO-41503). tests/toolchain_pin_test.sh holds
+  # the `--locked` claim and the toolchain pins below, as a step of the required
+  # `lint (native)` check, so a red verdict blocks the merge.
+  #
+  # The remaining float was the toolchain itself, which rust-toolchain.toml now
+  # pins: a new clippy lint arrives when someone bumps that pin, not on the day
+  # Rust releases.
 
 jobs:
   lint:
@@ -48,7 +59,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # BLO-41503. Static: every rust-toolchain pin equals rust-toolchain.toml,
+      # the Docker build context excludes that toml, and ci.yml's cargo calls
+      # pass --locked. It is the sole enforcement of all three, so it lives in a
+      # required check: in `probe-verdict` (not required) a red verdict stayed
+      # mergeable. One leg only -- it is static, the other two would repeat the
+      # answer. Before the toolchain install, so a pin mismatch is reported even
+      # when that install fails. The script also holds this placement.
+      - name: tests/toolchain_pin_test.sh
+        if: matrix.id == 'native'
+        run: bash tests/toolchain_pin_test.sh
+
+      # Version-pinned, not `@stable`, and kept equal to rust-toolchain.toml's
+      # `channel` — see that file for why and for the bump cadence.
+      #
+      # `components:` is explicit because this action installs `--profile minimal`,
+      # which carries neither clippy nor rustfmt. Under `@stable` that was masked
+      # by the runner image, which ships a full `stable` toolchain; a version-
+      # pinned rev is a separate rustup toolchain directory and gets no such
+      # windfall, so without this the two steps below fail to find their binaries.
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -65,7 +97,10 @@ jobs:
   # The vantage probe's verdict is shell inside a workflow, so no cargo target
   # covers it -- and it has already shipped two verdict bugs (exiting with
   # tunnel 1's status; renaming the TUNNELS=1 artifacts). New job rather than a
-  # step on `lint`, whose matrix would run it three times for one answer.
+  # step on `lint`, whose matrix would run it three times for one answer. This
+  # job is NOT a required check, so its steps are advisory; a guard that must
+  # block merges belongs on `lint` behind a one-leg `if:`, as
+  # tests/toolchain_pin_test.sh does.
   probe-verdict:
     name: probe verdict logic
     runs-on: ubuntu-latest
@@ -141,8 +176,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
+          # Version-pinned and kept equal to rust-toolchain.toml's `channel` — see
+          # the lint job above. This leg is also the drift detector for that pair:
+          # `targets:` installs wasm32 for THIS rev, while the cargo calls below
+          # resolve the toml, so if the two ever disagree the wasm32 build fails
+          # loudly on a required check instead of rotting quietly.
+          #
           # Installed as part of the pinned toolchain resolution rather than via a
           # `rustup target add` run step, so rust-cache below sees it and the wasm
           # leg drops a network call from its critical path. Empty on the other two
@@ -162,7 +203,7 @@ jobs:
       - name: cargo test (library target) + non-zero count assertion
         run: |
           set -euo pipefail
-          cargo test ${{ matrix.flags }} --lib 2>&1 | tee lib-test.log
+          cargo test ${{ matrix.flags }} --lib --locked 2>&1 | tee lib-test.log
 
           passed="$(sed -n 's/^test result: ok\. \([0-9]\{1,\}\) passed.*/\1/p' lib-test.log | head -1)"
           passed="${passed:-0}"
@@ -204,8 +245,8 @@ jobs:
       - name: cargo test (integration targets + doc-tests)
         run: |
           set -euo pipefail
-          cargo test ${{ matrix.flags }} --test '*' 2>&1 | tee int-test.log
-          cargo test ${{ matrix.flags }} --doc
+          cargo test ${{ matrix.flags }} --test '*' --locked 2>&1 | tee int-test.log
+          cargo test ${{ matrix.flags }} --doc --locked
 
           # Anti-vacuity gate for the native leg, mirroring the library gate above.
           # On the default and ffi legs a zero here is CORRECT — all four tests/*.rs
@@ -243,7 +284,7 @@ jobs:
         if: matrix.id == 'default-wasm'
         run: |
           set -euo pipefail
-          cargo build --release --target wasm32-unknown-unknown --features wasm
+          cargo build --release --target wasm32-unknown-unknown --features wasm --locked
           wasm=target/wasm32-unknown-unknown/release/amt_protocol.wasm
           test -f "$wasm" || { echo "::error::$wasm missing — wasm-bindgen consumes this in \`make wasm\`."; exit 1; }
           ls -l "$wasm"
@@ -255,7 +296,7 @@ jobs:
         if: matrix.id == 'ffi'
         run: |
           set -euo pipefail
-          cargo build --release --features ffi --no-default-features
+          cargo build --release --features ffi --no-default-features --locked
           for lib in target/release/libamt_protocol.a target/release/libamt_protocol.so; do
             test -f "$lib" || { echo "::error::$lib missing — CGO consumers link this."; exit 1; }
             ls -l "$lib"
@@ -266,4 +307,4 @@ jobs:
       # uncompiled until an Android NDK build.
       - name: cargo check (JNI selection)
         if: matrix.id == 'ffi'
-        run: cargo check --no-default-features --features jni
+        run: cargo check --no-default-features --features jni --locked
