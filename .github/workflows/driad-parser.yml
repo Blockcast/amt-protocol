@@ -29,7 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Kept equal to rust-toolchain.toml's `channel`, which would silently
+      # outrank a floating `@stable` here anyway (BLO-41503).
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
 
       # Covers the whole crate, including the 25 in-module driad.rs unit tests.

@@ -2,3 +2,8 @@ target
 .git
 .context
 graphify-out
+# The Dockerfile pins its own compiler (`FROM rust:<ver>`) for the published
+# amt-verify binary. In the build context, rust-toolchain.toml would outrank that
+# pin through the image's rustup proxy. This is a separate pin on purpose -- bump
+# it deliberately, it ships to production. Held by tests/toolchain_pin_test.sh.
+rust-toolchain.toml

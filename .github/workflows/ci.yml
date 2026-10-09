@@ -31,8 +31,10 @@ env:
   # That is no longer deferred: it landed in BLO-29424, the `lint` job below runs
   # both `cargo fmt --check` and `cargo clippy -D warnings`, and all three `lint`
   # legs are required checks on `main`. Cargo.lock is also committed now and every
-  # cargo invocation here passes `--locked`, so dep versions do not float either —
-  # both of this comment's original premises are obsolete (BLO-41503).
+  # dependency-resolving cargo invocation here passes `--locked` (`cargo fmt`
+  # resolves none), so dep versions do not float either — both of this comment's
+  # original premises are obsolete (BLO-41503). tests/toolchain_pin_test.sh holds
+  # the `--locked` claim and the toolchain pins below.
   #
   # The remaining float was the toolchain itself, which rust-toolchain.toml now
   # pins: a new clippy lint arrives when someone bumps that pin, not on the day
@@ -125,6 +127,11 @@ jobs:
       # mutation; run it in the same job so a guard cannot be removed silently.
       - name: tests/workflow_expression_budget_test.sh --self-test
         run: bash tests/workflow_expression_budget_test.sh --self-test
+      # BLO-41503. Static: every rust-toolchain pin equals rust-toolchain.toml,
+      # the Docker build context excludes that toml, and ci.yml's cargo calls
+      # pass --locked. Same job, one checkout.
+      - name: tests/toolchain_pin_test.sh
+        run: bash tests/toolchain_pin_test.sh
 
   test:
     # Keep these job names stable — they are the required-check names in branch
@@ -186,7 +193,7 @@ jobs:
       - name: cargo test (library target) + non-zero count assertion
         run: |
           set -euo pipefail
-          cargo test ${{ matrix.flags }} --lib 2>&1 | tee lib-test.log
+          cargo test ${{ matrix.flags }} --lib --locked 2>&1 | tee lib-test.log
 
           passed="$(sed -n 's/^test result: ok\. \([0-9]\{1,\}\) passed.*/\1/p' lib-test.log | head -1)"
           passed="${passed:-0}"
@@ -228,8 +235,8 @@ jobs:
       - name: cargo test (integration targets + doc-tests)
         run: |
           set -euo pipefail
-          cargo test ${{ matrix.flags }} --test '*' 2>&1 | tee int-test.log
-          cargo test ${{ matrix.flags }} --doc
+          cargo test ${{ matrix.flags }} --test '*' --locked 2>&1 | tee int-test.log
+          cargo test ${{ matrix.flags }} --doc --locked
 
           # Anti-vacuity gate for the native leg, mirroring the library gate above.
           # On the default and ffi legs a zero here is CORRECT — all four tests/*.rs
@@ -267,7 +274,7 @@ jobs:
         if: matrix.id == 'default-wasm'
         run: |
           set -euo pipefail
-          cargo build --release --target wasm32-unknown-unknown --features wasm
+          cargo build --release --target wasm32-unknown-unknown --features wasm --locked
           wasm=target/wasm32-unknown-unknown/release/amt_protocol.wasm
           test -f "$wasm" || { echo "::error::$wasm missing — wasm-bindgen consumes this in \`make wasm\`."; exit 1; }
           ls -l "$wasm"
@@ -279,7 +286,7 @@ jobs:
         if: matrix.id == 'ffi'
         run: |
           set -euo pipefail
-          cargo build --release --features ffi --no-default-features
+          cargo build --release --features ffi --no-default-features --locked
           for lib in target/release/libamt_protocol.a target/release/libamt_protocol.so; do
             test -f "$lib" || { echo "::error::$lib missing — CGO consumers link this."; exit 1; }
             ls -l "$lib"
@@ -290,4 +297,4 @@ jobs:
       # uncompiled until an Android NDK build.
       - name: cargo check (JNI selection)
         if: matrix.id == 'ffi'
-        run: cargo check --no-default-features --features jni
+        run: cargo check --no-default-features --features jni --locked

@@ -14,9 +14,16 @@
 # whenever a dependency needs a newer rustc. There is no bot and no schedule.
 # A stale pin is not an outage, so nothing here pages anyone.
 #
-# Keep `channel` equal to the `dtolnay/rust-toolchain@<rev>` pins in
-# .github/workflows/ci.yml. That file's `test` job is the drift detector; see the
-# comment there.
+# Keep `channel` equal to every `dtolnay/rust-toolchain@<rev>` pin in
+# .github/workflows/ (the driad-parser fuzz job's `@nightly` excepted: it selects
+# nightly with RUSTUP_TOOLCHAIN, which outranks this file).
+# tests/toolchain_pin_test.sh fails on any other rev; ci.yml's `test` job is the
+# runtime drift detector (see the comment there).
+#
+# The Dockerfile's `FROM rust:<ver>` is a THIRD, deliberately separate pin: it
+# builds the published amt-verify binary. .dockerignore keeps this file out of
+# the image build context so it cannot override that pin. Bump the Dockerfile on
+# its own, as a production change.
 [toolchain]
 channel = "1.99.0"
 components = ["clippy", "rustfmt"]
