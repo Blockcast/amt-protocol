@@ -20,6 +20,13 @@
 #      form, and without it that step escapes this check silently -- the count
 #      below still reads 7, because it catches a pattern matching NOTHING, not one
 #      matching a subset.
+#   4. This script runs from ci.yml's `lint` job and from no other job there, and
+#      any `if:` on that step names a leg `lint`'s matrix actually has. `lint
+#      (<id>)` legs are required checks on `main`; `probe verdict logic` is not,
+#      so while this ran there a red verdict stayed mergeable and 1-3 were
+#      advisory. A gate naming a missing leg skips the step on every leg -- green,
+#      enforcing nothing. (A typo'd gate also skips this check itself in CI;
+#      running it anywhere else still catches that.)
 #
 # Prints how many pins and cargo calls it checked, so a pattern that silently
 # matches nothing reads as a failure, not a pass.
@@ -58,6 +65,32 @@ while IFS= read -r hit; do
 done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?cargo[[:space:]]+(build|check|clippy|test|run|doc|fetch|install)([[:space:]]|$)' .github/workflows/ci.yml)
 [ "$calls" -gt 0 ] || { echo "FAIL: matched no cargo calls in ci.yml"; fail=1; }
 
-echo "checked ${pins} toolchain pins against channel ${channel}, ${calls} ci.yml cargo calls"
+# job|gate|gate-names-a-leg-of-that-job, one line per step running this script.
+placements=$(awk '
+  function flush() {
+    if (blk ~ /bash tests\/toolchain_pin_test\.sh/) {
+      ok = "yes"
+      if (gate != "") { ok = "no"; if (match(gate, /'"'"'[^'"'"']*'"'"'/) && index(ids[job] " ", " " substr(gate, RSTART + 1, RLENGTH - 2) " ")) ok = "yes" }
+      print job "|" gate "|" ok
+    }
+    blk = ""; gate = ""
+  }
+  /^[^[:space:]#]/ { flush(); injobs = ($0 ~ /^jobs:/); job = ""; next }
+  !injobs { next }
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { flush(); job = $1; sub(/:$/, "", job); next }
+  /^      - / { flush() }
+  /^          - id:/ { ids[job] = ids[job] " " $3 }
+  /^        if:/ { gate = $0; sub(/^[[:space:]]*if:[[:space:]]*/, "", gate) }
+  { blk = blk "\n" $0 }
+  END { flush() }
+' .github/workflows/ci.yml)
+case "$placements" in
+  *$'\n'*) echo "FAIL: tests/toolchain_pin_test.sh runs from more than one ci.yml step (job|if|gate-ok): $(echo "$placements" | tr '\n' ' ')"; fail=1 ;;
+  lint\|*\|yes) ;;
+  "") echo "FAIL: no ci.yml job runs tests/toolchain_pin_test.sh; run it from the required lint job"; fail=1 ;;
+  *) echo "FAIL: tests/toolchain_pin_test.sh must run once, from ci.yml's lint job (required check), gated to a leg lint's matrix has; found (job|if|gate-ok): $(echo "$placements" | tr '\n' ' ')"; fail=1 ;;
+esac
+
+echo "checked ${pins} toolchain pins against channel ${channel}, ${calls} ci.yml cargo calls, placement ${placements//$'\n'/; }"
 [ "$fail" -eq 0 ] && echo PASS
 exit "$fail"
