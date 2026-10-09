@@ -14,6 +14,9 @@
 # whenever a dependency needs a newer rustc. There is no bot and no schedule.
 # A stale pin is not an outage, so nothing here pages anyone.
 #
+# PINNED 2026-10-08 — rustc 1.99.0 (b940084d7 2026-09-28). Update this line when
+# you move `channel`, so staleness is readable without a `git log`.
+#
 # Keep `channel` equal to every `dtolnay/rust-toolchain@<rev>` pin in
 # .github/workflows/ (the driad-parser fuzz job's `@nightly` excepted: it selects
 # nightly with RUSTUP_TOOLCHAIN, which outranks this file).

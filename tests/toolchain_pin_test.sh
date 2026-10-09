@@ -15,7 +15,11 @@
 #      would see the substitution.
 #   3. Every dependency-resolving cargo call in ci.yml passes `--locked`, which
 #      is what ci.yml's top-level env comment promises. `cargo fmt` resolves no
-#      dependencies and takes no `--locked`, so it is not checked.
+#      dependencies and takes no `--locked`, so it is not checked. The optional
+#      leading `- ` matters: a one-line `- run: cargo build` step is the commonest
+#      form, and without it that step escapes this check silently -- the count
+#      below still reads 7, because it catches a pattern matching NOTHING, not one
+#      matching a subset.
 #
 # Prints how many pins and cargo calls it checked, so a pattern that silently
 # matches nothing reads as a failure, not a pass.
@@ -51,7 +55,7 @@ while IFS= read -r hit; do
     *--locked*) ;;
     *) echo "FAIL: .github/workflows/ci.yml:${hit%%:*} cargo call lacks --locked"; fail=1 ;;
   esac
-done < <(grep -nE '^[[:space:]]*(run:[[:space:]]*)?cargo[[:space:]]+(build|check|clippy|test|run|doc|fetch|install)([[:space:]]|$)' .github/workflows/ci.yml)
+done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?cargo[[:space:]]+(build|check|clippy|test|run|doc|fetch|install)([[:space:]]|$)' .github/workflows/ci.yml)
 [ "$calls" -gt 0 ] || { echo "FAIL: matched no cargo calls in ci.yml"; fail=1; }
 
 echo "checked ${pins} toolchain pins against channel ${channel}, ${calls} ci.yml cargo calls"
