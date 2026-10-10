@@ -23,10 +23,14 @@
 # tests/toolchain_pin_test.sh fails on any other rev; ci.yml's `test` job is the
 # runtime drift detector (see the comment there).
 #
-# The Dockerfile's `FROM rust:<ver>` is a THIRD, deliberately separate pin: it
-# builds the published amt-verify binary. .dockerignore keeps this file out of
-# the image build context so it cannot override that pin. Bump the Dockerfile on
-# its own, as a production change.
+# The Dockerfile's `FROM rust:<ver>` builds the published amt-verify binary and
+# must equal `channel` exactly, patch included -- tests/toolchain_pin_test.sh
+# fails otherwise. So moving `channel` is also a production change: bump the
+# Dockerfile in the same PR, or the test reds. That is the point -- the image
+# has no pre-merge build of its own, so its only protection is being compiled by
+# the rustc the `native` CI lanes already use. .dockerignore still keeps this
+# file out of the image build context, so the image's compiler comes from its
+# own FROM line rather than from a copied-in file. BLO-42208.
 [toolchain]
 channel = "1.99.0"
 components = ["clippy", "rustfmt"]

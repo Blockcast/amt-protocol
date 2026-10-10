@@ -4,6 +4,9 @@ target
 graphify-out
 # The Dockerfile pins its own compiler (`FROM rust:<ver>`) for the published
 # amt-verify binary. In the build context, rust-toolchain.toml would outrank that
-# pin through the image's rustup proxy. This is a separate pin on purpose -- bump
-# it deliberately, it ships to production. Held by tests/toolchain_pin_test.sh.
+# pin through the image's rustup proxy, so the image would be built by a compiler
+# its own Dockerfile does not name. The two versions are held EQUAL by
+# tests/toolchain_pin_test.sh (BLO-42208); this exclusion is what makes that
+# equality the reason the image is on that compiler, rather than a coincidence
+# that would survive the Dockerfile being bumped.
 rust-toolchain.toml
