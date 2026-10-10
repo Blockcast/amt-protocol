@@ -14,6 +14,7 @@
 //! - DNS wire-format query packet building (RFC 1035)
 //! - DNS wire-format response parsing for TYPE260 AMTRELAY records
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -186,22 +187,77 @@ impl DriadResolver {
         Self::select_amtrelay(data, Some(&expect))
     }
 
+    /// Every acceptable AMTRELAY relay at the lowest precedence present, in wire
+    /// order. [`parse_dns_response`] returns one of these chosen at random
+    /// (RFC 8777 §3.1.2); a caller that wants to fail over can walk the set.
+    /// Empty when the response is rejected or carries no usable record.
+    ///
+    /// [`parse_dns_response`]: DriadResolver::parse_dns_response
+    pub fn parse_dns_response_candidates(data: &[u8]) -> Vec<DriadRelayAddress> {
+        Self::lowest_precedence_set(data, None).unwrap_or_default()
+    }
+
+    /// Query-bound variant of [`parse_dns_response_candidates`].
+    ///
+    /// [`parse_dns_response_candidates`]: DriadResolver::parse_dns_response_candidates
+    pub fn parse_dns_response_candidates_validated(
+        query: &[u8],
+        data: &[u8],
+    ) -> Vec<DriadRelayAddress> {
+        DnsQuestionRef::from_query(query)
+            .and_then(|expect| Self::lowest_precedence_set(data, Some(&expect)))
+            .unwrap_or_default()
+    }
+
     /// Collect every acceptable AMTRELAY answer, then pick by precedence.
     fn select_amtrelay(data: &[u8], expect: Option<&DnsQuestionRef>) -> Option<DriadRelayAddress> {
-        let mut best: Option<(u8, DriadRelayAddress)> = None;
+        Self::select_amtrelay_with(data, expect, random_below)
+    }
+
+    /// The lowest precedence wins, and among equal precedence the choice is
+    /// uniformly random. RFC 8777 §3.1.2: a gateway SHOULD choose
+    /// non-deterministically among equal-precedence relays, so that a source
+    /// listing several relays spreads load instead of sending every gateway
+    /// behind one resolver cache to the first record. `below(n)` returns a
+    /// uniform integer in `0..n`.
+    fn select_amtrelay_with(
+        data: &[u8],
+        expect: Option<&DnsQuestionRef>,
+        below: impl FnOnce(u32) -> u32,
+    ) -> Option<DriadRelayAddress> {
+        let mut set = Self::lowest_precedence_set(data, expect)?;
+        if set.is_empty() {
+            return None;
+        }
+        let pick = below(set.len() as u32) as usize;
+        Some(set.swap_remove(pick))
+    }
+
+    /// The acceptable AMTRELAY relays sharing the lowest precedence, in wire
+    /// order, or `None` when the response is rejected.
+    fn lowest_precedence_set(
+        data: &[u8],
+        expect: Option<&DnsQuestionRef>,
+    ) -> Option<Vec<DriadRelayAddress>> {
+        let mut best: Option<u8> = None;
+        let mut set = Vec::new();
         Self::for_each_answer(data, AMTRELAY_TYPE, expect, |rdata| {
             // A record whose RDATA does not decode (unknown relay type, truncated
             // relay field, type 0 "no relay") is skipped, not fatal — RFC 8777
             // §4.2 requires falling through to the next candidate.
             if let Some((precedence, addr)) = Self::parse_amtrelay_record(rdata) {
-                // Strictly-lower precedence wins, so ties keep the first record
-                // in wire order (stable selection).
-                if best.as_ref().is_none_or(|(b, _)| precedence < *b) {
-                    best = Some((precedence, addr));
+                match best.map(|b| precedence.cmp(&b)) {
+                    None | Some(Ordering::Less) => {
+                        best = Some(precedence);
+                        set.clear();
+                        set.push(addr);
+                    }
+                    Some(Ordering::Equal) => set.push(addr),
+                    Some(Ordering::Greater) => {}
                 }
             }
         })?;
-        best.map(|(_, addr)| addr)
+        Some(set)
     }
 
     /// Parse a DNS A record response and extract the first IPv4 address.
@@ -582,6 +638,14 @@ impl DnsName {
     }
 }
 
+/// Uniform integer in `0..n` for the equal-precedence relay choice. The modulo
+/// bias is below n/2^32, negligible at relay-list sizes.
+fn random_below(n: u32) -> u32 {
+    let mut buf = [0u8; 4];
+    getrandom::getrandom(&mut buf).expect("getrandom for DRIAD relay choice");
+    u32::from_le_bytes(buf) % n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +760,67 @@ mod tests {
         offset += 2;
         // QCLASS = 1 (IN)
         assert_eq!(u16::from_be_bytes([packet[offset], packet[offset + 1]]), 1);
+    }
+
+    /// A DRIAD response for `source` carrying one IPv4 AMTRELAY answer per
+    /// `(precedence, relay)`, in the given wire order.
+    fn amtrelay_v4_response(source: IpAddr, answers: &[(u8, [u8; 4])]) -> Vec<u8> {
+        let mut response = DriadResolver::build_dns_query(source, 0xABCD);
+        response[2] = 0x81; // QR=1, RD=1
+        response[3] = 0x80; // RA=1
+        response[6..8].copy_from_slice(&(answers.len() as u16).to_be_bytes());
+        for (precedence, relay) in answers {
+            response.extend_from_slice(&[0xC0, 0x0C]); // owner: pointer to QNAME
+            response.extend_from_slice(&260u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&300u32.to_be_bytes());
+            response.extend_from_slice(&6u16.to_be_bytes());
+            response.push(*precedence);
+            response.push(0x01); // D=0, type=1 (IPv4)
+            response.extend_from_slice(relay);
+        }
+        response
+    }
+
+    #[test]
+    fn equal_precedence_choice_is_driven_by_the_random_draw() {
+        // RFC 8777 §3.1.2: lowest precedence first, then a non-deterministic choice
+        // among equal precedence. The draw indexes the tied set in wire order, and
+        // the lower-precedence relay wins regardless of wire position or draw.
+        let source: IpAddr = "69.25.95.192".parse().unwrap();
+        let response = amtrelay_v4_response(
+            source,
+            &[
+                (20, [192, 0, 2, 9]),
+                (10, [192, 0, 2, 1]),
+                (10, [192, 0, 2, 2]),
+                (10, [192, 0, 2, 3]),
+            ],
+        );
+        let v4 = |d| {
+            Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+                192, 0, 2, d,
+            ))))
+        };
+        assert_eq!(
+            DriadResolver::select_amtrelay_with(&response, None, |_| 0),
+            v4(1)
+        );
+        assert_eq!(
+            DriadResolver::select_amtrelay_with(&response, None, |n| n - 1),
+            v4(3)
+        );
+        assert_eq!(
+            DriadResolver::parse_dns_response_candidates(&response),
+            vec![v4(1).unwrap(), v4(2).unwrap(), v4(3).unwrap()]
+        );
+
+        let backup_first =
+            amtrelay_v4_response(source, &[(20, [192, 0, 2, 9]), (10, [192, 0, 2, 1])]);
+        assert_eq!(
+            DriadResolver::select_amtrelay_with(&backup_first, None, |_| 0),
+            v4(1)
+        );
     }
 
     #[test]

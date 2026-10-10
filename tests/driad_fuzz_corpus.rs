@@ -135,32 +135,51 @@ fn parsers_are_total_on_mutated_corpus() {
         let seed = &seeds[rng.below(seeds.len())];
         let input = mutate(&mut rng, seed);
 
+        // The relay choice among equal precedence is random (RFC 8777 §3.1.2), so the
+        // properties below are stated on the deterministic candidate set.
+        let candidates = DriadResolver::parse_dns_response_candidates(&input);
         let unvalidated = DriadResolver::parse_dns_response(&input);
         let _ = DriadResolver::parse_dns_a_response(&input);
         let _ = DriadResolver::parse_dns_aaaa_response(&input);
+        assert_eq!(
+            unvalidated.is_some(),
+            !candidates.is_empty(),
+            "parse_dns_response and its candidate set disagree on acceptance; input = {input:02x?}"
+        );
+        if let Some(u) = &unvalidated {
+            assert!(
+                candidates.contains(u),
+                "selected {u:?} outside the candidate set; input = {input:02x?}"
+            );
+        }
 
         // Mutant as response, against a known-good query.
         let validated = DriadResolver::parse_dns_response_validated(&query, &input);
+        let validated_candidates =
+            DriadResolver::parse_dns_response_candidates_validated(&query, &input);
 
         // The query-bound parser is strictly stricter: it may reject more, but
-        // it must never accept a record the query-less parser did not select.
-        if let Some(v) = validated {
-            assert_eq!(
-                Some(v),
-                unvalidated,
-                "validated accepted a record parse_dns_response did not select; input = {input:02x?}"
+        // it must never accept a record the query-less parser would not select.
+        if let Some(v) = &validated {
+            assert!(
+                candidates.contains(v),
+                "validated accepted a record parse_dns_response would not select; input = {input:02x?}"
             );
         }
+        assert!(
+            validated_candidates.iter().all(|c| candidates.contains(c)),
+            "validated candidates exceed the query-less set; input = {input:02x?}"
+        );
 
         // Mutant as query, against a known-good response — the query side is
         // also attacker-influenced once a type-3 relay name is followed up.
         let _ = DriadResolver::parse_dns_response_validated(&input, seed);
 
-        // Parsing must be a pure function of the bytes.
+        // The candidate set must be a pure function of the bytes.
         assert_eq!(
-            unvalidated,
-            DriadResolver::parse_dns_response(&input),
-            "parse is not deterministic for input = {input:02x?}"
+            candidates,
+            DriadResolver::parse_dns_response_candidates(&input),
+            "candidate set is not deterministic for input = {input:02x?}"
         );
 
         executed += 1;
