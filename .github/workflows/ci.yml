@@ -66,9 +66,15 @@ jobs:
       # mergeable. One leg only -- it is static, the other two would repeat the
       # answer. Before the toolchain install, so a pin mismatch is reported even
       # when that install fails. The script also holds this placement.
-      - name: tests/toolchain_pin_test.sh
+      # `--self-test` runs the failing mutations for check 4 rather than
+      # describing them: a guard whose evidence lives only in a PR body is a
+      # comment (BLO-38880), and check 4 is what that happened to, twice
+      # (BLO-42496). Same step, not a second one -- check 5 holds this script to
+      # exactly one ci.yml step, and it matches on the script path, so a
+      # separate `--self-test` step reads as a second placement and reds.
+      - name: tests/toolchain_pin_test.sh (+ --self-test)
         if: matrix.id == 'native'
-        run: bash tests/toolchain_pin_test.sh
+        run: bash tests/toolchain_pin_test.sh && bash tests/toolchain_pin_test.sh --self-test
 
       # Version-pinned, not `@stable`, and kept equal to rust-toolchain.toml's
       # `channel` — see that file for why and for the bump cadence.

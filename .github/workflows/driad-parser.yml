@@ -36,19 +36,19 @@ jobs:
 
       # Covers the whole crate, including the 25 in-module driad.rs unit tests.
       - name: cargo test (lib)
-        run: cargo test --lib --no-default-features
+        run: cargo test --lib --no-default-features --locked
 
       # Golden wire vectors: IPv4/IPv6/name relays, compression, multi-answer
       # precedence, transaction IDs, questions, answer ownership and class.
       # `fixtures_on_disk_match_generator` fails if a checked-in fixture has
       # drifted from the generator that documents its intent.
       - name: golden DRIAD corpus
-        run: cargo test --test driad_golden --no-default-features
+        run: cargo test --test driad_golden --no-default-features --locked
 
       # Deterministic bounded mutation over the same corpus. Runs on stable so
       # totality is gated on every PR, not only when the nightly fuzz job runs.
       - name: bounded mutation harness
-        run: cargo test --test driad_fuzz_corpus --no-default-features --features fuzzing
+        run: cargo test --test driad_fuzz_corpus --no-default-features --features fuzzing --locked
 
   fuzz:
     name: libFuzzer (bounded)
