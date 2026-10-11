@@ -49,6 +49,19 @@ pub enum TeardownSupport {
     Unsupported,
 }
 
+/// Which port the relay answers a Request at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelPort {
+    /// The Request's own source port: the tunnel is the gateway's endpoint
+    /// (address and port), as RFC 7450 §5.3.3.5 describes.
+    EachRequest,
+    /// The port of the first Request from that gateway address. Upstream Linux
+    /// `drivers/net/amt.c` keys a tunnel by the gateway's address alone and sets
+    /// its `source_port` only when `amt_request_handler` creates it, so every
+    /// later Membership Query goes to that first port.
+    FirstRequest,
+}
+
 pub struct FakeRelay {
     pub addr: SocketAddr,
     pub captured: Arc<Mutex<CapturedTraffic>>,
@@ -143,7 +156,25 @@ impl FakeRelay {
     /// Queries leave the G flag unset and carry no Gateway Address fields.
     #[allow(dead_code)]
     pub fn spawn_without_teardown_support(&self, inner_payload: Vec<u8>) {
-        self.spawn_with(inner_payload, None, TeardownSupport::Unsupported);
+        self.spawn_with(
+            inner_payload,
+            None,
+            TeardownSupport::Unsupported,
+            TunnelPort::EachRequest,
+        );
+    }
+
+    /// As `spawn`, for a relay that keys its tunnel by the gateway's address and
+    /// answers every Request at the port the first one came from, as upstream
+    /// Linux AMT does (see [`TunnelPort::FirstRequest`]).
+    #[allow(dead_code)]
+    pub fn spawn_keyed_by_gateway_address(&self, inner_payload: Vec<u8>) {
+        self.spawn_with(
+            inner_payload,
+            None,
+            TeardownSupport::Supported,
+            TunnelPort::FirstRequest,
+        );
     }
 
     /// As `spawn`, but advertises `advertise` as the relay address instead of
@@ -153,7 +184,12 @@ impl FakeRelay {
     /// socket without SO_BROADCAST. That is the only way to drive the runtime's
     /// fatal-socket-error path from outside the process.
     pub fn spawn_advertising(&self, inner_payload: Vec<u8>, advertise: Option<IpAddr>) {
-        self.spawn_with(inner_payload, advertise, TeardownSupport::Supported);
+        self.spawn_with(
+            inner_payload,
+            advertise,
+            TeardownSupport::Supported,
+            TunnelPort::EachRequest,
+        );
     }
 
     fn spawn_with(
@@ -161,6 +197,7 @@ impl FakeRelay {
         inner_payload: Vec<u8>,
         advertise: Option<IpAddr>,
         teardown: TeardownSupport,
+        tunnel_port: TunnelPort,
     ) {
         let sock = self.sock.clone();
         let captured = self.captured.clone();
@@ -173,6 +210,7 @@ impl FakeRelay {
             // socket concurrently, and a shared nonce means gateway B's
             // Request invalidates gateway A's in-flight Update.
             let mut req_nonce: HashMap<SocketAddr, u32> = HashMap::new();
+            let mut first_port: HashMap<IpAddr, u16> = HashMap::new();
             loop {
                 let (n, src) = match sock.recv_from(&mut buf).await {
                     Ok(v) => v,
@@ -215,15 +253,22 @@ impl FakeRelay {
                         let _ = sock.send_to(&advert.encode(), src).await;
                     }
                     AmtMessage::Request { request_nonce, .. } => {
-                        req_nonce.insert(src, request_nonce);
-                        let observed = gateway_address_fields(src);
+                        let tunnel = match tunnel_port {
+                            TunnelPort::EachRequest => src,
+                            TunnelPort::FirstRequest => SocketAddr::new(
+                                src.ip(),
+                                *first_port.entry(src.ip()).or_insert(src.port()),
+                            ),
+                        };
+                        req_nonce.insert(tunnel, request_nonce);
+                        let observed = gateway_address_fields(tunnel);
                         let query = membership_query(
                             request_nonce,
                             response_mac(&observed, request_nonce),
                             &[0x11; 12],
                             (teardown == TeardownSupport::Supported).then_some(observed),
                         );
-                        let _ = sock.send_to(&query, src).await;
+                        let _ = sock.send_to(&query, tunnel).await;
                     }
                     // An Update is authenticated against the datagram's own
                     // source (§5.3.3.4).

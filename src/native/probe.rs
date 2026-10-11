@@ -4,8 +4,15 @@
 //! receives "a valid Membership Query message" that does not have the L flag
 //! set. The check is the handshake up to that Query: Relay Discovery, Relay
 //! Advertisement, Request, Membership Query. It sends no Membership Update, so
-//! the relay holds no tunnel state for it (RFC 7450 §5.3.3.5), and a relay that
-//! fails it can be passed over for the next candidate.
+//! it joins no group, and a relay that fails it can be passed over for the next
+//! candidate.
+//!
+//! The check runs on the socket the gateway goes on to use. A relay can create
+//! tunnel state on a Request: Linux `drivers/net/amt.c` allocates the tunnel in
+//! `amt_request_handler`, keyed by the gateway's address alone, and upstream
+//! sets the tunnel's port only when it creates it. A gateway that sent its own
+//! Request from another port would have every Membership Query sent to the
+//! check's port instead, and its tunnel would never come up.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -25,19 +32,15 @@ const QUERY_L_FLAG: u8 = 0x02;
 /// full-size IGMP/MLD query fits one UDP datagram.
 const MAX_DATAGRAM: usize = u16::MAX as usize;
 
-/// Run the RFC 8777 §3.2.3 handshake against `relay` (its discovery address).
+/// Run the RFC 8777 §3.2.3 handshake against `relay` (its discovery address)
+/// from `sock`, an unconnected socket of the relay's family that the gateway
+/// keeps if the relay passes (see the module docs).
 ///
 /// Discovery is retried on the gateway's own schedule, so a relay is passed
 /// over only when the gateway itself would have given up on it: each attempt
 /// waits `DISCOVERY_TIMEOUT_MS`, with `MAX_DISCOVERY_RETRIES` retries. The
 /// Request then gets `REQUEST_TIMEOUT_MS`, as in the gateway.
-pub async fn handshake(relay: SocketAddr) -> Result<()> {
-    let bind = if relay.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let sock = UdpSocket::bind(bind).await?;
+pub async fn handshake(sock: &UdpSocket, relay: SocketAddr) -> Result<()> {
     let mut buf = vec![0u8; MAX_DATAGRAM];
 
     let mut advertised = None;
@@ -46,7 +49,7 @@ pub async fn handshake(relay: SocketAddr) -> Result<()> {
         sock.send_to(&AmtMessage::RelayDiscovery { nonce }.encode(), relay)
             .await?;
         let deadline = Instant::now() + Duration::from_millis(DISCOVERY_TIMEOUT_MS);
-        advertised = recv_matching(&sock, &mut buf, deadline, |_, msg| match msg {
+        advertised = recv_matching(sock, &mut buf, deadline, |_, msg| match msg {
             AmtMessage::RelayAdvertisement {
                 nonce: n,
                 relay_address,
@@ -70,7 +73,7 @@ pub async fn handshake(relay: SocketAddr) -> Result<()> {
     };
     sock.send_to(&request.encode(), target).await?;
     let deadline = Instant::now() + Duration::from_millis(REQUEST_TIMEOUT_MS);
-    let limited = recv_matching(&sock, &mut buf, deadline, |raw, msg| match msg {
+    let limited = recv_matching(sock, &mut buf, deadline, |raw, msg| match msg {
         AmtMessage::MembershipQuery {
             request_nonce: n, ..
         } if n == request_nonce => Some(raw[1] & QUERY_L_FLAG != 0),
@@ -155,12 +158,16 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn handshake_accepts_a_query_without_the_l_flag() {
-        handshake(relay(false).await).await.expect("connected");
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        handshake(&sock, relay(false).await)
+            .await
+            .expect("connected");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn handshake_refuses_a_relay_whose_query_sets_the_l_flag() {
-        let err = handshake(relay(true).await).await.unwrap_err();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let err = handshake(&sock, relay(true).await).await.unwrap_err();
         assert!(err.to_string().contains("L flag"), "{err:#}");
     }
 }

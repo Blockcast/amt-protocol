@@ -234,11 +234,13 @@ impl AsyncAmtGatewayBuilder {
     /// Build and spawn the runtime task.
     pub async fn build(self) -> Result<AsyncAmtGateway> {
         let relay = self.relay.ok_or_else(|| anyhow!("relay address not set"))?;
-        let bind = match relay {
-            IpAddr::V4(_) => "0.0.0.0:0",
-            IpAddr::V6(_) => "[::]:0",
-        };
-        let sock = UdpSocket::bind(bind).await?;
+        let sock = UdpSocket::bind(wildcard_for(relay)).await?;
+        Ok(self.spawn_on(relay, sock))
+    }
+
+    /// Spawn the runtime task on `sock`, an unconnected socket of `relay`'s
+    /// family.
+    fn spawn_on(self, relay: IpAddr, sock: UdpSocket) -> AsyncAmtGateway {
         let mut cfg = AmtConfig::new(relay, Some(self.relay_port));
         cfg.keepalive_interval_secs = self.keepalive.as_secs() as u32;
 
@@ -262,7 +264,7 @@ impl AsyncAmtGatewayBuilder {
             self.log_target,
         ));
 
-        Ok(AsyncAmtGateway {
+        AsyncAmtGateway {
             relay,
             cmd_tx,
             data_tx,
@@ -271,7 +273,15 @@ impl AsyncAmtGatewayBuilder {
             fatal,
             keepalives,
             rx_datagrams,
-        })
+        }
+    }
+}
+
+/// The wildcard bind address, any port, in `relay`'s family.
+fn wildcard_for(relay: IpAddr) -> &'static str {
+    match relay {
+        IpAddr::V4(_) => "0.0.0.0:0",
+        IpAddr::V6(_) => "[::]:0",
     }
 }
 
@@ -487,7 +497,8 @@ impl AsyncAmtGatewayBuilderForSource {
             let DriadRelayAddress::Ip(relay) = candidate.relay else {
                 continue;
             };
-            match super::probe::handshake(SocketAddr::new(relay, self.relay_port)).await {
+            let sock = UdpSocket::bind(wildcard_for(relay)).await?;
+            match super::probe::handshake(&sock, SocketAddr::new(relay, self.relay_port)).await {
                 Ok(()) => {
                     tracing::info!(
                         target: "amt",
@@ -496,12 +507,14 @@ impl AsyncAmtGatewayBuilderForSource {
                         candidates = candidates.len(),
                         "DRIAD relay accepted the handshake"
                     );
-                    return AsyncAmtGateway::builder(relay)
+                    // The gateway keeps the socket the check ran on: a relay
+                    // that keys its tunnel by our address answers every later
+                    // Request at the check's port (see `probe`).
+                    return Ok(AsyncAmtGateway::builder(relay)
                         .relay_port(self.relay_port)
                         .keepalive(self.keepalive)
                         .log_target(self.log_target)
-                        .build()
-                        .await;
+                        .spawn_on(relay, sock));
                 }
                 Err(e) => {
                     tracing::warn!(
