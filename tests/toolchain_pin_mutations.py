@@ -28,14 +28,17 @@ ORIGINAL = SCRIPT.read_text()
 
 # (what is being reverted, exact text in the script, what it becomes)
 MUTATIONS = [
-    ("sep class: drop &",       "[[:space:];&|(]",    "[[:space:];|(]"),
-    ("sep class: drop (",       "[[:space:];&|(]",    "[[:space:];&|]"),
-    ("sep class: drop ;",       "[[:space:];&|(]",    "[[:space:]&|(]"),
-    ("sep class: drop |",       "[[:space:];&|(]",    "[[:space:];&(]"),
-    ("sep class: space only",   "[[:space:];&|(]",    "[[:space:]]"),
+    ("sep class: drop (",       "[[:space:](]",       "[[:space:]]"),
     ("verb tail: space or EOL", "([^[:alnum:]_-]|$)", "([[:space:]]|$)"),
     ("verb: no +toolchain",     "(\\+[^[:space:]]+[[:space:]]+)?", ""),
     ("awk: blank from any #",   'sub(/(^|[[:space:]])#.*/, "", l)', 'sub(/#.*/, "", l)'),
+    ("awk: no name: blanking",  'if (l ~ /^[[:space:]]*(-[[:space:]]+)?name:/) l = ""',
+                                 'if (0) l = ""'),
+    ("awk: no segment split",   "k = split(l, seg, /[;&|]+/)", "k = 1; seg[1] = l"),
+    ("awk: no \\ continuation", r'if (l ~ /\\[[:space:]]*$/) { sub(/\\[[:space:]]*$/, "", l); join = l; next }',
+                                 ""),
+    ("verb list: drop test",    "(build|check|clippy|test|run|doc|fetch|install)",
+                                 "(build|check|clippy|run|doc|fetch|install)"),
     ("per-file guard: no [a-z]", "'[[:space:]]cargo[[:space:]][a-z]'",
                                  "'[[:space:]]cargo[[:space:]]'"),
     ("per-file guard: off",     'if [ "$found" -eq 0 ] && printf',

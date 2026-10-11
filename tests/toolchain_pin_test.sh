@@ -39,12 +39,26 @@
 #        - the scan read ci.yml alone while the pin scan above globbed
 #          `*.yml`, which is how driad-parser.yml carried three unlocked
 #          `cargo test` calls. Both now glob `*.y*ml`.
-#      Every separator in the class has its own --self-test leg. One leg
-#      asserting one message cannot tell you the other four still match --
-#      measured, four of five survived being dropped. `=` is deliberately not in
-#      the class: no idiom puts it immediately before `cargo` (in `RUSTFLAGS=x
-#      cargo build` the separator is the space), so it would be an element no
-#      leg could exercise, which is the thing this check is arguing against.
+#        - `--locked` was tested against the whole LINE, and grep yields one hit
+#          per line however many calls it holds, so `cargo build --locked &&
+#          cargo test` passed on the first call's flag and reported the same
+#          count a clean tree does. Each line is now split on ` ; & | ` and
+#          each segment scanned on its own. A `;&|` inside a quoted argument
+#          splits too, which can red a locked call -- loud, and the message
+#          names the line.
+#        - a backslash-continued call was scanned a line at a time, so the
+#          `--locked` on the next line did not count. Continuations are joined
+#          first and reported under the line the call starts on.
+#      The separator class is down to whitespace and `(`, because the segment
+#      split above already consumed ` ; & | ` -- no segment can still contain
+#      one, so keeping them was three elements no leg could exercise. Measured:
+#      with the split in, dropping `&`, `;` or `|` individually left every leg
+#      green. `=` was dropped earlier for the same reason (no idiom puts it
+#      immediately before `cargo` -- in `RUSTFLAGS=x cargo build` the separator
+#      is the space). `(` stays and has its own leg: `(cargo build)` is one
+#      segment, so the paren is still what precedes the verb.
+#      The separator legs are now exercising the split rather than the class,
+#      which is the honest description of what each one covers.
 #      `#` comments and YAML `name:` keys are blanked first: a step named
 #      `- name: cargo test (lib)` is not an invocation and carries no `--locked`.
 #      A `#` opens a comment only at line start or after whitespace, which is
@@ -68,7 +82,12 @@
 # Prints how many pins and cargo calls it checked, so a pattern that silently
 # matches nothing reads as a failure, not a pass.
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
+# Resolved before the cd, or `--self-test` only works when the invocation path
+# is still valid from the repo root: `cd tests && bash toolchain_pin_test.sh
+# --self-test` otherwise cannot copy itself and reds all 17 legs, which is the
+# output that makes a reader doubt the guard rather than the invocation.
+me=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+cd "$(dirname "$me")/.." || exit 2
 
 # `--self-test`: the failing mutations for check 4, in the repo rather than in a
 # PR body. BLO-38880 is the same lesson on the sibling guard, and check 4 is the
@@ -80,7 +99,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 if [ "${1:-}" = --self-test ]; then
     tmp=$(mktemp -d) || exit 1
     trap 'rm -rf "$tmp"' EXIT
-    me=${BASH_SOURCE[0]}; base=$(basename "$me"); legs=0 fails=0
+    base=$(basename "$me"); legs=0 fails=0
 
     # leg <name> <want-rc> <want-text> [--no-cargo] [second-workflow-filename]
     # -- extra workflow yaml is read from stdin and written as the second
@@ -152,6 +171,23 @@ WF
 WF
     leg sep-pipe 1 'driad.yml:1 cargo call lacks --locked' <<'WF'
       - run: true|cargo doc
+WF
+    # Two cargo calls on one line. `grep` yields one hit per LINE, so the
+    # unlocked call hid behind the locked one and the count printed `2` -- the
+    # same number a clean tree prints, because the second call never became a
+    # hit. Pre-fix: PASS.
+    leg multi-call-one-line 1 'driad.yml:1 cargo call lacks --locked' <<'WF'
+      - run: cargo build --locked && cargo test
+WF
+    # A backslash-continued call -- the standard idiom for a long invocation.
+    # Its `--locked` is on the next line, so scanning lines independently reds a
+    # correct call. Loud rather than silent, but it is a hard failure on valid
+    # YAML. Pre-fix: FAIL at :2.
+    leg backslash-continued 0 PASS <<'WF'
+      - run: |
+          cargo test \
+            --locked \
+            --all-features
 WF
     # `cargo +<toolchain> <verb>`: the override sits where the verb was
     # expected. The locked call above it keeps the per-file guard satisfied, so
@@ -258,12 +294,23 @@ for wf in .github/workflows/*.y*ml; do
   # Line-numbered shell view: `#` comments and `name:` keys blanked, so a step
   # title never reads as an invocation. A `#` opens a YAML comment only at line
   # start or after whitespace -- blanking from any `#` at all would delete the
-  # rest of `echo '#frag' && cargo build`. The ": " after the number is
-  # load-bearing -- it supplies the leading separator a column-0 `cargo` would
-  # otherwise lack.
-  shell=$(awk '{ l = $0; sub(/(^|[[:space:]])#.*/, "", l)
-                 if (l ~ /^[[:space:]]*(-[[:space:]]+)?name:/) l = ""
-                 printf "%s: %s\n", NR, l }' "$wf")
+  # rest of `echo '#frag' && cargo build`. Backslash-continued lines are joined
+  # first (reported under the line the call starts on), then each line is split
+  # into shell segments and emitted as its own record: `grep` yields one hit per
+  # LINE however many calls it holds, so `cargo build --locked && cargo test`
+  # used to be one hit that matched `--locked` and passed. The ": " after the
+  # number is load-bearing -- it supplies the leading separator a segment-initial
+  # `cargo` would otherwise lack.
+  shell=$(awk '
+    function emit(n, l,   i, k, seg) { k = split(l, seg, /[;&|]+/)
+                                       for (i = 1; i <= k; i++) printf "%s: %s\n", n, seg[i] }
+    { l = $0; sub(/(^|[[:space:]])#.*/, "", l)
+      if (l ~ /^[[:space:]]*(-[[:space:]]+)?name:/) l = ""
+      if (join != "") { l = join " " l } else { ln = NR }
+      join = ""
+      if (l ~ /\\[[:space:]]*$/) { sub(/\\[[:space:]]*$/, "", l); join = l; next }
+      emit(ln, l) }
+    END { if (join != "") emit(ln, join) }' "$wf")
   found=0
   while IFS= read -r hit; do
     found=$((found + 1))
@@ -272,7 +319,7 @@ for wf in .github/workflows/*.y*ml; do
       *--locked*) ;;
       *) echo "FAIL: ${wf}:${hit%%:*} cargo call lacks --locked"; fail=1 ;;
     esac
-  done < <(printf '%s\n' "$shell" | grep -E '(^|[[:space:];&|(])cargo[[:space:]]+(\+[^[:space:]]+[[:space:]]+)?(build|check|clippy|test|run|doc|fetch|install)([^[:alnum:]_-]|$)')
+  done < <(printf '%s\n' "$shell" | grep -E '(^|[[:space:](])cargo[[:space:]]+(\+[^[:space:]]+[[:space:]]+)?(build|check|clippy|test|run|doc|fetch|install)([^[:alnum:]_-]|$)')
   if [ "$found" -eq 0 ] && printf '%s\n' "$shell" | grep -q '[[:space:]]cargo[[:space:]][a-z]'; then
     echo "FAIL: $wf says cargo but the cargo-call pattern matched nothing in it"
     fail=1
