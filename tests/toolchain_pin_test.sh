@@ -20,24 +20,43 @@
 #      because Docker accepts `from`, and a lowercased line escaping this check
 #      is the subset match the count below cannot see. A non-numeric tag
 #      (`rust:latest`) captures nothing and fails: it is not a pin.
-#   4. Every dependency-resolving cargo call in .github/workflows/*.yml passes
+#   4. Every dependency-resolving cargo call in .github/workflows/*.y*ml passes
 #      `--locked`, which is what ci.yml's top-level env comment promises. `cargo
 #      fmt` and `cargo fuzz` resolve no dependencies at that position and take no
-#      `--locked`, so they are not checked. Two things this used to get wrong
-#      (BLO-42496), neither visible from a green run because a missed call reads
+#      `--locked`, so they are not checked. Four things this used to get wrong
+#      (BLO-42496), none visible from a green run because a missed call reads
 #      exactly like no missed call:
 #        - the pattern was anchored at line start, so `RUSTFLAGS=x cargo build`,
 #          `cd fuzz && cargo test`, and anything after `&&` inside a `run: |`
-#          block escaped it. It now matches `cargo` after any of ` =;&|(` too.
+#          block escaped it. It now matches `cargo` after any of ` ;&|(` too.
+#        - it also required whitespace or end-of-line *after* the verb, the same
+#          mistake at the other end: `(cargo build)` ends on `)` and did not
+#          count. The tail is now any non-word character, which still rejects
+#          `cargo building`.
+#        - `cargo +nightly test` escaped the verb list, because the toolchain
+#          override sits where the verb was expected. driad-parser.yml's fuzz
+#          job is this repo's toolchain-override job, so that is where it lands.
 #        - the scan read ci.yml alone while the pin scan above globbed
 #          `*.yml`, which is how driad-parser.yml carried three unlocked
-#          `cargo test` calls. Both now glob.
+#          `cargo test` calls. Both now glob `*.y*ml`.
+#      Every separator in the class has its own --self-test leg. One leg
+#      asserting one message cannot tell you the other four still match --
+#      measured, four of five survived being dropped. `=` is deliberately not in
+#      the class: no idiom puts it immediately before `cargo` (in `RUSTFLAGS=x
+#      cargo build` the separator is the space), so it would be an element no
+#      leg could exercise, which is the thing this check is arguing against.
 #      `#` comments and YAML `name:` keys are blanked first: a step named
 #      `- name: cargo test (lib)` is not an invocation and carries no `--locked`.
+#      A `#` opens a comment only at line start or after whitespace, which is
+#      YAML's own rule. Blanking from *any* `#` deleted `echo '#frag' && cargo
+#      build` from the scanned view, and the per-file guard below could not see
+#      that because it greps the already-blanked text.
 #      The per-file guard is what makes a broken pattern loud -- a file whose
-#      blanked body still says `cargo` must yield at least one call, so a rename
-#      or a bad regex fails instead of reading as "nothing to check". A file with
-#      no cargo at all (publish-amt-verify.yml) is legitimately zero.
+#      blanked body still says `cargo <lowercase-word>` must yield at least one
+#      call, so a rename or a bad regex fails instead of reading as "nothing to
+#      check". It deliberately does not reuse the verb list, or a broken verb
+#      list would silence its own alarm. A file with no cargo at all
+#      (publish-amt-verify.yml) is legitimately zero.
 #   5. This script runs from ci.yml's `lint` job and from no other job there, and
 #      any `if:` on that step names a leg `lint`'s matrix actually has. `lint
 #      (<id>)` legs are required checks on `main`; `probe verdict logic` is not,
@@ -63,13 +82,15 @@ if [ "${1:-}" = --self-test ]; then
     trap 'rm -rf "$tmp"' EXIT
     me=${BASH_SOURCE[0]}; base=$(basename "$me"); legs=0 fails=0
 
-    # leg <name> <want-rc> <want-text> [--no-cargo] -- extra workflow yaml is
-    # read from stdin as driad.yml; `-` means write no second workflow at all.
-    # `--no-cargo` drops the cargo step from the fixture ci.yml, which is the
-    # only way to reach the global "matched nothing anywhere" arm: the per-file
-    # guard below it only fires on a file that still says `cargo`.
+    # leg <name> <want-rc> <want-text> [--no-cargo] [second-workflow-filename]
+    # -- extra workflow yaml is read from stdin and written as the second
+    # workflow (driad.yml unless overridden); `-` means write no second
+    # workflow at all. `--no-cargo` drops the cargo step from the fixture
+    # ci.yml, which is the only way to reach the global "matched nothing
+    # anywhere" arm: the per-file guard below it only fires on a file that
+    # still says `cargo`.
     leg() {
-        local name=$1 want=$2 text=$3 nocargo=${4:-} d=$tmp/$1 out rc
+        local name=$1 want=$2 text=$3 nocargo=${4:-} second=${5:-driad.yml} d=$tmp/$1 out rc
         mkdir -p "$d/tests" "$d/.github/workflows"; cp "$me" "$d/tests/$base"
         printf 'channel = "1.99.0"\n' >"$d/rust-toolchain.toml"
         printf 'rust-toolchain.toml\n' >"$d/.dockerignore"
@@ -85,9 +106,10 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 CI
         [ "$nocargo" = --no-cargo ] && sed -i '/clippy/d' "$d/.github/workflows/ci.yml"
+        [ "$nocargo" = --no-pin ] && sed -i '/dtolnay/d' "$d/.github/workflows/ci.yml"
         local extra; extra=$(cat)
         if [ "$extra" = - ]; then rm -f "$d/.github/workflows/ci.yml"
-        elif [ -n "$extra" ]; then printf '%s\n' "$extra" >"$d/.github/workflows/driad.yml"; fi
+        elif [ -n "$extra" ]; then printf '%s\n' "$extra" >"$d/.github/workflows/$second"; fi
         out=$(cd "$d" && bash "tests/$base" 2>&1); rc=$?
         legs=$((legs + 1))
         if [ "$rc" = "$want" ] && [[ $out == *"$text"* ]]; then return 0; fi
@@ -113,16 +135,37 @@ WF
       - run: |
           cd fuzz && cargo test
 WF
-    # Every separator in the pattern's class other than whitespace, in one leg.
-    # Without it the class is decorative: narrowing it to `[[:space:]]` alone
-    # left all the other legs green, because each of them happens to put a
-    # space before `cargo`.
-    leg unanchored-nospace 1 'driad.yml:5 cargo call lacks --locked' <<'WF'
-      - run: |
-          cd fuzz&&cargo test
-          (cargo build)
-          RUSTFLAGS=-D warnings;cargo check
-          true|cargo doc
+    # One leg per separator in the pattern's class, each a single line so the
+    # asserted line number names the separator under test. These were one leg
+    # with four calls asserting one message, which is the shape this whole
+    # check exists to argue against: measured at that head, dropping `&`, `(`,
+    # `;` or `=` from the class individually left the leg green, because the
+    # `|` line it asserted still matched. Only dropping all five at once red.
+    leg sep-amp 1 'driad.yml:1 cargo call lacks --locked' <<'WF'
+      - run: cd fuzz&&cargo test
+WF
+    leg sep-paren 1 'driad.yml:1 cargo call lacks --locked' <<'WF'
+      - run: (cargo build)
+WF
+    leg sep-semi 1 'driad.yml:1 cargo call lacks --locked' <<'WF'
+      - run: true;cargo check
+WF
+    leg sep-pipe 1 'driad.yml:1 cargo call lacks --locked' <<'WF'
+      - run: true|cargo doc
+WF
+    # `cargo +<toolchain> <verb>`: the override sits where the verb was
+    # expected. The locked call above it keeps the per-file guard satisfied, so
+    # this leg reds on the verb pattern alone and not on the guard. Pre-fix:
+    # PASS, reported as 2 calls.
+    leg toolchain-override 1 'driad.yml:2 cargo call lacks --locked' <<'WF'
+      - run: cargo test --locked
+      - run: cargo +nightly test --no-default-features
+WF
+    # A `#` that does not open a YAML comment. Blanking from any `#` deleted
+    # the call with it, and the per-file guard could not see that because it
+    # greps the blanked text -- the `cargo` token is gone too. Pre-fix: PASS.
+    leg hash-midline 1 'driad.yml:1 cargo call lacks --locked' <<'WF'
+      - run: echo '#frag' && cargo build
 WF
     # No false positive on a commented-out call, nor on a step TITLE -- a
     # `- name: cargo test (lib)` line carries no `--locked` and is not a call.
@@ -132,15 +175,39 @@ WF
         run: cargo test --locked
 WF
     # Fails closed: a file that says cargo but yields no call means the pattern
-    # broke, not that there is nothing to check.
+    # broke, not that there is nothing to check. Deliberately not keyed on the
+    # verb list -- `frobnicate` is not a verb, and a broken verb list must not
+    # be able to silence the alarm that would report it.
     leg pattern-broke 1 'driad.yml says cargo but the cargo-call pattern matched nothing' <<'WF'
       - run: cargo frobnicate
+WF
+    # ...but a lowercase word is required after it, so `cargo --version` in a
+    # call-free workflow is not a false alarm. Reverting that reds this leg.
+    # Narrower than it looks: `echo cargo is pinned` still trips the guard,
+    # because `is` is a lowercase word. Dropping that too needs the verb list,
+    # which `pattern-broke` above exists to keep out of this guard.
+    leg guard-not-prose 0 PASS <<'WF'
+      - run: cargo --version
 WF
     # Workflows exist but none of them calls cargo at all. The per-file guard
     # cannot see this -- it needs a file that still says `cargo` -- so the
     # global count is the only thing standing between a vanished check 4 and a
     # green run.
-    leg no-cargo-anywhere 1 'matched no cargo calls in .github/workflows/*.yml' --no-cargo </dev/null
+    leg no-cargo-anywhere 1 'matched no cargo calls in .github/workflows/*.y*ml' --no-cargo </dev/null
+    # Both globs are `*.y*ml`, so a workflow saved as `.yaml` is scanned rather
+    # than silently skipped. Two legs because one cannot cover both: this one
+    # reds via the cargo scan, and an rc=1 leg asserting containment stays
+    # green when the *pin* glob narrows, because the cargo failure it asserts
+    # is still printed. The pin half needs its own leg that expects PASS.
+    leg glob-yaml 1 'driad.yaml:1 cargo call lacks --locked' '' driad.yaml <<'WF'
+      - run: cargo test --lib
+WF
+    # ci.yml's pin is dropped, so the .yaml file carries the only one: narrow
+    # the pin glob and `pins` falls to 0.
+    leg glob-yaml-pin 0 PASS --no-pin driad.yaml <<'WF'
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - run: cargo test --locked
+WF
     # An empty workflow glob is a failure, not a silent pass. Caught by the pin
     # scan and the placement parser, not by a count check of its own -- see the
     # note where that check would have gone.
@@ -163,7 +230,7 @@ while IFS= read -r hit; do
     echo "FAIL: ${hit%%:[[:space:]]*} pins @$rev; rust-toolchain.toml channel is $channel"
     fail=1
   fi
-done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*dtolnay/rust-toolchain@' .github/workflows/*.yml)
+done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*dtolnay/rust-toolchain@' .github/workflows/*.y*ml)
 [ "$pins" -gt 0 ] || { echo "FAIL: matched no dtolnay/rust-toolchain pins"; fail=1; }
 
 if ! grep -qxF 'rust-toolchain.toml' .dockerignore; then
@@ -185,13 +252,16 @@ done < <(grep -niE '^[[:space:]]*FROM[[:space:]]+rust:' Dockerfile)
 
 files=0
 calls=0
-for wf in .github/workflows/*.yml; do
+for wf in .github/workflows/*.y*ml; do
   [ -e "$wf" ] || continue
   files=$((files + 1))
   # Line-numbered shell view: `#` comments and `name:` keys blanked, so a step
-  # title never reads as an invocation. The ": " after the number is load-bearing
-  # -- it supplies the leading separator a column-0 `cargo` would otherwise lack.
-  shell=$(awk '{ l = $0; sub(/#.*/, "", l)
+  # title never reads as an invocation. A `#` opens a YAML comment only at line
+  # start or after whitespace -- blanking from any `#` at all would delete the
+  # rest of `echo '#frag' && cargo build`. The ": " after the number is
+  # load-bearing -- it supplies the leading separator a column-0 `cargo` would
+  # otherwise lack.
+  shell=$(awk '{ l = $0; sub(/(^|[[:space:]])#.*/, "", l)
                  if (l ~ /^[[:space:]]*(-[[:space:]]+)?name:/) l = ""
                  printf "%s: %s\n", NR, l }' "$wf")
   found=0
@@ -202,8 +272,8 @@ for wf in .github/workflows/*.yml; do
       *--locked*) ;;
       *) echo "FAIL: ${wf}:${hit%%:*} cargo call lacks --locked"; fail=1 ;;
     esac
-  done < <(printf '%s\n' "$shell" | grep -E '(^|[[:space:]=;&|(])cargo[[:space:]]+(build|check|clippy|test|run|doc|fetch|install)([[:space:]]|$)')
-  if [ "$found" -eq 0 ] && printf '%s\n' "$shell" | grep -q '[[:space:]]cargo[[:space:]]'; then
+  done < <(printf '%s\n' "$shell" | grep -E '(^|[[:space:];&|(])cargo[[:space:]]+(\+[^[:space:]]+[[:space:]]+)?(build|check|clippy|test|run|doc|fetch|install)([^[:alnum:]_-]|$)')
+  if [ "$found" -eq 0 ] && printf '%s\n' "$shell" | grep -q '[[:space:]]cargo[[:space:]][a-z]'; then
     echo "FAIL: $wf says cargo but the cargo-call pattern matched nothing in it"
     fail=1
   fi
@@ -213,7 +283,7 @@ done
 # `no-workflows` asserts that) -- and a third check for it had no failing
 # mutation: reverting it alone left every leg green. Adding one would be the
 # subset-reads-as-coverage mistake this block exists to answer.
-[ "$calls" -gt 0 ] || { echo "FAIL: matched no cargo calls in .github/workflows/*.yml"; fail=1; }
+[ "$calls" -gt 0 ] || { echo "FAIL: matched no cargo calls in .github/workflows/*.y*ml"; fail=1; }
 
 # job|gate|gate-names-a-leg-of-that-job, one line per step running this script.
 placements=$(awk '
