@@ -250,6 +250,55 @@ async fn spawn_driad_dns(records: Vec<(u8, [u8; 4])>) -> std::net::SocketAddr {
     dns_addr
 }
 
+/// A reply listing more relays than a gateway will ever try is cut to the most
+/// preferred few, so a large RRset cannot turn into an unbounded walk.
+#[tokio::test(flavor = "current_thread")]
+async fn driad_resolution_keeps_only_the_most_preferred_candidates() {
+    use amt_protocol::driad::DriadRelayAddress;
+    use amt_protocol::native::resolver::{resolve_candidates_via, MAX_CANDIDATES};
+
+    let offered: Vec<(u8, [u8; 4])> = (1..=10).rev().map(|i| (i * 10, [127, 0, 0, i])).collect();
+    let dns_addr = spawn_driad_dns(offered).await;
+
+    let candidates = resolve_candidates_via("10.0.0.1".parse().unwrap(), &[dns_addr])
+        .await
+        .expect("resolve");
+    let kept: Vec<_> = candidates
+        .iter()
+        .map(|c| (c.precedence, c.relay.clone()))
+        .collect();
+    let expected: Vec<_> = (1..=MAX_CANDIDATES as u8)
+        .map(|i| {
+            let relay = DriadRelayAddress::Ip([127, 0, 0, i].into());
+            (i * 10, relay)
+        })
+        .collect();
+    assert_eq!(kept, expected);
+}
+
+/// A relay that never answers holds the walk for its whole handshake budget;
+/// `discovery_timeout` bounds the build instead.
+#[tokio::test(flavor = "current_thread")]
+async fn driad_build_honours_the_discovery_timeout() {
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dns_addr = spawn_driad_dns(vec![(10, [127, 0, 0, 1])]).await;
+
+    let started = std::time::Instant::now();
+    let err = AsyncAmtGateway::builder_for_source("10.0.0.1".parse().unwrap())
+        .relay_port(silent.local_addr().unwrap().port())
+        .nameservers(vec![dns_addr])
+        .discovery_timeout(Duration::from_millis(300))
+        .build()
+        .await
+        .err()
+        .expect("a silent relay cannot complete the handshake");
+    assert!(err.to_string().contains("within"), "{err:#}");
+    // One discovery attempt alone waits DISCOVERY_TIMEOUT_MS.
+    assert!(
+        started.elapsed() < Duration::from_millis(amt_protocol::subscription::DISCOVERY_TIMEOUT_MS)
+    );
+}
+
 /// Subscribe on a DRIAD-built gateway and require the relay's data to arrive.
 async fn assert_data_flows(gw: AsyncAmtGateway) {
     let mut data_rx = gw.subscribe_data();

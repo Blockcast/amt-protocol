@@ -17,6 +17,12 @@ const MAX_ATTEMPTS: usize = 3;
 /// Largest DNS message: TCP frames each one with a 16-bit length (RFC 1035
 /// §4.2.2), and no UDP datagram is larger.
 const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
+/// Most relays [`resolve_candidates_via`] returns. The AMTRELAY RRset is
+/// third-party data (the source's zone, named by the subscribing application),
+/// and one TCP-sized reply can hold thousands of records. Each candidate can
+/// cost a gateway a full handshake budget and each type-3 name a lookup, so the
+/// list is cut to the most preferred few before any name is resolved.
+pub const MAX_CANDIDATES: usize = 4;
 
 /// Resolve the AMT relay address for `source` via DRIAD over UDP:53: the first
 /// of [`resolve_amt_relay_candidates`].
@@ -54,7 +60,10 @@ pub async fn resolve_amt_relay_candidates(source: IpAddr) -> Result<Vec<DriadCan
 ///   inheriting the record's precedence and D-bit (RFC 8777 §4.2.4). A name
 ///   that does not resolve is skipped, like any unusable record (§4.2).
 /// - The result is in [`DriadResolver::order_candidates`] order, with repeated
-///   addresses dropped after their first, most preferred, position.
+///   addresses dropped after their first, most preferred, position, and holds
+///   at most [`MAX_CANDIDATES`] relays. The records are cut to that many
+///   before any type-3 name is resolved, so a reply costs at most that many
+///   name lookups.
 pub async fn resolve_candidates_via(
     source: IpAddr,
     nameservers: &[SocketAddr],
@@ -72,19 +81,20 @@ pub async fn resolve_candidates_via(
         // Bind the reply to the query we sent. UDP:53 is unauthenticated, so an
         // off-path attacker who guesses the 5-tuple can race a forged AMTRELAY
         // answer and point relay discovery wherever it likes.
-        let records = DriadResolver::parse_dns_response_candidates_validated(&query, &reply);
+        let mut records = DriadResolver::parse_dns_response_candidates_validated(&query, &reply);
         if records.is_empty() {
             last_err = Some(anyhow!("DNS reply from {ns} had no valid AMTRELAY answer"));
             continue;
         }
+        records.retain(|r| match &r.relay {
+            DriadRelayAddress::Ip(ip) => ip.is_ipv4() == source.is_ipv4(),
+            DriadRelayAddress::DnsName(_) => true,
+        });
+        keep_most_preferred(&mut records);
         let mut candidates = Vec::new();
         for record in records {
             match &record.relay {
-                DriadRelayAddress::Ip(ip) => {
-                    if ip.is_ipv4() == source.is_ipv4() {
-                        candidates.push(record);
-                    }
-                }
+                DriadRelayAddress::Ip(_) => candidates.push(record),
                 DriadRelayAddress::DnsName(name) => {
                     match resolve_addresses(name, source, nameservers).await {
                         Ok(addresses) => candidates.extend(record.expand(&addresses)),
@@ -104,18 +114,25 @@ pub async fn resolve_candidates_via(
             ));
             continue;
         }
-        DriadResolver::order_candidates(&mut candidates);
-        let mut seen = Vec::with_capacity(candidates.len());
-        candidates.retain(|c| {
-            let fresh = !seen.contains(&c.relay);
-            if fresh {
-                seen.push(c.relay.clone());
-            }
-            fresh
-        });
+        // A type-3 name can expand to many addresses: cut again.
+        keep_most_preferred(&mut candidates);
         return Ok(candidates);
     }
     Err(last_err.unwrap_or_else(|| anyhow!("DRIAD: no usable nameserver answered")))
+}
+
+/// Order `candidates`, drop repeated relays after their first, most preferred,
+/// position, and keep the first [`MAX_CANDIDATES`].
+fn keep_most_preferred(candidates: &mut Vec<DriadCandidate>) {
+    DriadResolver::order_candidates(candidates);
+    let mut seen = Vec::with_capacity(MAX_CANDIDATES);
+    candidates.retain(|c| {
+        let keep = seen.len() < MAX_CANDIDATES && !seen.contains(&c.relay);
+        if keep {
+            seen.push(c.relay.clone());
+        }
+        keep
+    });
 }
 
 /// The addresses `name` resolves to in `source`'s family, from the first

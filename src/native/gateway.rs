@@ -105,6 +105,7 @@ impl AsyncAmtGateway {
         AsyncAmtGatewayBuilderForSource {
             source,
             nameservers: None,
+            discovery_timeout: None,
             relay_port: 2268,
             keepalive: Duration::from_secs(AmtConfig::DEFAULT_KEEPALIVE_SECS as u64),
             log_target: "amt",
@@ -456,6 +457,7 @@ fn handle_cmd(
 pub struct AsyncAmtGatewayBuilderForSource {
     source: IpAddr,
     nameservers: Option<Vec<SocketAddr>>,
+    discovery_timeout: Option<Duration>,
     relay_port: u16,
     keepalive: Duration,
     log_target: &'static str,
@@ -481,11 +483,33 @@ impl AsyncAmtGatewayBuilderForSource {
         self
     }
 
-    /// Resolve every DRIAD candidate for the source, then walk them in
+    /// Fail [`build`](Self::build) if resolving and walking the candidates
+    /// has not produced a relay within `limit`. Without it the walk is bounded
+    /// only by the candidate cap ([`super::resolver::MAX_CANDIDATES`]): each
+    /// unreachable candidate costs the full discovery and request budget.
+    pub fn discovery_timeout(mut self, limit: Duration) -> Self {
+        self.discovery_timeout = Some(limit);
+        self
+    }
+
+    /// Resolve the source's most preferred DRIAD candidates (at most
+    /// [`super::resolver::MAX_CANDIDATES`]), then walk them in
     /// precedence order (ties shuffled, RFC 8777 §3.1.2) until one completes
     /// the RFC 8777 §3.2.3 handshake, and build the gateway for that relay.
     /// [`AsyncAmtGateway::relay`] reports which one it was.
     pub async fn build(self) -> Result<AsyncAmtGateway> {
+        let source = self.source;
+        match self.discovery_timeout {
+            Some(limit) => tokio::time::timeout(limit, self.discover())
+                .await
+                .map_err(|_| {
+                    anyhow!("DRIAD found no working relay for {source} within {limit:?}")
+                })?,
+            None => self.discover().await,
+        }
+    }
+
+    async fn discover(self) -> Result<AsyncAmtGateway> {
         let candidates = match &self.nameservers {
             Some(nameservers) => {
                 super::resolver::resolve_candidates_via(self.source, nameservers).await?
