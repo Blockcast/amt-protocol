@@ -14,7 +14,6 @@
 //! - DNS wire-format query packet building (RFC 1035)
 //! - DNS wire-format response parsing for TYPE260 AMTRELAY records
 
-use std::cmp::Ordering;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -30,11 +29,84 @@ const DNS_TYPE_AAAA: u16 = 28;
 /// DNS class IN
 const DNS_CLASS_IN: u16 = 1;
 
+/// OPT pseudo-RR type (RFC 6891 §6.1.1).
+const DNS_TYPE_OPT: u16 = 41;
+
+/// Fixed DNS header length (RFC 1035 §4.1.1).
+const DNS_HEADER_LEN: usize = 12;
+
+/// TC (truncation) bit in the 16-bit header flags word (RFC 1035 §4.1.1).
+const DNS_FLAG_TC: u16 = 0x0200;
+
+/// Largest TTL a resolver may honour; RFC 2181 §8 reads a value with the top
+/// bit set as zero.
+const MAX_TTL: u32 = i32::MAX as u32;
+
+/// D-bit, the top bit of the second AMTRELAY RDATA octet (RFC 8777 §4.2.2).
+const AMTRELAY_D_BIT: u8 = 0x80;
+
+/// Relay-type bits below the D-bit (RFC 8777 §4.2.3).
+const AMTRELAY_TYPE_MASK: u8 = 0x7F;
+
+/// IPv6 minimum link MTU (RFC 8200 §5).
+const IPV6_MIN_MTU: u16 = 1280;
+
+/// Fixed IPv6 header length (RFC 8200 §3).
+const IPV6_HEADER_LEN: u16 = 40;
+
+/// UDP header length (RFC 768).
+const UDP_HEADER_LEN: u16 = 8;
+
 /// Result of DRIAD relay discovery — may be an IP or a DNS name requiring resolution
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriadRelayAddress {
     Ip(IpAddr),
     DnsName(String),
+}
+
+/// One usable AMTRELAY answer, keeping everything RFC 8777 lets a gateway act
+/// on rather than only the relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriadCandidate {
+    /// Lower is tried first (RFC 8777 §4.2.1).
+    pub precedence: u8,
+    /// The D-bit (RFC 8777 §4.2.2). When false the gateway MUST receive a
+    /// Relay Advertisement from this address before sending it a Request.
+    pub discovery_optional: bool,
+    pub relay: DriadRelayAddress,
+    /// Seconds this binding stays valid: the record's TTL, or for an expanded
+    /// type-3 relay the smaller of the AMTRELAY and address-record TTLs.
+    pub ttl: u32,
+}
+
+/// One A or AAAA answer, with its TTL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriadAddress {
+    pub addr: IpAddr,
+    pub ttl: u32,
+}
+
+impl DriadCandidate {
+    /// The address candidates a type-3 relay stands for, given the A/AAAA
+    /// answers its name resolved to. RFC 8777 §4.2.4: the precedence and D-bit
+    /// carry over to each address. The TTL is the smaller of the two records',
+    /// because the derived binding expires as soon as either one does.
+    ///
+    /// An address candidate is already resolved and comes back unchanged.
+    pub fn expand(&self, addresses: &[DriadAddress]) -> Vec<DriadCandidate> {
+        match self.relay {
+            DriadRelayAddress::Ip(_) => vec![self.clone()],
+            DriadRelayAddress::DnsName(_) => addresses
+                .iter()
+                .map(|address| DriadCandidate {
+                    precedence: self.precedence,
+                    discovery_optional: self.discovery_optional,
+                    relay: DriadRelayAddress::Ip(address.addr),
+                    ttl: self.ttl.min(address.ttl),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl fmt::Display for DriadRelayAddress {
@@ -121,6 +193,48 @@ impl DriadResolver {
         Self::build_dns_query_packet(hostname, DNS_TYPE_AAAA, transaction_id)
     }
 
+    /// UDP payload size advertised in the EDNS(0) OPT record: the largest DNS
+    /// message an unfragmented datagram carries on the IPv6 minimum MTU. Traffic
+    /// Router advertises the same size, and a multi-relay AMTRELAY answer
+    /// outgrows the 512 octets plain DNS allows.
+    pub const EDNS_UDP_PAYLOAD_SIZE: u16 = IPV6_MIN_MTU - IPV6_HEADER_LEN - UDP_HEADER_LEN;
+
+    /// [`build_dns_query`] plus an EDNS(0) OPT record (RFC 6891) advertising
+    /// [`EDNS_UDP_PAYLOAD_SIZE`], so a resolver can answer with every relay
+    /// instead of truncating at 512 octets.
+    ///
+    /// [`build_dns_query`]: DriadResolver::build_dns_query
+    /// [`EDNS_UDP_PAYLOAD_SIZE`]: DriadResolver::EDNS_UDP_PAYLOAD_SIZE
+    pub fn build_dns_query_edns(source: IpAddr, transaction_id: u16) -> Vec<u8> {
+        Self::with_edns(Self::build_dns_query(source, transaction_id))
+    }
+
+    /// [`build_dns_a_query`] plus an EDNS(0) OPT record.
+    ///
+    /// [`build_dns_a_query`]: DriadResolver::build_dns_a_query
+    pub fn build_dns_a_query_edns(hostname: &str, transaction_id: u16) -> Vec<u8> {
+        Self::with_edns(Self::build_dns_a_query(hostname, transaction_id))
+    }
+
+    /// [`build_dns_aaaa_query`] plus an EDNS(0) OPT record.
+    ///
+    /// [`build_dns_aaaa_query`]: DriadResolver::build_dns_aaaa_query
+    pub fn build_dns_aaaa_query_edns(hostname: &str, transaction_id: u16) -> Vec<u8> {
+        Self::with_edns(Self::build_dns_aaaa_query(hostname, transaction_id))
+    }
+
+    /// Append the OPT pseudo-RR (RFC 6891 §6.1.2) to a query this module built,
+    /// which has an empty additional section.
+    fn with_edns(mut packet: Vec<u8>) -> Vec<u8> {
+        packet[10..12].copy_from_slice(&1u16.to_be_bytes()); // ARCOUNT
+        packet.push(0); // owner: the root name
+        packet.extend_from_slice(&DNS_TYPE_OPT.to_be_bytes());
+        packet.extend_from_slice(&Self::EDNS_UDP_PAYLOAD_SIZE.to_be_bytes());
+        // Extended RCODE 0, version 0, DO and Z clear, then RDLENGTH 0.
+        packet.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        packet
+    }
+
     /// Build DNS wire-format query packet for any QNAME and QTYPE.
     fn build_dns_query_packet(qname: &str, qtype: u16, transaction_id: u16) -> Vec<u8> {
         let mut packet = Vec::with_capacity(64);
@@ -187,26 +301,66 @@ impl DriadResolver {
         Self::select_amtrelay(data, Some(&expect))
     }
 
-    /// Every acceptable AMTRELAY relay at the lowest precedence present, in wire
-    /// order. [`parse_dns_response`] returns one of these chosen at random
-    /// (RFC 8777 §3.1.2); a caller that wants to fail over can walk the set.
-    /// Empty when the response is rejected or carries no usable record.
+    /// Every usable AMTRELAY answer, in wire order, with its precedence, D-bit
+    /// and TTL. Empty when the response is rejected or carries no usable record.
+    ///
+    /// [`parse_dns_response`] returns one relay of the lowest precedence present,
+    /// chosen at random (RFC 8777 §3.1.2). A caller that wants to fail over
+    /// takes this list instead and walks it in [`order_candidates`] order.
     ///
     /// [`parse_dns_response`]: DriadResolver::parse_dns_response
-    pub fn parse_dns_response_candidates(data: &[u8]) -> Vec<DriadRelayAddress> {
-        Self::lowest_precedence_set(data, None).unwrap_or_default()
+    /// [`order_candidates`]: DriadResolver::order_candidates
+    pub fn parse_dns_response_candidates(data: &[u8]) -> Vec<DriadCandidate> {
+        Self::collect_candidates(data, None).unwrap_or_default()
     }
 
-    /// Query-bound variant of [`parse_dns_response_candidates`].
+    /// Query-bound variant of [`parse_dns_response_candidates`]: also requires
+    /// the reply's transaction ID and question to match `query`.
     ///
     /// [`parse_dns_response_candidates`]: DriadResolver::parse_dns_response_candidates
     pub fn parse_dns_response_candidates_validated(
         query: &[u8],
         data: &[u8],
-    ) -> Vec<DriadRelayAddress> {
+    ) -> Vec<DriadCandidate> {
         DnsQuestionRef::from_query(query)
-            .and_then(|expect| Self::lowest_precedence_set(data, Some(&expect)))
+            .and_then(|expect| Self::collect_candidates(data, Some(&expect)))
             .unwrap_or_default()
+    }
+
+    /// Put candidates in the order a gateway should try them: lower precedence
+    /// first (RFC 8777 §4.2.1), and a uniformly random order among equal
+    /// precedence (RFC 8777 §3.1.2 SHOULD), so gateways sharing one resolver
+    /// cache spread across the relays a source lists.
+    pub fn order_candidates(candidates: &mut [DriadCandidate]) {
+        Self::order_candidates_with(candidates, random_below);
+    }
+
+    /// [`order_candidates`] with the random source supplied: `below(n)` returns
+    /// a uniform integer in `0..n`.
+    ///
+    /// [`order_candidates`]: DriadResolver::order_candidates
+    pub fn order_candidates_with(
+        candidates: &mut [DriadCandidate],
+        mut below: impl FnMut(u32) -> u32,
+    ) {
+        // Stable insertion sort, so the shuffle below is the only source of tie
+        // order. std's stable sort would add kilobytes to the browser build, and
+        // an RRset is bounded by one DNS message, so the quadratic worst case
+        // stays small even for a hostile reply.
+        for i in 1..candidates.len() {
+            let mut j = i;
+            while j > 0 && candidates[j - 1].precedence > candidates[j].precedence {
+                candidates.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        for tie in candidates.chunk_by_mut(|a, b| a.precedence == b.precedence) {
+            // Fisher-Yates: every ordering of the tie is equally likely.
+            for i in (1..tie.len()).rev() {
+                let j = below(i as u32 + 1) as usize;
+                tie.swap(i, j);
+            }
+        }
     }
 
     /// Collect every acceptable AMTRELAY answer, then pick by precedence.
@@ -234,30 +388,78 @@ impl DriadResolver {
     }
 
     /// The acceptable AMTRELAY relays sharing the lowest precedence, in wire
-    /// order, or `None` when the response is rejected.
+    /// order, or `None` when the response is rejected. Derived from the same
+    /// walk as the candidate list, so a selection always lies in that list.
     fn lowest_precedence_set(
         data: &[u8],
         expect: Option<&DnsQuestionRef>,
     ) -> Option<Vec<DriadRelayAddress>> {
-        let mut best: Option<u8> = None;
-        let mut set = Vec::new();
-        Self::for_each_answer(data, AMTRELAY_TYPE, expect, |rdata| {
+        let candidates = Self::collect_candidates(data, expect)?;
+        let Some(best) = candidates.iter().map(|c| c.precedence).min() else {
+            return Some(Vec::new());
+        };
+        Some(
+            candidates
+                .into_iter()
+                .filter(|c| c.precedence == best)
+                .map(|c| c.relay)
+                .collect(),
+        )
+    }
+
+    /// Every acceptable AMTRELAY answer in wire order, or `None` when the
+    /// response is rejected.
+    fn collect_candidates(
+        data: &[u8],
+        expect: Option<&DnsQuestionRef>,
+    ) -> Option<Vec<DriadCandidate>> {
+        let mut candidates = Vec::new();
+        Self::for_each_answer(data, AMTRELAY_TYPE, expect, |ttl, rdata| {
             // A record whose RDATA does not decode (unknown relay type, truncated
             // relay field, type 0 "no relay") is skipped, not fatal — RFC 8777
             // §4.2 requires falling through to the next candidate.
-            if let Some((precedence, addr)) = Self::parse_amtrelay_record(rdata) {
-                match best.map(|b| precedence.cmp(&b)) {
-                    None | Some(Ordering::Less) => {
-                        best = Some(precedence);
-                        set.clear();
-                        set.push(addr);
-                    }
-                    Some(Ordering::Equal) => set.push(addr),
-                    Some(Ordering::Greater) => {}
-                }
+            if let Some(candidate) = Self::parse_amtrelay_candidate(ttl, rdata) {
+                candidates.push(candidate);
             }
         })?;
-        Some(set)
+        Some(candidates)
+    }
+
+    /// Every address answer to `query`, an A or AAAA query this module built,
+    /// with its TTL and in wire order. The record type is the query's QTYPE, and
+    /// the reply must match the query's transaction ID and question. Empty when
+    /// the reply is rejected or carries no address of that type.
+    pub fn parse_dns_addresses_validated(query: &[u8], data: &[u8]) -> Vec<DriadAddress> {
+        let Some(expect) = DnsQuestionRef::from_query(query) else {
+            return Vec::new();
+        };
+        let record_type = expect.qtype;
+        let mut addresses = Vec::new();
+        let walked = Self::for_each_answer(data, record_type, Some(&expect), |ttl, rdata| {
+            if let Some(addr) = Self::address_from_rdata(record_type, rdata) {
+                addresses.push(DriadAddress { addr, ttl });
+            }
+        });
+        if walked.is_none() {
+            return Vec::new();
+        }
+        addresses
+    }
+
+    /// True when `data` answers `query` (same transaction ID and question) with
+    /// the TC bit set: the reply was cut to fit the transport, so its answer
+    /// section may be incomplete and the query must be re-asked over TCP
+    /// (RFC 1035 §4.2.1, RFC 7766 §5). A stray or forged datagram that does not
+    /// bind to `query` never triggers the retry.
+    pub fn is_truncated_reply(query: &[u8], data: &[u8]) -> bool {
+        let Some(expect) = DnsQuestionRef::from_query(query) else {
+            return false;
+        };
+        if data.len() < DNS_HEADER_LEN {
+            return false;
+        }
+        let flags = u16::from_be_bytes([data[2], data[3]]);
+        flags & DNS_FLAG_TC != 0 && Self::question_matches(data, &expect).is_some()
     }
 
     /// Parse a DNS A record response and extract the first IPv4 address.
@@ -297,27 +499,31 @@ impl DriadResolver {
         expect: Option<&DnsQuestionRef>,
     ) -> Option<IpAddr> {
         let mut found: Option<IpAddr> = None;
-        Self::for_each_answer(data, record_type, expect, |rdata| {
-            if found.is_some() {
-                return;
+        Self::for_each_answer(data, record_type, expect, |_ttl, rdata| {
+            if found.is_none() {
+                found = Self::address_from_rdata(record_type, rdata);
             }
-            found = match (record_type, rdata.len()) {
-                (DNS_TYPE_A, 4) => Some(IpAddr::V4(Ipv4Addr::new(
-                    rdata[0], rdata[1], rdata[2], rdata[3],
-                ))),
-                (DNS_TYPE_AAAA, 16) => {
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(rdata);
-                    Some(IpAddr::V6(Ipv6Addr::from(octets)))
-                }
-                _ => None,
-            };
         })?;
         found
     }
 
-    /// Walk the answer section, invoking `visit` with the RDATA of every record
-    /// whose TYPE and CLASS match and whose owner name matches the question.
+    /// The address in an A (4-octet) or AAAA (16-octet) RDATA, or `None` when
+    /// the length does not fit the type.
+    fn address_from_rdata(record_type: u16, rdata: &[u8]) -> Option<IpAddr> {
+        match record_type {
+            DNS_TYPE_A => <[u8; 4]>::try_from(rdata)
+                .ok()
+                .map(|octets| IpAddr::V4(Ipv4Addr::from(octets))),
+            DNS_TYPE_AAAA => <[u8; 16]>::try_from(rdata)
+                .ok()
+                .map(|octets| IpAddr::V6(Ipv6Addr::from(octets))),
+            _ => None,
+        }
+    }
+
+    /// Walk the answer section, invoking `visit` with the TTL and RDATA of every
+    /// record whose TYPE and CLASS match and whose owner name matches the
+    /// question. A TTL with the top bit set reads as zero (RFC 2181 §8).
     ///
     /// Returns None if the message is not a usable response at all (malformed,
     /// not a reply, RCODE set, or failing `expect`); Some(()) when the answer
@@ -326,24 +532,80 @@ impl DriadResolver {
         data: &[u8],
         record_type: u16,
         expect: Option<&DnsQuestionRef>,
-        mut visit: impl FnMut(&[u8]),
+        mut visit: impl FnMut(u32, &[u8]),
     ) -> Option<()> {
-        if data.len() < 12 {
+        let (qname, mut offset, qclass) = Self::question_section(data, expect)?;
+
+        let flags = u16::from_be_bytes([data[2], data[3]]);
+        // No error (RCODE=0).
+        if flags & 0x0F != 0 {
+            return None;
+        }
+        let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
+
+        for _ in 0..ancount {
+            let owner = DnsName::decode(data, offset)?;
+            offset = owner.end;
+            if offset + 10 > data.len() {
+                return None;
+            }
+
+            let rtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
+            let rclass = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
+            let ttl = u32::from_be_bytes([
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+            let ttl = if ttl > MAX_TTL { 0 } else { ttl };
+            let rdlength = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
+            offset += 10;
+
+            if offset + rdlength > data.len() {
+                return None;
+            }
+
+            // Owner/class must match the question. An in-bailiwick reply can
+            // otherwise smuggle a record for an unrelated name (or a bogus
+            // class) into the answer section and have it read as ours.
+            if rtype == record_type && rclass == qclass && DnsName::eq(data, &owner, data, &qname) {
+                visit(ttl, &data[offset..offset + rdlength]);
+            }
+
+            offset += rdlength;
+        }
+
+        Some(())
+    }
+
+    /// `question_section` with the query binding required, for callers that
+    /// need only the verdict.
+    fn question_matches(data: &[u8], expect: &DnsQuestionRef) -> Option<()> {
+        Self::question_section(data, Some(expect)).map(|_| ())
+    }
+
+    /// Check that `data` is a reply (QR=1) with exactly one question and, when
+    /// `expect` is given, that its transaction ID and question match the query.
+    /// Returns the question name, the offset just past the question, and its
+    /// class.
+    fn question_section(
+        data: &[u8],
+        expect: Option<&DnsQuestionRef>,
+    ) -> Option<(DnsName, usize, u16)> {
+        if data.len() < DNS_HEADER_LEN {
             return None;
         }
 
         let flags = u16::from_be_bytes([data[2], data[3]]);
-        // Must be a response (QR=1) with no error (RCODE=0).
-        if (flags >> 15) & 1 != 1 || flags & 0x0F != 0 {
+        // Must be a response (QR=1).
+        if (flags >> 15) & 1 != 1 {
             return None;
         }
 
-        let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
-        let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
-
         // Exactly one question: DRIAD never pipelines, and a multi-question
         // reply gives us no single owner name to hold answers to.
-        if qdcount != 1 {
+        if u16::from_be_bytes([data[4], data[5]]) != 1 {
             return None;
         }
 
@@ -355,7 +617,7 @@ impl DriadResolver {
         }
 
         // Decode the question: its owner name is what every answer must match.
-        let qname = DnsName::decode(data, 12)?;
+        let qname = DnsName::decode(data, DNS_HEADER_LEN)?;
         let after_qname = qname.end;
         if after_qname + 4 > data.len() {
             return None;
@@ -372,35 +634,19 @@ impl DriadResolver {
             }
         }
 
-        let mut offset = after_qname + 4;
-        for _ in 0..ancount {
-            let owner = DnsName::decode(data, offset)?;
-            offset = owner.end;
-            if offset + 10 > data.len() {
-                return None;
-            }
+        Some((qname, after_qname + 4, qclass))
+    }
 
-            let rtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
-            let rclass = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
-            // data[offset+4..offset+8] = TTL, unused for selection.
-            let rdlength = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
-            offset += 10;
-
-            if offset + rdlength > data.len() {
-                return None;
-            }
-
-            // Owner/class must match the question. An in-bailiwick reply can
-            // otherwise smuggle a record for an unrelated name (or a bogus
-            // class) into the answer section and have it read as ours.
-            if rtype == record_type && rclass == qclass && DnsName::eq(data, &owner, data, &qname) {
-                visit(&data[offset..offset + rdlength]);
-            }
-
-            offset += rdlength;
-        }
-
-        Some(())
+    /// Decode one AMTRELAY answer into a candidate: the relay plus the
+    /// precedence, the D-bit and the record's TTL.
+    fn parse_amtrelay_candidate(ttl: u32, rdata: &[u8]) -> Option<DriadCandidate> {
+        let (precedence, relay) = Self::parse_amtrelay_record(rdata)?;
+        Some(DriadCandidate {
+            precedence,
+            discovery_optional: rdata[1] & AMTRELAY_D_BIT != 0,
+            relay,
+            ttl,
+        })
     }
 
     /// Parse AMTRELAY RDATA (RFC 8777 Section 4.2), returning its precedence.
@@ -414,7 +660,7 @@ impl DriadResolver {
         }
 
         let precedence = rdata[0];
-        let relay_type = rdata[1] & 0x7F;
+        let relay_type = rdata[1] & AMTRELAY_TYPE_MASK;
 
         let addr = match relay_type {
             1 => {
@@ -497,10 +743,14 @@ impl DriadResolver {
 /// See `crate::fuzz_api` for why these are not part of the public API.
 #[cfg(feature = "fuzzing")]
 pub mod fuzz_exports {
-    use super::{DriadRelayAddress, DriadResolver};
+    use super::{DriadCandidate, DriadRelayAddress, DriadResolver};
 
     pub fn parse_amtrelay_rdata(rdata: &[u8]) -> Option<(u8, DriadRelayAddress)> {
         DriadResolver::parse_amtrelay_record(rdata)
+    }
+
+    pub fn parse_amtrelay_candidate(ttl: u32, rdata: &[u8]) -> Option<DriadCandidate> {
+        DriadResolver::parse_amtrelay_candidate(ttl, rdata)
     }
 
     pub fn parse_dns_wire_name(data: &[u8]) -> Option<String> {
@@ -811,8 +1061,25 @@ mod tests {
             v4(3)
         );
         assert_eq!(
-            DriadResolver::parse_dns_response_candidates(&response),
-            vec![v4(1).unwrap(), v4(2).unwrap(), v4(3).unwrap()]
+            DriadResolver::lowest_precedence_set(&response, None),
+            Some(vec![v4(1).unwrap(), v4(2).unwrap(), v4(3).unwrap()])
+        );
+        // The candidate list keeps the precedence-20 backup too, in wire order.
+        let relays: Vec<_> = DriadResolver::parse_dns_response_candidates(&response)
+            .into_iter()
+            .map(|c| (c.precedence, c.relay))
+            .collect();
+        assert_eq!(
+            relays,
+            vec![
+                (
+                    20,
+                    DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)))
+                ),
+                (10, v4(1).unwrap()),
+                (10, v4(2).unwrap()),
+                (10, v4(3).unwrap()),
+            ]
         );
 
         let backup_first =
@@ -821,6 +1088,39 @@ mod tests {
             DriadResolver::select_amtrelay_with(&backup_first, None, |_| 0),
             v4(1)
         );
+    }
+
+    #[test]
+    fn candidate_keeps_d_bit_and_reads_a_top_bit_ttl_as_zero() {
+        let source: IpAddr = "69.25.95.192".parse().unwrap();
+        let mut response = amtrelay_v4_response(source, &[(10, [192, 0, 2, 1])]);
+        let rdata_at = response.len() - 6;
+        response[rdata_at + 1] |= AMTRELAY_D_BIT;
+        // TTL(4) and RDLENGTH(2) immediately precede RDATA.
+        let ttl_at = rdata_at - 6;
+        response[ttl_at..ttl_at + 4].copy_from_slice(&(MAX_TTL + 1).to_be_bytes());
+        assert_eq!(
+            DriadResolver::parse_dns_response_candidates(&response),
+            vec![DriadCandidate {
+                precedence: 10,
+                discovery_optional: true,
+                relay: DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+                ttl: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn truncated_reply_is_detected_only_when_bound_to_the_query() {
+        let source: IpAddr = "69.25.95.192".parse().unwrap();
+        let query = DriadResolver::build_dns_query_edns(source, 0xABCD);
+        let mut reply = amtrelay_v4_response(source, &[]);
+        assert!(!DriadResolver::is_truncated_reply(&query, &reply));
+        reply[2] |= (DNS_FLAG_TC >> 8) as u8;
+        assert!(DriadResolver::is_truncated_reply(&query, &reply));
+        // A truncated reply to some other query does not trigger a retry.
+        let other = DriadResolver::build_dns_query_edns(source, 0x1111);
+        assert!(!DriadResolver::is_truncated_reply(&other, &reply));
     }
 
     #[test]

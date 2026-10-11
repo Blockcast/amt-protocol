@@ -41,3 +41,10 @@ path = "fuzz_targets/driad_query_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "driad_candidates"
+path = "fuzz_targets/driad_candidates.rs"
+test = false
+doc = false
+bench = false

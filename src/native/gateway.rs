@@ -17,6 +17,7 @@ use tokio::time::Instant;
 
 use super::platform::NativePlatform;
 use crate::config::AmtConfig;
+use crate::driad::DriadRelayAddress;
 use crate::gateway::{GatewayState, GroupKey};
 use crate::subscription::{Event, SubscriptionManager};
 
@@ -46,6 +47,8 @@ pub(crate) enum Cmd {
 }
 
 pub struct AsyncAmtGateway {
+    /// The relay (discovery) address this gateway tunnels to.
+    pub(crate) relay: IpAddr,
     pub(crate) cmd_tx: mpsc::Sender<Cmd>,
     pub(crate) data_tx: broadcast::Sender<DataEvent>,
     pub(crate) state: Arc<AtomicU8>,
@@ -96,14 +99,22 @@ impl AsyncAmtGateway {
     }
 
     /// Construct a builder that will DRIAD-resolve the relay from `source`
-    /// when `.build()` is awaited.
+    /// when `.build()` is awaited, walking the candidates until one accepts
+    /// the handshake.
     pub fn builder_for_source(source: IpAddr) -> AsyncAmtGatewayBuilderForSource {
         AsyncAmtGatewayBuilderForSource {
             source,
+            nameservers: None,
             relay_port: 2268,
             keepalive: Duration::from_secs(AmtConfig::DEFAULT_KEEPALIVE_SECS as u64),
             log_target: "amt",
         }
+    }
+
+    /// The relay (discovery) address this gateway was built for: the explicit
+    /// one, or the DRIAD candidate that accepted the handshake.
+    pub fn relay(&self) -> IpAddr {
+        self.relay
     }
 
     pub fn state(&self) -> GatewayState {
@@ -252,6 +263,7 @@ impl AsyncAmtGatewayBuilder {
         ));
 
         Ok(AsyncAmtGateway {
+            relay,
             cmd_tx,
             data_tx,
             state,
@@ -433,6 +445,7 @@ fn handle_cmd(
 
 pub struct AsyncAmtGatewayBuilderForSource {
     source: IpAddr,
+    nameservers: Option<Vec<SocketAddr>>,
     relay_port: u16,
     keepalive: Duration,
     log_target: &'static str,
@@ -452,15 +465,57 @@ impl AsyncAmtGatewayBuilderForSource {
         self
     }
 
+    /// Ask these nameservers instead of the ones in /etc/resolv.conf.
+    pub fn nameservers(mut self, nameservers: Vec<SocketAddr>) -> Self {
+        self.nameservers = Some(nameservers);
+        self
+    }
+
+    /// Resolve every DRIAD candidate for the source, then walk them in
+    /// precedence order (ties shuffled, RFC 8777 §3.1.2) until one completes
+    /// the RFC 8777 §3.2.3 handshake, and build the gateway for that relay.
+    /// [`AsyncAmtGateway::relay`] reports which one it was.
     pub async fn build(self) -> Result<AsyncAmtGateway> {
-        let relay = super::resolver::resolve_amt_relay(self.source).await?;
-        tracing::info!(target: "amt", relay=%relay, "DRIAD resolved relay");
-        AsyncAmtGateway::builder(relay)
-            .relay_port(self.relay_port)
-            .keepalive(self.keepalive)
-            .log_target(self.log_target)
-            .build()
-            .await
+        let candidates = match &self.nameservers {
+            Some(nameservers) => {
+                super::resolver::resolve_candidates_via(self.source, nameservers).await?
+            }
+            None => super::resolver::resolve_amt_relay_candidates(self.source).await?,
+        };
+        let mut last_err: Option<anyhow::Error> = None;
+        for candidate in &candidates {
+            let DriadRelayAddress::Ip(relay) = candidate.relay else {
+                continue;
+            };
+            match super::probe::handshake(SocketAddr::new(relay, self.relay_port)).await {
+                Ok(()) => {
+                    tracing::info!(
+                        target: "amt",
+                        relay = %relay,
+                        precedence = candidate.precedence,
+                        candidates = candidates.len(),
+                        "DRIAD relay accepted the handshake"
+                    );
+                    return AsyncAmtGateway::builder(relay)
+                        .relay_port(self.relay_port)
+                        .keepalive(self.keepalive)
+                        .log_target(self.log_target)
+                        .build()
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "amt",
+                        relay = %relay,
+                        precedence = candidate.precedence,
+                        error = %e,
+                        "DRIAD relay failed the handshake; trying the next candidate"
+                    );
+                    last_err = Some(e.context(format!("DRIAD relay {relay}")));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("DRIAD offered no relay for {}", self.source)))
     }
 }
 

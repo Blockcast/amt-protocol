@@ -3,7 +3,7 @@
 //! Exposes Rust AMT protocol implementation to JavaScript/TypeScript.
 
 use crate::config::AmtConfig;
-use crate::driad::DriadResolver;
+use crate::driad::{DriadAddress, DriadCandidate, DriadRelayAddress, DriadResolver};
 use crate::gateway::{AmtGateway, GatewayState};
 use crate::igmp::{IgmpRecord, IgmpV3Report};
 use crate::messages::AmtMessage;
@@ -557,6 +557,95 @@ impl JsDriad {
     pub fn parse_dns_a_response_validated(query: &[u8], data: &[u8]) -> Option<String> {
         DriadResolver::parse_dns_a_response_validated(query, data).map(|addr| addr.to_string())
     }
+
+    /// Every usable AMTRELAY answer, in the order a gateway should try them:
+    /// lower precedence first, and a random order among equal precedence
+    /// (RFC 8777 §3.1.2), so walking the array fails over relay by relay.
+    ///
+    /// Each element is `{precedence, discoveryOptional, relayType, relay, ttl}`:
+    /// `relayType` is the RFC 8777 §4.2.3 type (1 IPv4, 2 IPv6, 3 name), `relay`
+    /// an IP string or a name, and `discoveryOptional` the D-bit (§4.2.2; when
+    /// false, discovery MUST precede a Request). A type-3 relay stands for each
+    /// address its name resolves to (`parseDnsAddressesValidated`), each with
+    /// the record's precedence and D-bit and the smaller of the two TTLs
+    /// (§4.2.4).
+    ///
+    /// Prefer `parseDnsResponseCandidatesValidated` whenever the query bytes
+    /// are still at hand, for the same reason as `parseDnsResponseValidated`.
+    ///
+    /// @param data - Raw DNS response bytes (Uint8Array)
+    /// @returns Array of candidates, empty when the response is rejected or has no usable record
+    #[wasm_bindgen(js_name = parseDnsResponseCandidates)]
+    pub fn parse_dns_response_candidates(data: &[u8]) -> js_sys::Array {
+        let mut candidates = DriadResolver::parse_dns_response_candidates(data);
+        DriadResolver::order_candidates(&mut candidates);
+        candidates.iter().map(candidate_to_js).collect()
+    }
+
+    /// `parseDnsResponseCandidates`, binding the response to `query` (the
+    /// packet `buildDnsQuery` returned): a reply with another transaction ID or
+    /// question yields an empty array.
+    ///
+    /// @param query - The DNS query packet that was sent (Uint8Array)
+    /// @param data - Raw DNS response bytes (Uint8Array)
+    /// @returns Array of candidates, as for `parseDnsResponseCandidates`
+    #[wasm_bindgen(js_name = parseDnsResponseCandidatesValidated)]
+    pub fn parse_dns_response_candidates_validated(query: &[u8], data: &[u8]) -> js_sys::Array {
+        let mut candidates = DriadResolver::parse_dns_response_candidates_validated(query, data);
+        DriadResolver::order_candidates(&mut candidates);
+        candidates.iter().map(candidate_to_js).collect()
+    }
+
+    /// Every address answer to an A or AAAA `query` (from `buildDnsAQuery` or a
+    /// matching AAAA query), bound to that query, in wire order. Each element
+    /// is `{address, ttl}`.
+    ///
+    /// @param query - The DNS A/AAAA query packet that was sent (Uint8Array)
+    /// @param data - Raw DNS response bytes (Uint8Array)
+    /// @returns Array of addresses, empty when the response is not a valid answer to `query`
+    #[wasm_bindgen(js_name = parseDnsAddressesValidated)]
+    pub fn parse_dns_addresses_validated(query: &[u8], data: &[u8]) -> js_sys::Array {
+        DriadResolver::parse_dns_addresses_validated(query, data)
+            .iter()
+            .map(address_to_js)
+            .collect()
+    }
+}
+
+/// RFC 8777 §4.2.3 relay type of a decoded relay: 1 IPv4, 2 IPv6, 3 name.
+fn relay_type(relay: &DriadRelayAddress) -> u8 {
+    match relay {
+        DriadRelayAddress::Ip(IpAddr::V4(_)) => 1,
+        DriadRelayAddress::Ip(IpAddr::V6(_)) => 2,
+        DriadRelayAddress::DnsName(_) => 3,
+    }
+}
+
+/// Set `key` on a plain object this module just created, which cannot refuse.
+fn set(object: &js_sys::Object, key: &str, value: JsValue) {
+    js_sys::Reflect::set(object, &JsValue::from_str(key), &value)
+        .expect("a fresh plain object accepts any property");
+}
+
+fn candidate_to_js(candidate: &DriadCandidate) -> js_sys::Object {
+    let object = js_sys::Object::new();
+    set(&object, "precedence", candidate.precedence.into());
+    set(
+        &object,
+        "discoveryOptional",
+        candidate.discovery_optional.into(),
+    );
+    set(&object, "relayType", relay_type(&candidate.relay).into());
+    set(&object, "relay", candidate.relay.to_string().into());
+    set(&object, "ttl", candidate.ttl.into());
+    object
+}
+
+fn address_to_js(address: &DriadAddress) -> js_sys::Object {
+    let object = js_sys::Object::new();
+    set(&object, "address", address.addr.to_string().into());
+    set(&object, "ttl", address.ttl.into());
+    object
 }
 
 /// Decode AMT message from bytes
@@ -578,4 +667,101 @@ pub fn decode_amt_message(data: &[u8]) -> Result<String, JsValue> {
     };
 
     Ok(msg_type.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_type_is_the_rfc_8777_type_octet() {
+        let v4 = DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let v6 = DriadRelayAddress::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let name = DriadRelayAddress::DnsName("sfo12.bcast.id".to_string());
+        assert_eq!(
+            [relay_type(&v4), relay_type(&v6), relay_type(&name)],
+            [1, 2, 3]
+        );
+    }
+}
+
+/// The JS shape itself, which only a wasm32 build with a JS host can observe.
+/// Run with `wasm-pack test --node` or `cargo test --target
+/// wasm32-unknown-unknown` under `wasm-bindgen-test-runner`.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod js_shape_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn get(object: &JsValue, key: &str) -> JsValue {
+        js_sys::Reflect::get(object, &JsValue::from_str(key)).unwrap()
+    }
+
+    /// A reply to `query` carrying `answers` (type, TTL, RDATA) after the echoed
+    /// header and question.
+    fn reply(query: &[u8], answers: &[(u16, u32, Vec<u8>)]) -> Vec<u8> {
+        let mut out = query.to_vec();
+        out[2] = 0x81;
+        out[3] = 0x80;
+        out[6..8].copy_from_slice(&(answers.len() as u16).to_be_bytes());
+        for (rtype, ttl, rdata) in answers {
+            out.extend_from_slice(&[0xC0, 0x0C]);
+            out.extend_from_slice(&rtype.to_be_bytes());
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&ttl.to_be_bytes());
+            out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            out.extend_from_slice(rdata);
+        }
+        out
+    }
+
+    #[wasm_bindgen_test]
+    fn candidates_are_plain_objects_in_walk_order() {
+        let query = DriadResolver::build_dns_query("69.25.95.10".parse().unwrap(), 0x1234);
+        let mut named = vec![20, 0x03];
+        named.extend_from_slice(b"\x05sfo12\x05bcast\x02id\x00");
+        let data = reply(
+            &query,
+            &[(260, 3600, named), (260, 60, vec![10, 0x81, 192, 0, 2, 1])],
+        );
+        let candidates = JsDriad::parse_dns_response_candidates_validated(&query, &data);
+        assert_eq!(candidates.length(), 2);
+        let first = candidates.get(0);
+        assert_eq!(get(&first, "precedence").as_f64(), Some(10.0));
+        assert_eq!(get(&first, "discoveryOptional").as_bool(), Some(true));
+        assert_eq!(get(&first, "relayType").as_f64(), Some(1.0));
+        assert_eq!(
+            get(&first, "relay").as_string().as_deref(),
+            Some("192.0.2.1")
+        );
+        assert_eq!(get(&first, "ttl").as_f64(), Some(60.0));
+        let second = candidates.get(1);
+        assert_eq!(get(&second, "relayType").as_f64(), Some(3.0));
+        assert_eq!(
+            get(&second, "relay").as_string().as_deref(),
+            Some("sfo12.bcast.id")
+        );
+        assert_eq!(get(&second, "discoveryOptional").as_bool(), Some(false));
+
+        let mut wrong_txid = data.clone();
+        wrong_txid[0] ^= 0xFF;
+        assert_eq!(
+            JsDriad::parse_dns_response_candidates_validated(&query, &wrong_txid).length(),
+            0
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn addresses_are_plain_objects() {
+        let query = DriadResolver::build_dns_a_query("sfo12.bcast.id", 0x1234);
+        let data = reply(&query, &[(1, 30, vec![192, 0, 2, 7])]);
+        let addresses = JsDriad::parse_dns_addresses_validated(&query, &data);
+        assert_eq!(addresses.length(), 1);
+        let first = addresses.get(0);
+        assert_eq!(
+            get(&first, "address").as_string().as_deref(),
+            Some("192.0.2.7")
+        );
+        assert_eq!(get(&first, "ttl").as_f64(), Some(30.0));
+    }
 }

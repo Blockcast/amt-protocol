@@ -70,8 +70,12 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+
 # For native-runtime integration tests. `process` is needed by tests/cli_json.rs
-# (Task 3.4) which spawns the built bin via tokio::process::Command.
+# (Task 3.4) which spawns the built bin via tokio::process::Command. Not on
+# wasm32, where tokio's `net` (mio) does not build: that kept the wasm-bindgen
+# tests in src/wasm.rs from compiling under `--target wasm32-unknown-unknown`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "process", "io-util"] }
 
 [[bin]]
