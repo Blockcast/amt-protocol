@@ -53,7 +53,7 @@ jobs:
       # Candidate lists: precedence, D-bit and TTL kept per record, tie
       # permutations reachable, type-3 expansion, query binding, EDNS framing.
       - name: candidate lists
-        run: cargo test --test driad_candidates --no-default-features
+        run: cargo test --test driad_candidates --no-default-features --locked
 
   wasm-shape:
     name: wasm-bindgen JS shape
