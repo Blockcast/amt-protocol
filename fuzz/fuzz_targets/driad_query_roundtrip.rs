@@ -3,14 +3,18 @@
 //! than the query-less one, never differently permissive.
 //!
 //! `parse_dns_response_validated` adds transaction-ID and question checks on
-//! top of the same answer selection `parse_dns_response` performs. So for any
-//! (query, response) pair the following must hold:
+//! top of the same answer selection `parse_dns_response` performs. The relay
+//! choice among equal precedence is random (RFC 8777 §3.1.2), so the property
+//! is stated on the deterministic candidate lists, as in
+//! `tests/driad_fuzz_corpus.rs`. For any (query, response) pair:
 //!
-//!   validated(q, r) == Some(x)  ⟹  parse(r) == Some(x)
+//!   candidates_validated(q, r) ⊆ candidates(r), and
+//!   validated(q, r) == Some(x)  ⟹  x is a lowest-precedence record of
+//!                                   candidates_validated(q, r)
 //!
-//! A violation means the two entry points disagree about which record wins,
-//! which would make the hardened native path and the browser path resolve
-//! different relays from identical bytes.
+//! A violation means the query-bound parser accepted a record the query-less
+//! one would not offer, which would make the hardened native path and the
+//! browser path choose among different relays from identical bytes.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -22,12 +26,20 @@ fuzz_target!(|data: &[u8]| {
     let split = data.len() / 2;
     let (query, response) = data.split_at(split);
 
+    let candidates = DriadResolver::parse_dns_response_candidates(response);
+    let validated_candidates =
+        DriadResolver::parse_dns_response_candidates_validated(query, response);
+    assert!(
+        validated_candidates.iter().all(|c| candidates.contains(c)),
+        "validated candidates exceed the query-less list"
+    );
     if let Some(validated) = DriadResolver::parse_dns_response_validated(query, response) {
-        let unvalidated = DriadResolver::parse_dns_response(response);
-        assert_eq!(
-            Some(validated),
-            unvalidated,
-            "validated parse accepted a record the query-less parse did not select"
+        let best = validated_candidates.iter().map(|c| c.precedence).min();
+        assert!(
+            validated_candidates
+                .iter()
+                .any(|c| Some(c.precedence) == best && c.relay == validated),
+            "validated parse selected {validated:?}, outside its lowest-precedence candidates"
         );
     }
 

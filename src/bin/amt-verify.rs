@@ -621,11 +621,9 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
                 .build()
                 .await
                 .map_err(ExitCategory::HandshakeFail)?;
-            // Re-resolve to surface the address in JSON output. Cheap UDP
-            // lookup; an alternative is exposing a getter on AsyncAmtGateway.
-            let resolved = amt_protocol::native::resolver::resolve_amt_relay(args.source)
-                .await
-                .map_err(ExitCategory::HandshakeFail)?;
+            // The candidate that accepted the handshake. Resolving again here
+            // could name a different relay: equal-precedence order is random.
+            let resolved = gw.relay();
             (gw, resolved)
         }
     };

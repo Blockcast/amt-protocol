@@ -50,6 +50,40 @@ jobs:
       - name: bounded mutation harness
         run: cargo test --test driad_fuzz_corpus --no-default-features --features fuzzing
 
+      # Candidate lists: precedence, D-bit and TTL kept per record, tie
+      # permutations reachable, type-3 expansion, query binding, EDNS framing.
+      - name: candidate lists
+        run: cargo test --test driad_candidates --no-default-features
+
+  wasm-shape:
+    name: wasm-bindgen JS shape
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Kept equal to rust-toolchain.toml's `channel` (BLO-41503).
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # The runner must speak the crate's bindgen schema, so its version comes
+      # from Cargo.lock instead of a second pin that could drift.
+      - name: install wasm-bindgen-test-runner
+        run: |
+          set -euo pipefail
+          version="$(awk '$0 == "name = \"wasm-bindgen\"" { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
+          test -n "$version"
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      # JsDriad.parseDnsResponseCandidates(Validated) / parseDnsAddressesValidated
+      # return arrays of plain objects; only a wasm32 build in a JS host can
+      # observe that shape. Fails if the two shape tests did not both run.
+      - name: JsDriad candidate and address shape (Node)
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: |
+          set -euo pipefail
+          cargo test --target wasm32-unknown-unknown --lib js_shape --locked 2>&1 | tee shape.log
+          grep -q 'test result: ok. 2 passed' shape.log
+
   fuzz:
     name: libFuzzer (bounded)
     runs-on: ubuntu-latest
@@ -82,6 +116,8 @@ jobs:
         run: cargo fuzz run driad_amtrelay_rdata -- -max_total_time=120 -max_len=512
       - name: fuzz validated/unvalidated differential
         run: cargo fuzz run driad_query_roundtrip -- -max_total_time=120 -max_len=4096
+      - name: fuzz candidate list
+        run: cargo fuzz run driad_candidates -- -max_total_time=120 -max_len=4096
 
       - name: upload crash artifacts
         if: failure()

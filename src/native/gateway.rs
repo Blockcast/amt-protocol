@@ -17,6 +17,7 @@ use tokio::time::Instant;
 
 use super::platform::NativePlatform;
 use crate::config::AmtConfig;
+use crate::driad::DriadRelayAddress;
 use crate::gateway::{GatewayState, GroupKey};
 use crate::subscription::{Event, SubscriptionManager};
 
@@ -46,6 +47,8 @@ pub(crate) enum Cmd {
 }
 
 pub struct AsyncAmtGateway {
+    /// The relay (discovery) address this gateway tunnels to.
+    pub(crate) relay: IpAddr,
     pub(crate) cmd_tx: mpsc::Sender<Cmd>,
     pub(crate) data_tx: broadcast::Sender<DataEvent>,
     pub(crate) state: Arc<AtomicU8>,
@@ -96,14 +99,23 @@ impl AsyncAmtGateway {
     }
 
     /// Construct a builder that will DRIAD-resolve the relay from `source`
-    /// when `.build()` is awaited.
+    /// when `.build()` is awaited, walking the candidates until one accepts
+    /// the handshake.
     pub fn builder_for_source(source: IpAddr) -> AsyncAmtGatewayBuilderForSource {
         AsyncAmtGatewayBuilderForSource {
             source,
+            nameservers: None,
+            discovery_timeout: None,
             relay_port: 2268,
             keepalive: Duration::from_secs(AmtConfig::DEFAULT_KEEPALIVE_SECS as u64),
             log_target: "amt",
         }
+    }
+
+    /// The relay (discovery) address this gateway was built for: the explicit
+    /// one, or the DRIAD candidate that accepted the handshake.
+    pub fn relay(&self) -> IpAddr {
+        self.relay
     }
 
     pub fn state(&self) -> GatewayState {
@@ -223,11 +235,13 @@ impl AsyncAmtGatewayBuilder {
     /// Build and spawn the runtime task.
     pub async fn build(self) -> Result<AsyncAmtGateway> {
         let relay = self.relay.ok_or_else(|| anyhow!("relay address not set"))?;
-        let bind = match relay {
-            IpAddr::V4(_) => "0.0.0.0:0",
-            IpAddr::V6(_) => "[::]:0",
-        };
-        let sock = UdpSocket::bind(bind).await?;
+        let sock = UdpSocket::bind(wildcard_for(relay)).await?;
+        Ok(self.spawn_on(relay, sock))
+    }
+
+    /// Spawn the runtime task on `sock`, an unconnected socket of `relay`'s
+    /// family.
+    fn spawn_on(self, relay: IpAddr, sock: UdpSocket) -> AsyncAmtGateway {
         let mut cfg = AmtConfig::new(relay, Some(self.relay_port));
         cfg.keepalive_interval_secs = self.keepalive.as_secs() as u32;
 
@@ -251,7 +265,8 @@ impl AsyncAmtGatewayBuilder {
             self.log_target,
         ));
 
-        Ok(AsyncAmtGateway {
+        AsyncAmtGateway {
+            relay,
             cmd_tx,
             data_tx,
             state,
@@ -259,7 +274,15 @@ impl AsyncAmtGatewayBuilder {
             fatal,
             keepalives,
             rx_datagrams,
-        })
+        }
+    }
+}
+
+/// The wildcard bind address, any port, in `relay`'s family.
+fn wildcard_for(relay: IpAddr) -> &'static str {
+    match relay {
+        IpAddr::V4(_) => "0.0.0.0:0",
+        IpAddr::V6(_) => "[::]:0",
     }
 }
 
@@ -433,6 +456,8 @@ fn handle_cmd(
 
 pub struct AsyncAmtGatewayBuilderForSource {
     source: IpAddr,
+    nameservers: Option<Vec<SocketAddr>>,
+    discovery_timeout: Option<Duration>,
     relay_port: u16,
     keepalive: Duration,
     log_target: &'static str,
@@ -452,15 +477,82 @@ impl AsyncAmtGatewayBuilderForSource {
         self
     }
 
+    /// Ask these nameservers instead of the ones in /etc/resolv.conf.
+    pub fn nameservers(mut self, nameservers: Vec<SocketAddr>) -> Self {
+        self.nameservers = Some(nameservers);
+        self
+    }
+
+    /// Fail [`build`](Self::build) if resolving and walking the candidates
+    /// has not produced a relay within `limit`. Without it the walk is bounded
+    /// only by the candidate cap ([`super::resolver::MAX_CANDIDATES`]): each
+    /// unreachable candidate costs the full discovery and request budget.
+    pub fn discovery_timeout(mut self, limit: Duration) -> Self {
+        self.discovery_timeout = Some(limit);
+        self
+    }
+
+    /// Resolve the source's most preferred DRIAD candidates (at most
+    /// [`super::resolver::MAX_CANDIDATES`]), then walk them in
+    /// precedence order (ties shuffled, RFC 8777 §3.1.2) until one completes
+    /// the RFC 8777 §3.2.3 handshake, and build the gateway for that relay.
+    /// [`AsyncAmtGateway::relay`] reports which one it was.
     pub async fn build(self) -> Result<AsyncAmtGateway> {
-        let relay = super::resolver::resolve_amt_relay(self.source).await?;
-        tracing::info!(target: "amt", relay=%relay, "DRIAD resolved relay");
-        AsyncAmtGateway::builder(relay)
-            .relay_port(self.relay_port)
-            .keepalive(self.keepalive)
-            .log_target(self.log_target)
-            .build()
-            .await
+        let source = self.source;
+        match self.discovery_timeout {
+            Some(limit) => tokio::time::timeout(limit, self.discover())
+                .await
+                .map_err(|_| {
+                    anyhow!("DRIAD found no working relay for {source} within {limit:?}")
+                })?,
+            None => self.discover().await,
+        }
+    }
+
+    async fn discover(self) -> Result<AsyncAmtGateway> {
+        let candidates = match &self.nameservers {
+            Some(nameservers) => {
+                super::resolver::resolve_candidates_via(self.source, nameservers).await?
+            }
+            None => super::resolver::resolve_amt_relay_candidates(self.source).await?,
+        };
+        let mut last_err: Option<anyhow::Error> = None;
+        for candidate in &candidates {
+            let DriadRelayAddress::Ip(relay) = candidate.relay else {
+                continue;
+            };
+            let sock = UdpSocket::bind(wildcard_for(relay)).await?;
+            match super::probe::handshake(&sock, SocketAddr::new(relay, self.relay_port)).await {
+                Ok(()) => {
+                    tracing::info!(
+                        target: "amt",
+                        relay = %relay,
+                        precedence = candidate.precedence,
+                        candidates = candidates.len(),
+                        "DRIAD relay accepted the handshake"
+                    );
+                    // The gateway keeps the socket the check ran on: a relay
+                    // that keys its tunnel by our address answers every later
+                    // Request at the check's port (see `probe`).
+                    return Ok(AsyncAmtGateway::builder(relay)
+                        .relay_port(self.relay_port)
+                        .keepalive(self.keepalive)
+                        .log_target(self.log_target)
+                        .spawn_on(relay, sock));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "amt",
+                        relay = %relay,
+                        precedence = candidate.precedence,
+                        error = %e,
+                        "DRIAD relay failed the handshake; trying the next candidate"
+                    );
+                    last_err = Some(e.context(format!("DRIAD relay {relay}")));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("DRIAD offered no relay for {}", self.source)))
     }
 }
 

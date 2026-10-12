@@ -263,7 +263,7 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
                 ),
             ]),
         ),
-        // Ties keep wire order.
+        // Equal precedence: either relay may be chosen (RFC 8777 §3.1.2).
         (
             "r_precedence_tie.bin",
             response(&[
@@ -676,12 +676,26 @@ fn falls_through_when_best_precedence_record_is_unusable() {
 }
 
 #[test]
-fn precedence_tie_keeps_wire_order() {
-    assert_eq!(
-        DriadResolver::parse_dns_response(&load("r_precedence_tie.bin")),
-        Some(DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::new(
-            192, 0, 2, 1
-        )))),
+fn precedence_tie_chooses_among_equal_relays() {
+    // RFC 8777 §3.1.2: a non-deterministic choice among equal-precedence relays,
+    // so a source that lists several relays spreads gateways across them. Over 64
+    // draws, the chance that a fair choice never picks one of two relays is 2^-63.
+    let first = DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::from(RELAY_V4)));
+    let second = DriadRelayAddress::Ip(IpAddr::V4(Ipv4Addr::from(RELAY_V4_ALT)));
+    let fixture = load("r_precedence_tie.bin");
+    let (mut saw_first, mut saw_second) = (false, false);
+    for _ in 0..64 {
+        let chosen = DriadResolver::parse_dns_response(&fixture).expect("a relay");
+        assert!(
+            chosen == first || chosen == second,
+            "chose {chosen:?}, not a tied relay"
+        );
+        saw_first |= chosen == first;
+        saw_second |= chosen == second;
+    }
+    assert!(
+        saw_first && saw_second,
+        "both equal-precedence relays must be chosen"
     );
 }
 

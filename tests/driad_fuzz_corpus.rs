@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use amt_protocol::DriadResolver;
+use amt_protocol::{DriadCandidate, DriadRelayAddress, DriadResolver};
 
 /// xorshift64*, so the mutation schedule is fixed and reproducible without
 /// pulling in an RNG dependency (BLO-28790 forbids new dependencies).
@@ -62,6 +62,7 @@ fn seeds() -> Vec<Vec<u8>> {
         "driad_parse_response",
         "driad_amtrelay_rdata",
         "driad_query_roundtrip",
+        "driad_candidates",
     ] {
         out.extend(read_dir_files(&root.join("fuzz/corpus").join(target)));
     }
@@ -118,6 +119,17 @@ fn mutate(rng: &mut Rng, seed: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// True when `relay` is one of the candidates at the lowest precedence present,
+/// the set `parse_dns_response` draws from.
+fn in_lowest_precedence(candidates: &[DriadCandidate], relay: &DriadRelayAddress) -> bool {
+    let Some(best) = candidates.iter().map(|c| c.precedence).min() else {
+        return false;
+    };
+    candidates
+        .iter()
+        .any(|c| c.precedence == best && &c.relay == relay)
+}
+
 /// The parser must be total on arbitrary bytes: no panic, no hang, no
 /// out-of-bounds. Every entry point, over every mutated seed.
 #[test]
@@ -135,32 +147,69 @@ fn parsers_are_total_on_mutated_corpus() {
         let seed = &seeds[rng.below(seeds.len())];
         let input = mutate(&mut rng, seed);
 
+        // The relay choice among equal precedence is random (RFC 8777 §3.1.2), so the
+        // properties below are stated on the deterministic candidate list.
+        let candidates = DriadResolver::parse_dns_response_candidates(&input);
         let unvalidated = DriadResolver::parse_dns_response(&input);
         let _ = DriadResolver::parse_dns_a_response(&input);
         let _ = DriadResolver::parse_dns_aaaa_response(&input);
+        assert_eq!(
+            unvalidated.is_some(),
+            !candidates.is_empty(),
+            "parse_dns_response and its candidate list disagree on acceptance; input = {input:02x?}"
+        );
+        if let Some(u) = &unvalidated {
+            assert!(
+                in_lowest_precedence(&candidates, u),
+                "selected {u:?} outside the lowest-precedence candidates; input = {input:02x?}"
+            );
+        }
 
         // Mutant as response, against a known-good query.
         let validated = DriadResolver::parse_dns_response_validated(&query, &input);
+        let validated_candidates =
+            DriadResolver::parse_dns_response_candidates_validated(&query, &input);
 
         // The query-bound parser is strictly stricter: it may reject more, but
-        // it must never accept a record the query-less parser did not select.
-        if let Some(v) = validated {
-            assert_eq!(
-                Some(v),
-                unvalidated,
-                "validated accepted a record parse_dns_response did not select; input = {input:02x?}"
+        // it must never accept a record the query-less parser would not offer.
+        if let Some(v) = &validated {
+            assert!(
+                in_lowest_precedence(&validated_candidates, v),
+                "validated selected {v:?} outside its lowest-precedence candidates; input = {input:02x?}"
             );
         }
+        assert!(
+            validated_candidates.iter().all(|c| candidates.contains(c)),
+            "validated candidates exceed the query-less list; input = {input:02x?}"
+        );
+
+        // Ordering is a permutation sorted by precedence, whatever the draw.
+        let mut ordered = candidates.clone();
+        DriadResolver::order_candidates_with(&mut ordered, |n| rng.below(n as usize) as u32);
+        assert!(
+            ordered
+                .windows(2)
+                .all(|w| w[0].precedence <= w[1].precedence),
+            "ordering inverted precedence; input = {input:02x?}"
+        );
+        assert!(
+            ordered.len() == candidates.len() && ordered.iter().all(|c| candidates.contains(c)),
+            "ordering is not a permutation of the candidates; input = {input:02x?}"
+        );
 
         // Mutant as query, against a known-good response — the query side is
         // also attacker-influenced once a type-3 relay name is followed up.
         let _ = DriadResolver::parse_dns_response_validated(&input, seed);
+        let _ = DriadResolver::parse_dns_addresses_validated(&input, seed);
+        let _ = DriadResolver::parse_dns_addresses_validated(&query, &input);
+        let _ = DriadResolver::is_truncated_reply(&query, &input);
+        let _ = DriadResolver::is_truncated_reply(&input, seed);
 
-        // Parsing must be a pure function of the bytes.
+        // The candidate list must be a pure function of the bytes.
         assert_eq!(
-            unvalidated,
-            DriadResolver::parse_dns_response(&input),
-            "parse is not deterministic for input = {input:02x?}"
+            candidates,
+            DriadResolver::parse_dns_response_candidates(&input),
+            "candidate list is not deterministic for input = {input:02x?}"
         );
 
         executed += 1;
@@ -219,6 +268,14 @@ fn amtrelay_rdata_decoder_is_total_and_keeps_precedence() {
             assert_eq!(
                 precedence, input[0],
                 "decoded precedence must be RDATA octet 0; input = {input:02x?}"
+            );
+        }
+        if let Some(candidate) = amt_protocol::fuzz_api::parse_amtrelay_candidate(0, &input) {
+            assert_eq!(candidate.precedence, input[0]);
+            assert_eq!(
+                candidate.discovery_optional,
+                input[1] & 0x80 != 0,
+                "the D-bit must survive decoding; input = {input:02x?}"
             );
         }
         let _ = amt_protocol::fuzz_api::parse_dns_wire_name(&input);

@@ -44,7 +44,9 @@ pub mod wasm;
 /// path safe (BLO-28790).
 #[cfg(feature = "fuzzing")]
 pub mod fuzz_api {
-    pub use crate::driad::fuzz_exports::{parse_amtrelay_rdata, parse_dns_wire_name};
+    pub use crate::driad::fuzz_exports::{
+        parse_amtrelay_candidate, parse_amtrelay_rdata, parse_dns_wire_name,
+    };
 }
 
 #[cfg(feature = "ffi")]
@@ -55,7 +57,7 @@ pub mod jni;
 
 pub use config::AmtConfig;
 pub use constants::*;
-pub use driad::{DriadRelayAddress, DriadResolver};
+pub use driad::{DriadAddress, DriadCandidate, DriadRelayAddress, DriadResolver};
 pub use error::{AmtError, Result};
 pub use gateway::{AmtGateway, GatewayState, GroupInfo, GroupKey};
 pub use igmp::{IgmpRecord, IgmpV3Report, RecordType};

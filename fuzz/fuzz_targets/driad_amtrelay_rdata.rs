@@ -20,5 +20,12 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
+    // The D-bit (RFC 8777 §4.2.2) must survive into the candidate too: a
+    // dropped D-bit would let a gateway skip discovery a relay requires.
+    if let Some(candidate) = amt_protocol::fuzz_api::parse_amtrelay_candidate(0, data) {
+        assert_eq!(candidate.precedence, data[0]);
+        assert_eq!(candidate.discovery_optional, data[1] & 0x80 != 0);
+    }
+
     let _ = amt_protocol::fuzz_api::parse_dns_wire_name(data);
 });

@@ -2,6 +2,7 @@
 
 pub mod gateway;
 pub mod platform;
+pub mod probe;
 pub mod resolver;
 
 pub use gateway::{AsyncAmtGateway, AsyncAmtGatewayBuilder, DataEvent};
