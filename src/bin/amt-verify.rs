@@ -1,7 +1,7 @@
 //! amt-verify — one-shot + watch E2E verify CLI for AMT tunnels.
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -78,6 +78,18 @@ struct Args {
     /// Rejected with exit 2 if combined with --watch.
     #[arg(long, default_value_t = false)]
     json: bool,
+
+    /// Hand each counted payload — the inner UDP payload, byte for byte — to a
+    /// decoder on this host, e.g. `127.0.0.1:15003` or `[::1]:15003` for
+    /// `txfeed-sub -listen` (BLO-46422). One-shot and `--watch` alike. Loopback
+    /// only: anything else, multicast included, is refused with exit 2.
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        value_parser = parse_forward,
+        conflicts_with = "tunnels"
+    )]
+    forward: Option<SocketAddr>,
 
     /// Verbose logging (sets RUST_LOG=debug for crate=amt)
     #[arg(short, long, default_value_t = false)]
@@ -204,6 +216,14 @@ struct OneshotReport {
     /// Receiver-intrinsic loss, read off the stream's own sequence numbers.
     /// `null` when no packet arrived. See [`SeqTracker`].
     mmtp: Option<MmtpLoss>,
+    /// `--forward` only, `null` without it: counted payloads the kernel
+    /// accepted for the loopback decoder. Not a delivery count — UDP gives the
+    /// sender none, and an absent reader drops them on its side of loopback.
+    /// `forwarded + forward_errors == packet_count`.
+    forwarded: Option<u64>,
+    /// `--forward` sends that failed. Never subtracted from `packet_count`: a
+    /// failed hand-off is not a missed packet.
+    forward_errors: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -603,6 +623,14 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
         return run_tunnels(&args, n, shutdown_mode).await;
     }
 
+    // Bound before the join, so a socket that cannot exist fails the run
+    // without having subscribed to anything.
+    let mut fwd = args
+        .forward
+        .map(Forwarder::bind)
+        .transpose()
+        .map_err(|e| ExitCategory::Fatal(anyhow!("--forward: bind loopback socket: {e}")))?;
+
     // ----- Build gateway (explicit relay OR DRIAD path) -----
     let (gw, resolved_relay) = match args.relay {
         Some(r) => {
@@ -686,6 +714,9 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
                 seq.observe(&evt.payload);
                 elapsed_ms = Some(data_started.elapsed().as_millis() as u64);
                 data_ended_at_ms = Some(unix_millis());
+                if let Some(f) = fwd.as_mut() {
+                    f.send(&evt.payload);
+                }
                 if first_evt.is_none() {
                     first_data_ms = Some(started.elapsed().as_millis() as u64);
                     first_evt = Some(evt);
@@ -729,6 +760,8 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
                     .collect(),
             }),
             mmtp: seq.finish(),
+            forwarded: fwd.as_ref().map(|f| f.forwarded),
+            forward_errors: fwd.as_ref().map(|f| f.errors),
         };
         println!(
             "{}",
@@ -764,7 +797,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     }
 
     if args.watch {
-        run_watch(gw, data_rx, args.group, args.source, shutdown_mode)
+        run_watch(gw, data_rx, args.group, args.source, shutdown_mode, fwd)
             .await
             .map_err(ExitCategory::Fatal)?;
     } else {
@@ -851,6 +884,7 @@ async fn run_watch(
     group: IpAddr,
     source: IpAddr,
     shutdown_mode: ShutdownMode,
+    mut fwd: Option<Forwarder>,
 ) -> Result<()> {
     use tokio::sync::broadcast::error::RecvError;
     let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -870,6 +904,9 @@ async fn run_watch(
                         pkts += 1;
                         bytes += evt.payload.len() as u64;
                         last_seen = Instant::now();
+                        if let Some(f) = fwd.as_mut() {
+                            f.send(&evt.payload);
+                        }
                     }
                     Err(RecvError::Lagged(skipped)) => {
                         eprintln!("amt-verify: WARN lagged {} packets", skipped);
@@ -910,6 +947,63 @@ async fn finish_gateway(
         ShutdownMode::DropWithoutTeardown => {
             drop(gw);
             Ok(())
+        }
+    }
+}
+
+/// `--forward` value parser. Loopback only: the flag is a hand-off to a decoder
+/// on this host, and a slip — the channel's own group typed where the decoder's
+/// address belongs — must not turn a receive-only probe into a sender.
+fn parse_forward(s: &str) -> std::result::Result<SocketAddr, String> {
+    let addr = s.parse::<SocketAddr>().map_err(|e| e.to_string())?;
+    if !addr.ip().is_loopback() {
+        return Err(
+            "not a loopback address; --forward sends only to 127.0.0.0/8 or [::1], \
+             never to a multicast group or the network"
+                .into(),
+        );
+    }
+    Ok(addr)
+}
+
+/// `--forward` hand-off: each counted payload, unchanged, to the decoder. One
+/// non-blocking socket, so a send can fail but never stall the receive loop,
+/// bound to the destination's own loopback address, which also picks the family.
+struct Forwarder {
+    sock: std::net::UdpSocket,
+    to: SocketAddr,
+    forwarded: u64,
+    errors: u64,
+}
+
+impl Forwarder {
+    fn bind(to: SocketAddr) -> std::io::Result<Self> {
+        let sock = std::net::UdpSocket::bind((to.ip(), 0))?;
+        sock.set_nonblocking(true)?;
+        Ok(Self {
+            sock,
+            to,
+            forwarded: 0,
+            errors: 0,
+        })
+    }
+
+    fn send(&mut self, payload: &[u8]) {
+        match self.sock.send_to(payload, self.to) {
+            Ok(_) => self.forwarded += 1,
+            Err(e) => {
+                // Once, not per packet: at stream rate that floods stderr, and
+                // `--watch` has no report to carry the count.
+                if self.errors == 0 {
+                    tracing::warn!(
+                        target: "amt",
+                        to=%self.to,
+                        error=?e,
+                        "--forward send failed; later failures are counted, not logged"
+                    );
+                }
+                self.errors += 1;
+            }
         }
     }
 }
