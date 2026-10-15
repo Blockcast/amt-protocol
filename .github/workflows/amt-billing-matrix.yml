@@ -98,6 +98,10 @@ jobs:
             drop) flag=--drop-without-teardown ;;
             *) echo "::error::unknown shape $SHAPE"; exit 2 ;;
           esac
+          # Validate before tcpdump starts: a non-numeric tail would fail `sleep`
+          # under bash -e after the capture began, and >1200 s overruns the 25m job.
+          case "$CAPTURE_TAIL" in ''|*[!0-9]*) echo "::error::capture_tail must be an integer"; exit 2 ;; esac
+          [ "$CAPTURE_TAIL" -le 1200 ] || { echo "::error::capture_tail > 1200 s exceeds the 25m job budget"; exit 2; }
           mkdir -p out
           ip=$(curl -fsS -4 https://api.ipify.org || echo unavailable)
           {
