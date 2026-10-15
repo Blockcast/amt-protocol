@@ -185,10 +185,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           # Version-pinned and kept equal to rust-toolchain.toml's `channel` — see
-          # the lint job above. This leg is also the drift detector for that pair:
-          # `targets:` installs wasm32 for THIS rev, while the cargo calls below
-          # resolve the toml, so if the two ever disagree the wasm32 build fails
-          # loudly on a required check instead of rotting quietly.
+          # the lint job above. This leg is NOT a drift detector for that pair:
+          # rust-toolchain.toml declares wasm32 in `targets` (BLO-43602), so a
+          # drifted rev still builds wasm32 green. tests/toolchain_pin_test.sh
+          # check 1, in the required lint legs, is the only drift guard. For the
+          # toml's channel, `targets:` below is now redundant; it stays because
+          # it is harmless.
           #
           # Installed as part of the pinned toolchain resolution rather than via a
           # `rustup target add` run step, so rust-cache below sees it and the wasm

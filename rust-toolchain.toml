@@ -20,8 +20,11 @@
 # Keep `channel` equal to every `dtolnay/rust-toolchain@<rev>` pin in
 # .github/workflows/ (the driad-parser fuzz job's `@nightly` excepted: it selects
 # nightly with RUSTUP_TOOLCHAIN, which outranks this file).
-# tests/toolchain_pin_test.sh fails on any other rev; ci.yml's `test` job is the
-# runtime drift detector (see the comment there).
+# tests/toolchain_pin_test.sh check 1 fails on any other rev, and it is the ONLY
+# drift guard for that pair: it runs in the required `lint` legs. ci.yml's
+# `test (default-wasm)` leg used to catch drift at runtime too, but since the
+# `targets` line below, rustup installs wasm32 with `channel` whatever the
+# dtolnay rev is, so that build stays green on a drifted pin. BLO-43602.
 #
 # The Dockerfile's `FROM rust:<ver>` builds the published amt-verify binary and
 # must equal `channel` exactly, patch included -- tests/toolchain_pin_test.sh
@@ -39,5 +42,7 @@ components = ["clippy", "rustfmt"]
 # install wasm32 on their own toolchain, but inside this directory rustup
 # switches to `channel` above, which then has no wasm32 std:
 # `error[E0463]: can't find crate for core`. Declaring it here makes rustup
-# install it with the pinned toolchain. BLO-43602.
+# install it with the pinned toolchain. This repo's CI cannot see the line go
+# missing (its wasm leg installs wasm32 via dtolnay `targets:` regardless), so
+# tests/toolchain_pin_test.sh check 6 asserts it. BLO-43602.
 targets = ["wasm32-unknown-unknown"]

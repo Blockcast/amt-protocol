@@ -78,6 +78,11 @@
 #      advisory. A gate naming a missing leg skips the step on every leg -- green,
 #      enforcing nothing. (A typo'd gate also skips this check itself in CI;
 #      running it anywhere else still catches that.)
+#   6. The toml's `targets` declares wasm32-unknown-unknown. Consumers build the
+#      WASM module from a checkout of this repo, where rustup switches to
+#      `channel`; without the line that toolchain has no wasm32 std (E0463).
+#      Nothing else in this repo's CI catches its removal: the default-wasm leg
+#      installs wasm32 through dtolnay `targets:` either way. BLO-43602.
 #
 # Prints how many pins and cargo calls it checked, so a pattern that silently
 # matches nothing reads as a failure, not a pass.
@@ -111,7 +116,7 @@ if [ "${1:-}" = --self-test ]; then
     leg() {
         local name=$1 want=$2 text=$3 nocargo=${4:-} second=${5:-driad.yml} d=$tmp/$1 out rc
         mkdir -p "$d/tests" "$d/.github/workflows"; cp "$me" "$d/tests/$base"
-        printf 'channel = "1.99.0"\n' >"$d/rust-toolchain.toml"
+        printf 'channel = "1.99.0"\ntargets = ["wasm32-unknown-unknown"]\n' >"$d/rust-toolchain.toml"
         printf 'rust-toolchain.toml\n' >"$d/.dockerignore"
         printf 'FROM rust:1.99.0\n' >"$d/Dockerfile"
         cat >"$d/.github/workflows/ci.yml" <<'CI'
@@ -126,6 +131,7 @@ jobs:
 CI
         [ "$nocargo" = --no-cargo ] && sed -i '/clippy/d' "$d/.github/workflows/ci.yml"
         [ "$nocargo" = --no-pin ] && sed -i '/dtolnay/d' "$d/.github/workflows/ci.yml"
+        [ "$nocargo" = --no-wasm ] && sed -i '/^targets/d' "$d/rust-toolchain.toml"
         local extra; extra=$(cat)
         if [ "$extra" = - ]; then rm -f "$d/.github/workflows/ci.yml"
         elif [ -n "$extra" ]; then printf '%s\n' "$extra" >"$d/.github/workflows/$second"; fi
@@ -248,6 +254,8 @@ WF
     # scan and the placement parser, not by a count check of its own -- see the
     # note where that check would have gone.
     leg no-workflows 1 'FAIL: matched no dtolnay/rust-toolchain pins' <<<-
+    # Check 6: dropping the toml's wasm32 `targets` line must red.
+    leg no-wasm-target 1 'rust-toolchain.toml does not declare wasm32-unknown-unknown' --no-wasm </dev/null
     if [ "$fails" -eq 0 ]; then echo "PASS: ${legs} self-test legs"; exit 0; fi
     echo "FAIL: ${fails} of ${legs} self-test leg(s) diverged"; exit 1
 fi
@@ -271,6 +279,11 @@ done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*dtolnay/rust-to
 
 if ! grep -qxF 'rust-toolchain.toml' .dockerignore; then
   echo "FAIL: .dockerignore does not exclude rust-toolchain.toml; it would override the Dockerfile's FROM rust:<ver> pin"
+  fail=1
+fi
+
+if ! grep -qE '^targets[[:space:]]*=.*"wasm32-unknown-unknown"' rust-toolchain.toml; then
+  echo "FAIL: rust-toolchain.toml does not declare wasm32-unknown-unknown in targets; consumers building the WASM module in this checkout hit E0463"
   fail=1
 fi
 
