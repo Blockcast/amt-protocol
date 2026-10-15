@@ -9,6 +9,12 @@ name: AMT billing matrix case
 # This workflow is only the gateway half. The billing half is read back from
 # the relay WAL keyed on `egress_ipv4` below, and the shutdown timestamp
 # brackets the window that should close: `ts_before`..`ts_after`.
+#
+# ⚠ teardown-only is only a Teardown test if `wire.txt` shows an outbound
+# `amt_type=7`. amt-verify sends Teardown only when the relay's Membership
+# Query carries the Gateway Address fields (G flag, RFC 7450 §5.1.4.5); the
+# staging relay sent G=0 on 2026-10-15, so the run degraded to case 3's
+# no-leave/no-Teardown shape and billed via the 45s stale sweep.
 
 on:
   workflow_dispatch:
@@ -42,11 +48,6 @@ on:
         default: "2602:f74d:1:5::196"
       group_v6:
         default: "ff3e::232:99:10"
-
-  # Lets the branch exercise the workflow before it is on the default branch;
-  # every input falls back to its dispatch default below.
-  push:
-    branches: [blo-46644-amt-billing-matrix-case]
 
 permissions:
   contents: read
