@@ -247,6 +247,14 @@ fan-out shrinks to a `Map<(src, group), WTStream>` lookup.
    > caller did not work: no in-tree caller re-subscribed on `QueryFailed`, so one
    > lost Request, or its lost Query, stranded the queued subscription for good.
 
+   > **Amended 2026-10-15 (BLO-33585).** A further timer is armed in Active: the
+   > next robustness retransmission of the latest join. A join goes out QRV
+   > times in all, the QRV read from the relay's last Membership Query, each
+   > repeat at a random point of (0, `UNSOLICITED_REPORT_INTERVAL_MS`) after the
+   > one before (RFC 7450 §5.2.1, RFC 3376 §5.1). A repeat is not a keep-alive
+   > and does not move the keep-alive timer, and one `tick()` may send a repeat
+   > and a due keep-alive together.
+
 7. **Inner data demux is best-effort, never fatal**: a malformed inner IP/UDP packet
    inside `AmtMessage::MulticastData` produces `Event::Warning(MalformedInner)` and
    the manager continues. No `Event::Data` is emitted for that datagram.

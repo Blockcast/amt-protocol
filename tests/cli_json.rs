@@ -3,7 +3,7 @@
 mod common;
 
 use amt_protocol::messages::MessageType;
-use amt_protocol::subscription::REQUEST_TIMEOUT_MS;
+use amt_protocol::subscription::{REQUEST_TIMEOUT_MS, UNSOLICITED_REPORT_INTERVAL_MS};
 use common::fake_relay::{synth_v4_udp, FakeRelay, Loss};
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
@@ -362,7 +362,13 @@ async fn forward_continues_under_watch() {
 async fn a_lost_request_restarts_discovery_and_still_receives() {
     let relay = FakeRelay::bind("v4").await;
     let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
-    relay.spawn_lossy(inner, Loss { requests: 1 });
+    relay.spawn_lossy(
+        inner,
+        Loss {
+            requests: 1,
+            ..Loss::default()
+        },
+    );
 
     let v = run_json_within(&relay, 2 * REQUEST_TIMEOUT_MS).await;
 
@@ -371,6 +377,37 @@ async fn a_lost_request_restarts_discovery_and_still_receives() {
     let types = captured_types(&relay).await;
     assert_eq!(count(&types, MessageType::RelayDiscovery), 2, "{types:?}");
     assert_eq!(count(&types, MessageType::Request), 2, "{types:?}");
+}
+
+/// A relay that loses the gateway's first Membership Update still delivers
+/// within one run when its Query carries QRV 2: the join goes out again within
+/// the Unsolicited Report Interval (RFC 7450 §5.2.1, RFC 3376 §5.1). Before,
+/// the join went out once and the next Update was the keep-alive a minute
+/// later, past the public-vantage probe's deadline, so one lost datagram read
+/// as "relay not forwarding".
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_join_goes_out_again_and_still_receives() {
+    let relay = FakeRelay::bind("v4").await;
+    let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
+    relay.spawn_querying(
+        inner,
+        2,
+        Loss {
+            updates: 1,
+            ..Loss::default()
+        },
+    );
+
+    // Bound: the handshake (the crate's own REQUEST_TIMEOUT_MS) plus the
+    // longest a retransmission may wait.
+    let v = run_json_within(&relay, REQUEST_TIMEOUT_MS + UNSOLICITED_REPORT_INTERVAL_MS).await;
+
+    assert_eq!(v["outcome"], "ok", "{v}");
+    assert_eq!(v["packet_count"], 1, "{v}");
+    let types = captured_types(&relay).await;
+    assert_eq!(count(&types, MessageType::Request), 1, "{types:?}");
+    // The lost join, the one retransmission QRV 2 owes it, and the leave.
+    assert_eq!(count(&types, MessageType::MembershipUpdate), 3, "{types:?}");
 }
 
 /// Run amt-verify in --json mode against `relay` with a deadline of

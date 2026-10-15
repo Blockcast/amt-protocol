@@ -10,6 +10,8 @@ pub use group::GroupState;
 
 pub mod report;
 
+mod query;
+
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -39,6 +41,13 @@ pub const MAX_DISCOVERY_RETRIES: u32 = 3;
 /// than a number of its own.
 pub const MAX_DISCOVERY_RESTARTS: u32 = MAX_DISCOVERY_RETRIES;
 
+/// [Unsolicited Report Interval]: the retransmissions of a state-change report
+/// are spaced at random over (0, this) (RFC 3376 §5.1 and §8.11, RFC 3810 §6.1
+/// and §9.11, both "Default: 1 second"). The relay does not advertise it, and
+/// RFC 7450 recommends the same 1 s for the repetitions of a Teardown
+/// (§5.2.3.7.2), so the RFC value is the one both ends assume.
+pub const UNSOLICITED_REPORT_INTERVAL_MS: u64 = 1_000;
+
 pub struct SubscriptionManager<P: Platform> {
     inner: AmtGateway<P>,
     cfg: AmtConfig,
@@ -53,6 +62,22 @@ pub struct SubscriptionManager<P: Platform> {
     /// `discovery_retries`, an Advertisement does not reset it: in the failure
     /// it bounds, every Discovery IS answered and only the Request is not.
     discovery_restarts: u32,
+    /// The QRV of the last Membership Query accepted: the number of times to
+    /// send each state-change report (RFC 7450 §5.1.4.8, §5.2.1), since "the
+    /// host adopts the QRV value as its own Robustness Variable value"
+    /// (§4.2.1.2). `None` when that Query encapsulated no IGMPv3/MLDv2 General
+    /// Query with a non-zero QRV: the relay then gave no count, and a join is
+    /// sent once, as it was before any retransmission existed.
+    robustness: Option<u8>,
+    /// Retransmissions of the latest join still owed, and when the next is
+    /// due. A state-change report "is retransmitted [Robustness Variable] - 1
+    /// more times, at intervals chosen at random from the range (0,
+    /// [Unsolicited Report Interval])" (RFC 3376 §5.1, RFC 3810 §6.1).
+    report_retransmissions: u8,
+    next_report_retransmission_ms: Option<u64>,
+    /// Draws the retransmission delays; the inner gateway draws its nonces from
+    /// the same source.
+    platform: Arc<P>,
     out_queue: VecDeque<Event>,
     shutting_down: bool,
     /// True after shutdown() has been called. AsyncAmtGateway runtime uses
@@ -64,7 +89,7 @@ pub struct SubscriptionManager<P: Platform> {
 
 impl<P: Platform> SubscriptionManager<P> {
     pub fn new(cfg: AmtConfig, platform: Arc<P>) -> Self {
-        let inner = AmtGateway::new(cfg.clone(), platform);
+        let inner = AmtGateway::new(cfg.clone(), platform.clone());
         Self {
             inner,
             cfg,
@@ -75,6 +100,10 @@ impl<P: Platform> SubscriptionManager<P> {
             last_request_at_ms: None,
             discovery_retries: 0,
             discovery_restarts: 0,
+            robustness: None,
+            report_retransmissions: 0,
+            next_report_retransmission_ms: None,
+            platform,
             out_queue: VecDeque::new(),
             shutting_down: false,
             closed: false,
@@ -123,11 +152,16 @@ impl<P: Platform> SubscriptionManager<P> {
             }
             GatewayState::Active => {
                 // Move newly-queued group(s) from pending into groups + emit ALLOW Update.
+                let mut joined = false;
                 while let Some(key) = self.pending.pop_front() {
                     let mut state = GroupState::new(key.clone(), now_ms);
                     state.announced = true;
                     self.groups.insert(key.clone(), state);
                     self.emit_incremental_allow(&key, now_ms)?;
+                    joined = true;
+                }
+                if joined {
+                    self.arm_report_retransmissions(now_ms);
                 }
             }
             GatewayState::Closed => return Err(AmtError::ShutdownInProgress),
@@ -310,16 +344,20 @@ impl<P: Platform> SubscriptionManager<P> {
                 return Ok(());
             }
         };
-        if let Err(e) = self
+        let general_query = match self
             .inner
             .handle_query(nonce, mac, query_data, gateway_address)
         {
-            self.out_queue.push_back(Event::Warning(e));
-            return Ok(());
-        }
+            Ok(general_query) => general_query,
+            Err(e) => {
+                self.out_queue.push_back(Event::Warning(e));
+                return Ok(());
+            }
+        };
         // The Request was answered: the next unanswered one starts a fresh
         // restart budget.
         self.discovery_restarts = 0;
+        self.robustness = query::querier_robustness(&general_query);
         // RFC 7450 §5.2.3.7.1: a Query reporting a gateway endpoint other than
         // the one the last Update was sent from means the relay still forwards
         // to the tunnel at the old one. Tear it down ahead of the Update that
@@ -355,6 +393,10 @@ impl<P: Platform> SubscriptionManager<P> {
         // witness does not: the Update carries its own `keepalive` label.
         self.send_current_state_update(now_ms, !initial_handshake)?;
         if initial_handshake {
+            // This Update is the first report of every join queued during the
+            // handshake. A re-Query's Update while Active is a current-state
+            // report answering a Query, which RFC 3376 §5.2 does not repeat.
+            self.arm_report_retransmissions(now_ms);
             self.out_queue.push_back(Event::HandshakeComplete);
         }
         Ok(())
@@ -363,8 +405,17 @@ impl<P: Platform> SubscriptionManager<P> {
     /// Emit a current-state Membership Update. `keepalive` labels the event for
     /// consumers that count keep-alives: false for the initial Update that
     /// completes the handshake, true for every later one (periodic tick, or a
-    /// re-Query arriving while already Active).
+    /// re-Query arriving while already Active). Robustness retransmissions of
+    /// a join are not keep-alives either: see `retransmit_join_report`.
     fn send_current_state_update(&mut self, now_ms: u64, keepalive: bool) -> Result<()> {
+        self.transmit_current_state_report(keepalive)?;
+        self.last_update_at_ms = Some(now_ms);
+        Ok(())
+    }
+
+    /// Queue a Membership Update carrying the current-state report of every
+    /// group, without touching the keep-alive schedule.
+    fn transmit_current_state_report(&mut self, keepalive: bool) -> Result<()> {
         let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
         let port = self.inner.relay_port();
         let report = match relay {
@@ -385,7 +436,55 @@ impl<P: Platform> SubscriptionManager<P> {
             payload: msg.encode(),
             keepalive,
         });
-        self.last_update_at_ms = Some(now_ms);
+        Ok(())
+    }
+
+    /// A join was just reported: owe it [Robustness Variable] - 1 more
+    /// transmissions (RFC 3376 §5.1, RFC 3810 §6.1; RFC 7450 §5.2.1 makes the
+    /// relay's QRV that variable). A later join restarts the count, as a new
+    /// state change "becomes the first of [Robustness Variable] transmissions"
+    /// (RFC 3376 §5.1).
+    fn arm_report_retransmissions(&mut self, now_ms: u64) {
+        self.report_retransmissions = self.robustness.map_or(0, |qrv| qrv.saturating_sub(1));
+        self.next_report_retransmission_ms = (self.report_retransmissions > 0)
+            .then(|| now_ms + self.report_retransmission_delay_ms());
+    }
+
+    /// Uniform over the open interval (0, [Unsolicited Report Interval]), in
+    /// whole milliseconds (RFC 3376 §5.1).
+    fn report_retransmission_delay_ms(&self) -> u64 {
+        let mut draw = [0u8; 4];
+        self.platform.random_bytes(&mut draw);
+        1 + u64::from(u32::from_be_bytes(draw)) % (UNSOLICITED_REPORT_INTERVAL_MS - 1)
+    }
+
+    /// Send the next owed retransmission of the latest join.
+    ///
+    /// It carries the current-state report of every group, rebuilt at the
+    /// moment it is sent, rather than a copy of the first transmission: a group
+    /// that left since is not re-joined by it, and one that joined since is
+    /// included. After a handshake that is what the first transmission was.
+    /// After a join while Active it stands in for that join's ALLOW record,
+    /// which for an SSM join is no change of effect: a router moves to the same
+    /// state on IS_IN(B) as on ALLOW(B), from INCLUDE (RFC 3376 §6.4.1, §6.4.2)
+    /// or EXCLUDE mode; an ASM join's record is IS_EX({}) either way
+    /// (`report::build_allow_v4`). It is labelled as no keep-alive and leaves
+    /// the keep-alive schedule alone: it repeats a join, and is no evidence
+    /// that the tunnel survived an interval.
+    fn retransmit_join_report(&mut self, now_ms: u64) -> Result<()> {
+        self.next_report_retransmission_ms = None;
+        if self.groups.is_empty() {
+            // Everything left meanwhile: an Update with no subscription in it
+            // is one a gateway SHOULD NOT send (RFC 7450 §5.2.3.5.1).
+            self.report_retransmissions = 0;
+            return Ok(());
+        }
+        self.report_retransmissions -= 1;
+        self.transmit_current_state_report(false)?;
+        if self.report_retransmissions > 0 {
+            self.next_report_retransmission_ms =
+                Some(now_ms + self.report_retransmission_delay_ms());
+        }
         Ok(())
     }
 
@@ -403,6 +502,11 @@ impl<P: Platform> SubscriptionManager<P> {
             .remove(key)
             .map(|g| g.announced)
             .unwrap_or(false);
+        if self.groups.is_empty() {
+            // No subscription is left for an owed join retransmission to repeat.
+            self.report_retransmissions = 0;
+            self.next_report_retransmission_ms = None;
+        }
         if !was_announced || self.inner.state() != GatewayState::Active {
             return Ok(());
         }
@@ -498,7 +602,15 @@ impl<P: Platform> SubscriptionManager<P> {
             }
             return Ok(());
         }
-        // 3. Active keep-alive.
+        // 3. The next robustness retransmission of the latest join.
+        if self.inner.state() == GatewayState::Active {
+            if let Some(due) = self.next_report_retransmission_ms {
+                if now_ms >= due {
+                    self.retransmit_join_report(now_ms)?;
+                }
+            }
+        }
+        // 4. Active keep-alive.
         if self.inner.state() == GatewayState::Active && !self.groups.is_empty() {
             let interval_ms = (self.cfg.keepalive_interval_secs as u64) * 1000;
             if interval_ms == 0 {
@@ -535,6 +647,11 @@ impl<P: Platform> SubscriptionManager<P> {
                 if let Some(t) = self.last_update_at_ms {
                     candidates.push(t + interval_ms);
                 }
+            }
+        }
+        if self.inner.state() == GatewayState::Active {
+            if let Some(t) = self.next_report_retransmission_ms {
+                candidates.push(t);
             }
         }
         candidates.into_iter().min()
@@ -969,12 +1086,24 @@ mod tests {
         key: GroupKey,
         gateway_address: Option<GatewayAddress>,
     ) -> u32 {
+        drive_to_active_querying(m, key, gateway_address, vec![0x11; 12])
+    }
+
+    /// `drive_to_active_via` with `general_query` as the datagram the Query
+    /// encapsulates, against a relay advertising the configured address. The
+    /// Query arrives, and the handshake's Update goes out, at 1200.
+    fn drive_to_active_querying(
+        m: &mut SubscriptionManager<TestPlatform>,
+        key: GroupKey,
+        gateway_address: Option<GatewayAddress>,
+        general_query: Vec<u8>,
+    ) -> u32 {
         m.subscribe(key, 1000).unwrap();
         let initial = drain(m);
         let disc_nonce = discovery_nonce_from(&initial);
         let advert = AmtMessage::RelayAdvertisement {
             nonce: disc_nonce,
-            relay_address: "192.0.2.96".parse::<IpAddr>().unwrap(),
+            relay_address: m.relay_address().unwrap(),
         };
         m.handle_datagram(&advert.encode(), 1100).unwrap();
         let after_advert = drain(m);
@@ -992,12 +1121,248 @@ mod tests {
         let query = AmtMessage::MembershipQuery {
             request_nonce: req_nonce,
             response_mac: [0; 6],
-            query_data: vec![0x11; 12],
+            query_data: general_query,
             gateway_address,
         };
         m.handle_datagram(&query.encode(), 1200).unwrap();
         drain(m);
         req_nonce
+    }
+
+    /// The Membership Updates among `events`, decoded, with their keep-alive
+    /// labels.
+    fn updates(events: &[Event]) -> Vec<(AmtMessage, bool)> {
+        events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Transmit {
+                    payload, keepalive, ..
+                } if payload[0] == 0x05 => Some((AmtMessage::decode(payload).unwrap(), *keepalive)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn report_of(update: &AmtMessage) -> &[u8] {
+        match update {
+            AmtMessage::MembershipUpdate { report_data, .. } => report_data,
+            other => panic!("expected a MembershipUpdate, got {other:?}"),
+        }
+    }
+
+    fn ssm(group: &str, source: &str) -> GroupKey {
+        GroupKey {
+            group: group.parse().unwrap(),
+            source: Some(source.parse().unwrap()),
+        }
+    }
+
+    /// RFC 7450 §5.2.1 with RFC 3376 §5.1: the relay's QRV is the number of
+    /// times a join goes out. QRV 3 gives the handshake's Update two
+    /// retransmissions, each at a random point of (0, [Unsolicited Report
+    /// Interval]) after the one before, carrying the latest Query's nonce, not
+    /// labelled keep-alive, and leaving the keep-alive anchored on the
+    /// handshake's Update.
+    #[test]
+    fn a_join_goes_out_qrv_times_within_the_unsolicited_report_interval() {
+        let mut m = mgr();
+        let key = ssm("232.0.0.1", "10.0.0.1");
+        let nonce = drive_to_active_querying(
+            &mut m,
+            key.clone(),
+            Some(relay_observed_gateway()),
+            query::fixtures::igmpv3_general_query(3),
+        );
+        let mut previous = 1200;
+        for n in 1..=2 {
+            let due = m.next_wakeup_ms().expect("a retransmission is armed");
+            assert!(
+                due > previous && due < previous + UNSOLICITED_REPORT_INTERVAL_MS,
+                "retransmission {n} due at {due}, previous at {previous}"
+            );
+            m.tick(due - 1).unwrap();
+            assert!(drain(&mut m).is_empty(), "retransmission {n} early");
+            m.tick(due).unwrap();
+            let sent = updates(&drain(&mut m));
+            assert_eq!(sent.len(), 1, "retransmission {n}: {sent:?}");
+            let (update, keepalive) = &sent[0];
+            assert!(!keepalive, "a repeated join is not a keep-alive");
+            match update {
+                AmtMessage::MembershipUpdate { request_nonce, .. } => {
+                    assert_eq!(*request_nonce, nonce)
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                report_of(update),
+                report::build_current_state_v4([&key]).unwrap()
+            );
+            previous = due;
+        }
+        let keepalive_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
+        assert_eq!(
+            m.next_wakeup_ms(),
+            Some(1200 + keepalive_ms),
+            "QRV - 1 retransmissions, then only the keep-alive"
+        );
+    }
+
+    /// No count, no repeat: a Query encapsulating no readable General Query,
+    /// or one with QRV 0 (which a relay MUST NOT send, RFC 7450 §5.3.3.3) or
+    /// QRV 1, leaves the join sent once.
+    #[test]
+    fn a_join_goes_out_once_without_a_qrv_above_one() {
+        let keepalive_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
+        for general_query in [
+            vec![0x11; 12],
+            query::fixtures::igmpv3_general_query(0),
+            query::fixtures::igmpv3_general_query(1),
+        ] {
+            let mut m = mgr();
+            drive_to_active_querying(
+                &mut m,
+                ssm("232.0.0.1", "10.0.0.1"),
+                Some(relay_observed_gateway()),
+                general_query.clone(),
+            );
+            assert_eq!(
+                m.next_wakeup_ms(),
+                Some(1200 + keepalive_ms),
+                "{general_query:02x?}"
+            );
+        }
+    }
+
+    /// A retransmission is rebuilt when it goes out, so once every group has
+    /// left there is nothing to repeat and nothing is sent or left armed.
+    #[test]
+    fn no_retransmission_once_every_group_has_left() {
+        let mut m = mgr();
+        let key = ssm("232.0.0.1", "10.0.0.1");
+        drive_to_active_querying(
+            &mut m,
+            key.clone(),
+            Some(relay_observed_gateway()),
+            query::fixtures::igmpv3_general_query(2),
+        );
+        let due = m.next_wakeup_ms().unwrap();
+        m.unsubscribe(&key, 1201).unwrap();
+        assert_eq!(updates(&drain(&mut m)).len(), 1, "the leave");
+        assert_eq!(m.next_wakeup_ms(), None);
+        m.tick(due).unwrap();
+        assert!(updates(&drain(&mut m)).is_empty());
+    }
+
+    /// A join while Active is a state change of its own (RFC 3376 §5.1): its
+    /// ALLOW goes out at once and is repeated, and the repeat reports every
+    /// group the tunnel then carries.
+    #[test]
+    fn a_join_while_active_is_repeated_with_every_group() {
+        let mut m = mgr();
+        drive_to_active_querying(
+            &mut m,
+            ssm("232.0.0.1", "10.0.0.1"),
+            Some(relay_observed_gateway()),
+            query::fixtures::igmpv3_general_query(2),
+        );
+        let due = m.next_wakeup_ms().unwrap();
+        m.tick(due).unwrap();
+        assert_eq!(updates(&drain(&mut m)).len(), 1, "the handshake's repeat");
+
+        let second = ssm("232.0.0.2", "10.0.0.1");
+        m.subscribe(second.clone(), 2000).unwrap();
+        let allow = updates(&drain(&mut m));
+        assert_eq!(allow.len(), 1);
+        assert_eq!(
+            report_of(&allow[0].0),
+            report::build_allow_v4(&second).unwrap()
+        );
+        let due = m.next_wakeup_ms().unwrap();
+        assert!(due > 2000 && due < 2000 + UNSOLICITED_REPORT_INTERVAL_MS);
+        m.tick(due).unwrap();
+        let repeat = updates(&drain(&mut m));
+        assert_eq!(repeat.len(), 1, "{repeat:?}");
+        assert!(!repeat[0].1);
+        assert_eq!(
+            report_of(&repeat[0].0),
+            report::build_current_state_v4(m.groups().keys()).unwrap()
+        );
+        assert_eq!(m.groups().len(), 2);
+    }
+
+    /// The current-state report a re-Query draws while Active answers that
+    /// Query; RFC 3376 §5.2 does not repeat such reports, so it arms no
+    /// retransmission, only the keep-alive from its own send time.
+    #[test]
+    fn a_refresh_query_while_active_is_not_repeated() {
+        let mut m = mgr();
+        let nonce = drive_to_active_querying(
+            &mut m,
+            ssm("232.0.0.1", "10.0.0.1"),
+            Some(relay_observed_gateway()),
+            query::fixtures::igmpv3_general_query(2),
+        );
+        let due = m.next_wakeup_ms().unwrap();
+        m.tick(due).unwrap();
+        drain(&mut m);
+
+        let refresh = AmtMessage::MembershipQuery {
+            request_nonce: nonce,
+            response_mac: [6, 5, 4, 3, 2, 1],
+            query_data: query::fixtures::igmpv3_general_query(2),
+            gateway_address: Some(relay_observed_gateway()),
+        };
+        m.handle_datagram(&refresh.encode(), 5000).unwrap();
+        let sent = updates(&drain(&mut m));
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].1, "a re-Query's Update is labelled keep-alive");
+        let keepalive_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
+        assert_eq!(m.next_wakeup_ms(), Some(5000 + keepalive_ms));
+    }
+
+    /// The delays cover the open interval (0, [Unsolicited Report Interval])
+    /// rather than sitting at one point of it: RFC 3376 §5.1 draws each at
+    /// random, which is what keeps many gateways' repeats from coinciding.
+    #[test]
+    fn retransmission_delays_spread_over_the_open_interval() {
+        let m = mgr();
+        let draws: Vec<u64> = (0..1000)
+            .map(|_| m.report_retransmission_delay_ms())
+            .collect();
+        let (low, high) = (*draws.iter().min().unwrap(), *draws.iter().max().unwrap());
+        assert!(
+            low >= 1 && high < UNSOLICITED_REPORT_INTERVAL_MS,
+            "{low}..={high}"
+        );
+        assert!(
+            low < UNSOLICITED_REPORT_INTERVAL_MS / 10
+                && high > UNSOLICITED_REPORT_INTERVAL_MS * 9 / 10,
+            "{low}..={high}"
+        );
+    }
+
+    /// The same over MLDv2, whose QRV sits elsewhere in the Query (RFC 3810
+    /// §5.1).
+    #[test]
+    fn a_join_goes_out_qrv_times_over_mldv2() {
+        let cfg = AmtConfig::new("2001:db8::96".parse::<IpAddr>().unwrap(), Some(2268));
+        let mut m = SubscriptionManager::new(cfg, Arc::new(TestPlatform::new()));
+        let key = ssm("ff3e::1234", "2001:db8::1");
+        drive_to_active_querying(
+            &mut m,
+            key.clone(),
+            Some(relay_observed_gateway()),
+            query::fixtures::mldv2_general_query(2),
+        );
+        let due = m.next_wakeup_ms().unwrap();
+        assert!(due > 1200 && due < 1200 + UNSOLICITED_REPORT_INTERVAL_MS);
+        m.tick(due).unwrap();
+        let sent = updates(&drain(&mut m));
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            report_of(&sent[0].0),
+            report::build_current_state_v6([&key]).unwrap()
+        );
     }
 
     #[test]
