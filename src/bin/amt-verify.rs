@@ -74,6 +74,17 @@ struct Args {
     #[arg(long, default_value_t = false)]
     drop_without_teardown: bool,
 
+    /// Send the shutdown Teardown even when the relay's Membership Query left
+    /// the G flag unset, with an all-zero Gateway Address. Not RFC 7450
+    /// compliant: it emulates the non-compliant gateways a relay sees, for
+    /// Teardown-only billing tests against a relay that sets no G (BLO-46706).
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "drop_without_teardown"
+    )]
+    force_teardown: bool,
+
     /// Machine-readable JSON output (one-shot mode only).
     /// Rejected with exit 2 if combined with --watch.
     #[arg(long, default_value_t = false)]
@@ -637,6 +648,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             let gw = AsyncAmtGateway::builder(r)
                 .relay_port(args.port)
                 .keepalive(Duration::from_secs(args.keepalive))
+                .force_teardown(args.force_teardown)
                 .build()
                 .await
                 .map_err(ExitCategory::Fatal)?;
@@ -646,6 +658,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             let gw = AsyncAmtGateway::builder_for_source(args.source)
                 .relay_port(args.port)
                 .keepalive(Duration::from_secs(args.keepalive))
+                .force_teardown(args.force_teardown)
                 .build()
                 .await
                 .map_err(ExitCategory::HandshakeFail)?;

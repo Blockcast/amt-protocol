@@ -15,14 +15,18 @@ name: AMT billing matrix case
 # Query carries the Gateway Address fields (G flag, RFC 7450 §5.1.4.5); the
 # staging relay sent G=0 on 2026-10-15, so the run degraded to case 3's
 # no-leave/no-Teardown shape and billed via the 45s stale sweep.
+# `teardown-forced` (BLO-46706) sends the Teardown anyway, with an all-zero
+# Gateway Address, as the non-compliant gateways seen 2026-09-24 do. The
+# relay kernel drops it, but amt-astats acts on any outbound-source type 7
+# (finalize + MFC removal), which is the billing path under test.
 
 on:
   workflow_dispatch:
     inputs:
       shape:
-        description: graceful = case 1, teardown-only = case 2, drop = case 3
+        description: graceful = case 1, teardown-only = case 2, teardown-forced = case 2 against a G=0 relay, drop = case 3
         type: choice
-        options: [teardown-only, graceful, drop]
+        options: [teardown-only, teardown-forced, graceful, drop]
         default: teardown-only
       relay:
         description: Relay IPv4 (staging VIP)
@@ -83,6 +87,7 @@ jobs:
           case "$SHAPE" in
             graceful) flag= ;;
             teardown-only) flag=--no-graceful-leave ;;
+            teardown-forced) flag="--no-graceful-leave --force-teardown" ;;
             drop) flag=--drop-without-teardown ;;
             *) echo "::error::unknown shape $SHAPE"; exit 2 ;;
           esac
@@ -123,7 +128,7 @@ jobs:
         if: always() && env.RELAY6 != ''
         continue-on-error: true
         run: |
-          case "$SHAPE" in graceful) flag= ;; teardown-only) flag=--no-graceful-leave ;; *) flag=--drop-without-teardown ;; esac
+          case "$SHAPE" in graceful) flag= ;; teardown-only) flag=--no-graceful-leave ;; teardown-forced) flag="--no-graceful-leave --force-teardown" ;; *) flag=--drop-without-teardown ;; esac
           ip6=$(curl -fsS -6 -m 5 https://api6.ipify.org || echo none)
           echo "egress_ipv6=$ip6" | tee out/meta6.txt
           [ "$ip6" = none ] && { echo "no IPv6 egress on this runner; case 4 not attempted" | tee -a out/meta6.txt; exit 0; }

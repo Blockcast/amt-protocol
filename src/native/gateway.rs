@@ -84,6 +84,7 @@ pub struct AsyncAmtGatewayBuilder {
     log_target: &'static str,
     data_capacity: usize,
     recv_buf_bytes: usize,
+    force_teardown: bool,
 }
 
 impl AsyncAmtGateway {
@@ -95,6 +96,7 @@ impl AsyncAmtGateway {
             log_target: "amt",
             data_capacity: 1024,
             recv_buf_bytes: 65535,
+            force_teardown: false,
         }
     }
 
@@ -109,6 +111,7 @@ impl AsyncAmtGateway {
             relay_port: 2268,
             keepalive: Duration::from_secs(AmtConfig::DEFAULT_KEEPALIVE_SECS as u64),
             log_target: "amt",
+            force_teardown: false,
         }
     }
 
@@ -206,6 +209,12 @@ impl AsyncAmtGatewayBuilder {
         self.log_target = t;
         self
     }
+    /// Send a Teardown on shutdown even to a relay that set no G flag
+    /// ([`AmtConfig::force_teardown`]). Relay-side billing tests only.
+    pub fn force_teardown(mut self, on: bool) -> Self {
+        self.force_teardown = on;
+        self
+    }
     /// Slots in this gateway's data broadcast ring. Default 1024.
     ///
     /// tokio preallocates the ring, so this is per-gateway resident memory —
@@ -244,6 +253,7 @@ impl AsyncAmtGatewayBuilder {
     fn spawn_on(self, relay: IpAddr, sock: UdpSocket) -> AsyncAmtGateway {
         let mut cfg = AmtConfig::new(relay, Some(self.relay_port));
         cfg.keepalive_interval_secs = self.keepalive.as_secs() as u32;
+        cfg.force_teardown = self.force_teardown;
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(32);
         let (data_tx, _) = broadcast::channel::<DataEvent>(self.data_capacity);
@@ -461,11 +471,17 @@ pub struct AsyncAmtGatewayBuilderForSource {
     relay_port: u16,
     keepalive: Duration,
     log_target: &'static str,
+    force_teardown: bool,
 }
 
 impl AsyncAmtGatewayBuilderForSource {
     pub fn relay_port(mut self, port: u16) -> Self {
         self.relay_port = port;
+        self
+    }
+    /// See [`AsyncAmtGatewayBuilder::force_teardown`].
+    pub fn force_teardown(mut self, on: bool) -> Self {
+        self.force_teardown = on;
         self
     }
     pub fn keepalive(mut self, d: Duration) -> Self {
@@ -538,6 +554,7 @@ impl AsyncAmtGatewayBuilderForSource {
                         .relay_port(self.relay_port)
                         .keepalive(self.keepalive)
                         .log_target(self.log_target)
+                        .force_teardown(self.force_teardown)
                         .spawn_on(relay, sock));
                 }
                 Err(e) => {
