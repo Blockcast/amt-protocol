@@ -45,6 +45,12 @@ on:
       timeout:
         description: amt-verify --timeout (seconds)
         default: "30"
+      capture_tail:
+        # A relay that ignores Teardown keeps streaming to the tunnel after
+        # amt-verify exits (BLO-46715). 1 s only shows THAT it does; a tail
+        # past the relay's hold (~260-780 s) shows for how long.
+        description: Seconds to keep capturing after amt-verify exits
+        default: "1"
       relay_v6:
         description: Relay IPv6 for the one-shot case-4 attempt (skipped when the runner has no v6 egress)
         default: "2602:f74d:1::96"
@@ -60,7 +66,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     env:
       IMAGE: ghcr.io/blockcast/amt-verify:main
       SHAPE: ${{ inputs.shape || 'teardown-only' }}
@@ -68,6 +74,7 @@ jobs:
       SOURCE: ${{ inputs.source || '69.25.95.196' }}
       GROUP: ${{ inputs.group || '232.99.0.10' }}
       TIMEOUT: ${{ inputs.timeout || '30' }}
+      CAPTURE_TAIL: ${{ inputs.capture_tail || '1' }}
       RELAY6: ${{ inputs.relay_v6 || '2602:f74d:1::96' }}
       SOURCE6: ${{ inputs.source_v6 || '2602:f74d:1:5::196' }}
       GROUP6: ${{ inputs.group_v6 || 'ff3e::232:99:10' }}
@@ -91,6 +98,10 @@ jobs:
             drop) flag=--drop-without-teardown ;;
             *) echo "::error::unknown shape $SHAPE"; exit 2 ;;
           esac
+          # Validate before tcpdump starts: a non-numeric tail would fail `sleep`
+          # under bash -e after the capture began, and >1200 s overruns the 25m job.
+          case "$CAPTURE_TAIL" in ''|*[!0-9]*) echo "::error::capture_tail must be an integer"; exit 2 ;; esac
+          [ "$CAPTURE_TAIL" -le 1200 ] || { echo "::error::capture_tail > 1200 s exceeds the 25m job budget"; exit 2; }
           mkdir -p out
           ip=$(curl -fsS -4 https://api.ipify.org || echo unavailable)
           {
@@ -112,7 +123,7 @@ jobs:
           rc=$?
           set -e
           { echo "ts_after=$(date -u +%FT%T.%NZ)"; echo "exit=$rc"; } | tee -a out/meta.txt
-          sleep 1; sudo pkill tcpdump; sleep 1
+          sleep "$CAPTURE_TAIL"; sudo pkill tcpdump; sleep 1
           {
             for t in 1 2 3 4 5 6 7; do
               o=$(sudo tcpdump -nn -r out/amt.pcap "udp[8]&0x0f==$t and dst host $RELAY" 2>/dev/null | wc -l)
@@ -120,6 +131,13 @@ jobs:
               echo "amt_type=$t out=$o in=$i"
             done
             sudo tcpdump -nn -tttt -r out/amt.pcap "udp[8]&0x0f==7" 2>/dev/null | sed 's/^/teardown: /'
+            # Data the relay sent after our first Teardown. `-i any` can see a
+            # packet on two interfaces, so pkts is an upper bound.
+            td=$(sudo tcpdump -nn -tt -r out/amt.pcap "udp[8]&0x0f==7 and dst host $RELAY" 2>/dev/null | head -1 | cut -d' ' -f1)
+            if [ -n "$td" ]; then
+              sudo tcpdump -nn -tt -r out/amt.pcap "udp[8]&0x0f==6 and src host $RELAY" 2>/dev/null \
+                | awk -v td="$td" -v tail="$CAPTURE_TAIL" '$1>td{n++;last=$1} END{printf "post_teardown_data pkts=%d last_after_teardown_s=%.3f capture_tail_s=%s\n", n, (n?last-td:0), tail}'
+            fi
           } | tee out/wire.txt
           cat out/report.json; tail -n 40 out/stderr.txt
           echo "### case shape \`$SHAPE\` — exit $rc, GwIP \`$ip\`" >> "$GITHUB_STEP_SUMMARY"
