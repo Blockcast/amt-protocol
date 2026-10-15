@@ -1,0 +1,142 @@
+name: AMT billing matrix case
+
+# BLO-46644. Drives one gateway-side shape of the AMT billing matrix
+# (multicast: docs/runbook/amt-billing-e2e-matrix.md) from a GitHub-HOSTED
+# runner, i.e. an OFF-cluster public vantage. In-cluster gateways cannot
+# complete discovery against the staging relay (BLO-34638), so this is the
+# venue that makes cases 1-3 repeatable without a human host.
+#
+# This workflow is only the gateway half. The billing half is read back from
+# the relay WAL keyed on `egress_ipv4` below, and the shutdown timestamp
+# brackets the window that should close: `ts_before`..`ts_after`.
+#
+# ⚠ teardown-only is only a Teardown test if `wire.txt` shows an outbound
+# `amt_type=7`. amt-verify sends Teardown only when the relay's Membership
+# Query carries the Gateway Address fields (G flag, RFC 7450 §5.1.4.5); the
+# staging relay sent G=0 on 2026-10-15, so the run degraded to case 3's
+# no-leave/no-Teardown shape and billed via the 45s stale sweep.
+
+on:
+  workflow_dispatch:
+    inputs:
+      shape:
+        description: graceful = case 1, teardown-only = case 2, drop = case 3
+        type: choice
+        options: [teardown-only, graceful, drop]
+        default: teardown-only
+      relay:
+        description: Relay IPv4 (staging VIP)
+        default: "69.25.95.96"
+      source:
+        description: SSM source
+        default: "69.25.95.196"
+      group:
+        description: Multicast group
+        # 232.1.1.62 (the runbook's group) was dark on 2026-10-15 while
+        # 232.99.0.10 from the same source carried ~4 Mbps. amt-verify only
+        # sends leave/Teardown on the data path: on a --timeout with no data
+        # it exits before shutdown, so a dark group silently turns every
+        # shape into case 3. Check `packet_count > 0` before reading a WAL row.
+        default: "232.99.0.10"
+      timeout:
+        description: amt-verify --timeout (seconds)
+        default: "30"
+      relay_v6:
+        description: Relay IPv6 for the one-shot case-4 attempt (skipped when the runner has no v6 egress)
+        default: "2602:f74d:1::96"
+      source_v6:
+        default: "2602:f74d:1:5::196"
+      group_v6:
+        default: "ff3e::232:99:10"
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      IMAGE: ghcr.io/blockcast/amt-verify:main
+      SHAPE: ${{ inputs.shape || 'teardown-only' }}
+      RELAY: ${{ inputs.relay || '69.25.95.96' }}
+      SOURCE: ${{ inputs.source || '69.25.95.196' }}
+      GROUP: ${{ inputs.group || '232.99.0.10' }}
+      TIMEOUT: ${{ inputs.timeout || '30' }}
+      RELAY6: ${{ inputs.relay_v6 || '2602:f74d:1::96' }}
+      SOURCE6: ${{ inputs.source_v6 || '2602:f74d:1:5::196' }}
+      GROUP6: ${{ inputs.group_v6 || 'ff3e::232:99:10' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: image
+        run: |
+          docker pull -q "$IMAGE" || docker build -q -t "$IMAGE" .
+          docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" | sed 's/^/client_commit=/'
+      - name: v4 (billing GwIP = egress_ipv4)
+        run: |
+          case "$SHAPE" in
+            graceful) flag= ;;
+            teardown-only) flag=--no-graceful-leave ;;
+            drop) flag=--drop-without-teardown ;;
+            *) echo "::error::unknown shape $SHAPE"; exit 2 ;;
+          esac
+          mkdir -p out
+          ip=$(curl -fsS -4 https://api.ipify.org || echo unavailable)
+          {
+            echo "shape=$SHAPE flag=${flag:-none}"
+            echo "egress_ipv4=$ip"
+            echo "ts_before=$(date -u +%FT%T.%NZ)"
+          } | tee out/meta.txt
+          # Wire evidence for what the relay should have seen. AMT message type
+          # is the low nibble of the first UDP payload byte (RFC 7450 §5.1):
+          # 1 discovery, 2 advertisement, 3 request, 4 query, 5 update,
+          # 6 data, 7 TEARDOWN. A case-2 run with no outbound type 7 means the
+          # client never sent Teardown, whatever the relay log says.
+          sudo tcpdump -i any -nn -U -w out/amt.pcap "udp port 2268 and host $RELAY" 2>/dev/null &
+          sleep 1
+          set +e
+          docker run --rm --network host "$IMAGE" --relay "$RELAY" --source "$SOURCE" \
+            --group "$GROUP" --timeout "$TIMEOUT" --json $flag \
+            > out/report.json 2> out/stderr.txt
+          rc=$?
+          set -e
+          { echo "ts_after=$(date -u +%FT%T.%NZ)"; echo "exit=$rc"; } | tee -a out/meta.txt
+          sleep 1; sudo pkill tcpdump; sleep 1
+          {
+            for t in 1 2 3 4 5 6 7; do
+              o=$(sudo tcpdump -nn -r out/amt.pcap "udp[8]&0x0f==$t and dst host $RELAY" 2>/dev/null | wc -l)
+              i=$(sudo tcpdump -nn -r out/amt.pcap "udp[8]&0x0f==$t and src host $RELAY" 2>/dev/null | wc -l)
+              echo "amt_type=$t out=$o in=$i"
+            done
+            sudo tcpdump -nn -tttt -r out/amt.pcap "udp[8]&0x0f==7" 2>/dev/null | sed 's/^/teardown: /'
+          } | tee out/wire.txt
+          cat out/report.json; tail -n 40 out/stderr.txt
+          echo "### case shape \`$SHAPE\` — exit $rc, GwIP \`$ip\`" >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - name: v6 attempt (case 4, informational)
+        if: always() && env.RELAY6 != ''
+        continue-on-error: true
+        run: |
+          case "$SHAPE" in graceful) flag= ;; teardown-only) flag=--no-graceful-leave ;; *) flag=--drop-without-teardown ;; esac
+          ip6=$(curl -fsS -6 -m 5 https://api6.ipify.org || echo none)
+          echo "egress_ipv6=$ip6" | tee out/meta6.txt
+          [ "$ip6" = none ] && { echo "no IPv6 egress on this runner; case 4 not attempted" | tee -a out/meta6.txt; exit 0; }
+          echo "ts_before=$(date -u +%FT%T.%NZ)" | tee -a out/meta6.txt
+          set +e
+          docker run --rm --network host "$IMAGE" --family v6 --relay "$RELAY6" --source "$SOURCE6" \
+            --group "$GROUP6" --timeout "$TIMEOUT" --json $flag > out/report6.json 2> out/stderr6.txt
+          rc=$?
+          { echo "ts_after=$(date -u +%FT%T.%NZ)"; echo "exit=$rc"; } | tee -a out/meta6.txt
+          cat out/report6.json; tail -n 20 out/stderr6.txt
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: amt-billing-matrix-${{ inputs.shape || 'teardown-only' }}-${{ github.run_id }}
+          path: out/
