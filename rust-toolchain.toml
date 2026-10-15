@@ -34,3 +34,10 @@
 [toolchain]
 channel = "1.99.0"
 components = ["clippy", "rustfmt"]
+# Consumers build the WASM module from a checkout of this repo (pim-multicast-
+# gateway's IWA, Chrome Canary, broadcast-discovery and e2e workflows). They
+# install wasm32 on their own toolchain, but inside this directory rustup
+# switches to `channel` above, which then has no wasm32 std:
+# `error[E0463]: can't find crate for core`. Declaring it here makes rustup
+# install it with the pinned toolchain. BLO-43602.
+targets = ["wasm32-unknown-unknown"]
