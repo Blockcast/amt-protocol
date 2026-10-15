@@ -3,7 +3,8 @@
 mod common;
 
 use amt_protocol::messages::MessageType;
-use common::fake_relay::{synth_v4_udp, FakeRelay};
+use amt_protocol::subscription::{REQUEST_TIMEOUT_MS, UNSOLICITED_REPORT_INTERVAL_MS};
+use common::fake_relay::{synth_v4_udp, FakeRelay, Loss};
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -349,6 +350,94 @@ async fn forward_continues_under_watch() {
         assert_eq!(&buf[..n], b"txfeed", "datagram {i}");
     }
     child.kill().await.expect("stop amt-verify");
+}
+
+/// A relay that loses the gateway's first Request still delivers within one
+/// run. The unanswered Request restarts relay discovery (RFC 7450 §5.2.3.5.3)
+/// and the second handshake is answered. Before, the gateway parked in Idle
+/// with the subscription never announced, and the run reported zero packets
+/// at its deadline -- which the public-vantage probe reads as "relay not
+/// forwarding", for one lost datagram.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_request_restarts_discovery_and_still_receives() {
+    let relay = FakeRelay::bind("v4").await;
+    let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
+    relay.spawn_lossy(
+        inner,
+        Loss {
+            requests: 1,
+            ..Loss::default()
+        },
+    );
+
+    let v = run_json_within(&relay, 2 * REQUEST_TIMEOUT_MS).await;
+
+    assert_eq!(v["outcome"], "ok", "{v}");
+    assert_eq!(v["packet_count"], 1, "{v}");
+    let types = captured_types(&relay).await;
+    assert_eq!(count(&types, MessageType::RelayDiscovery), 2, "{types:?}");
+    assert_eq!(count(&types, MessageType::Request), 2, "{types:?}");
+}
+
+/// A relay that loses the gateway's first Membership Update still delivers
+/// within one run when its Query carries QRV 2: the join goes out again within
+/// the Unsolicited Report Interval (RFC 7450 §5.2.1, RFC 3376 §5.1). Before,
+/// the join went out once and the next Update was the keep-alive a minute
+/// later, past the public-vantage probe's deadline, so one lost datagram read
+/// as "relay not forwarding".
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_join_goes_out_again_and_still_receives() {
+    let relay = FakeRelay::bind("v4").await;
+    let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
+    relay.spawn_querying(
+        inner,
+        2,
+        Loss {
+            updates: 1,
+            ..Loss::default()
+        },
+    );
+
+    // Bound: the handshake (the crate's own REQUEST_TIMEOUT_MS) plus the
+    // longest a retransmission may wait.
+    let v = run_json_within(&relay, REQUEST_TIMEOUT_MS + UNSOLICITED_REPORT_INTERVAL_MS).await;
+
+    assert_eq!(v["outcome"], "ok", "{v}");
+    assert_eq!(v["packet_count"], 1, "{v}");
+    let types = captured_types(&relay).await;
+    assert_eq!(count(&types, MessageType::Request), 1, "{types:?}");
+    // The lost join, the one retransmission QRV 2 owes it, and the leave.
+    assert_eq!(count(&types, MessageType::MembershipUpdate), 3, "{types:?}");
+}
+
+/// Run amt-verify in --json mode against `relay` with a deadline of
+/// `deadline_ms` (whole seconds, rounded up), require exit 0, and return the
+/// parsed report.
+async fn run_json_within(relay: &FakeRelay, deadline_ms: u64) -> serde_json::Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amt-verify"))
+        .args([
+            "--relay",
+            &relay.addr.ip().to_string(),
+            "--port",
+            &relay.addr.port().to_string(),
+            "--group",
+            "232.0.0.1",
+            "--source",
+            "10.0.0.1",
+            "--timeout",
+            &deadline_ms.div_ceil(1000).to_string(),
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn amt-verify");
+    let mut stdout = child.stdout.take().unwrap();
+    let mut buf = String::new();
+    stdout.read_to_string(&mut buf).await.unwrap();
+    let status = child.wait().await.unwrap();
+    assert!(status.success(), "exit code: {status}, report: {buf}");
+    serde_json::from_str(buf.trim()).expect(&buf)
 }
 
 /// Run amt-verify against `relay` in --json mode subscribed to `group`,

@@ -13,7 +13,7 @@ use amt_protocol::messages::AmtMessage;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
@@ -60,6 +60,60 @@ enum TunnelPort {
     /// its `source_port` only when `amt_request_handler` creates it, so every
     /// later Membership Query goes to that first port.
     FirstRequest,
+}
+
+/// Datagrams from the gateway that the relay loses, the way a lossy or policed
+/// path into a real relay does: each field drops the first N datagrams of one
+/// message type unanswered. They are still recorded in
+/// `CapturedTraffic::message_types`, which counts what the gateway SENT.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Loss {
+    /// Requests dropped before one is answered with a Membership Query.
+    pub requests: usize,
+    /// Membership Updates dropped before one is answered with data.
+    pub updates: usize,
+}
+
+/// The datagram a Membership Query encapsulates (§5.1.4.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncapsulatedQuery {
+    /// 12 placeholder bytes that are no IP datagram, so the gateway finds no
+    /// QRV in them and sends each report once.
+    Placeholder,
+    /// An IPv4 IGMPv3 General Query with this QRV, as a relay sends one.
+    Igmpv3General { qrv: u8 },
+}
+
+/// One's-complement sum of 16-bit words (RFC 1071), for the IPv4 and IGMP
+/// checksums.
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum: u32 = bytes
+        .chunks(2)
+        .map(|w| u32::from(u16::from_be_bytes([w[0], *w.get(1).unwrap_or(&0)])))
+        .sum();
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// An IPv4 datagram carrying an IGMPv3 General Query (RFC 3376 §4.1) from
+/// `relay` to 224.0.0.1, TTL 1, with the Router Alert option (RFC 2113), Max
+/// Resp Code 1 (RFC 7450 §5.3.3.3) and the production relay's QQIC of 125 s.
+fn igmpv3_general_query(relay: Ipv4Addr, qrv: u8) -> Vec<u8> {
+    let mut igmp = vec![0x11, 1, 0, 0, 0, 0, 0, 0, qrv & 0x07, 125, 0, 0];
+    let checksum = internet_checksum(&igmp);
+    igmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+    let mut ip = vec![0x46, 0xC0];
+    ip.extend_from_slice(&(24 + igmp.len() as u16).to_be_bytes());
+    ip.extend_from_slice(&[0, 0, 0, 0, 1, 2, 0, 0]);
+    ip.extend_from_slice(&relay.octets());
+    ip.extend_from_slice(&[224, 0, 0, 1]);
+    ip.extend_from_slice(&[0x94, 0x04, 0, 0]);
+    let checksum = internet_checksum(&ip);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    ip.extend_from_slice(&igmp);
+    ip
 }
 
 pub struct FakeRelay {
@@ -161,6 +215,8 @@ impl FakeRelay {
             None,
             TeardownSupport::Unsupported,
             TunnelPort::EachRequest,
+            Loss::default(),
+            EncapsulatedQuery::Placeholder,
         );
     }
 
@@ -174,6 +230,8 @@ impl FakeRelay {
             None,
             TeardownSupport::Supported,
             TunnelPort::FirstRequest,
+            Loss::default(),
+            EncapsulatedQuery::Placeholder,
         );
     }
 
@@ -189,6 +247,36 @@ impl FakeRelay {
             advertise,
             TeardownSupport::Supported,
             TunnelPort::EachRequest,
+            Loss::default(),
+            EncapsulatedQuery::Placeholder,
+        );
+    }
+
+    /// As `spawn`, but losing the gateway datagrams `loss` names.
+    #[allow(dead_code)]
+    pub fn spawn_lossy(&self, inner_payload: Vec<u8>, loss: Loss) {
+        self.spawn_with(
+            inner_payload,
+            None,
+            TeardownSupport::Supported,
+            TunnelPort::EachRequest,
+            loss,
+            EncapsulatedQuery::Placeholder,
+        );
+    }
+
+    /// As `spawn_lossy`, but its Membership Queries encapsulate an IGMPv3
+    /// General Query carrying `qrv`, as a production relay's do. IPv4 only.
+    #[allow(dead_code)]
+    pub fn spawn_querying(&self, inner_payload: Vec<u8>, qrv: u8, loss: Loss) {
+        assert!(self.addr.is_ipv4(), "an IGMPv3 Query needs an IPv4 relay");
+        self.spawn_with(
+            inner_payload,
+            None,
+            TeardownSupport::Supported,
+            TunnelPort::EachRequest,
+            loss,
+            EncapsulatedQuery::Igmpv3General { qrv },
         );
     }
 
@@ -198,11 +286,22 @@ impl FakeRelay {
         advertise: Option<IpAddr>,
         teardown: TeardownSupport,
         tunnel_port: TunnelPort,
+        loss: Loss,
+        query: EncapsulatedQuery,
     ) {
         let sock = self.sock.clone();
         let captured = self.captured.clone();
         let teardown_authenticated = self.teardown_authenticated.clone();
         let relay_ip = advertise.unwrap_or_else(|| self.addr.ip());
+        let general_query = match (query, relay_ip) {
+            (EncapsulatedQuery::Placeholder, _) => vec![0x11; 12],
+            (EncapsulatedQuery::Igmpv3General { qrv }, IpAddr::V4(relay)) => {
+                igmpv3_general_query(relay, qrv)
+            }
+            (EncapsulatedQuery::Igmpv3General { .. }, IpAddr::V6(_)) => {
+                unreachable!("spawn_querying refuses an IPv6 relay")
+            }
+        };
         tokio::spawn(async move {
             let mut buf = [0u8; 65535];
             // Keyed by the gateway's ephemeral source address, NOT a single
@@ -211,6 +310,8 @@ impl FakeRelay {
             // Request invalidates gateway A's in-flight Update.
             let mut req_nonce: HashMap<SocketAddr, u32> = HashMap::new();
             let mut first_port: HashMap<IpAddr, u16> = HashMap::new();
+            let mut lost_requests = 0;
+            let mut lost_updates = 0;
             loop {
                 let (n, src) = match sock.recv_from(&mut buf).await {
                     Ok(v) => v,
@@ -252,6 +353,9 @@ impl FakeRelay {
                         };
                         let _ = sock.send_to(&advert.encode(), src).await;
                     }
+                    AmtMessage::Request { .. } if lost_requests < loss.requests => {
+                        lost_requests += 1;
+                    }
                     AmtMessage::Request { request_nonce, .. } => {
                         let tunnel = match tunnel_port {
                             TunnelPort::EachRequest => src,
@@ -265,10 +369,13 @@ impl FakeRelay {
                         let query = membership_query(
                             request_nonce,
                             response_mac(&observed, request_nonce),
-                            &[0x11; 12],
+                            &general_query,
                             (teardown == TeardownSupport::Supported).then_some(observed),
                         );
                         let _ = sock.send_to(&query, tunnel).await;
+                    }
+                    AmtMessage::MembershipUpdate { .. } if lost_updates < loss.updates => {
+                        lost_updates += 1;
                     }
                     // An Update is authenticated against the datagram's own
                     // source (§5.3.3.4).
