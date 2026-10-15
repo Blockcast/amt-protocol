@@ -92,6 +92,13 @@ jobs:
             echo "egress_ipv4=$ip"
             echo "ts_before=$(date -u +%FT%T.%NZ)"
           } | tee out/meta.txt
+          # Wire evidence for what the relay should have seen. AMT message type
+          # is the low nibble of the first UDP payload byte (RFC 7450 §5.1):
+          # 1 discovery, 2 advertisement, 3 request, 4 query, 5 update,
+          # 6 data, 7 TEARDOWN. A case-2 run with no outbound type 7 means the
+          # client never sent Teardown, whatever the relay log says.
+          sudo tcpdump -i any -nn -U -w out/amt.pcap "udp port 2268 and host $RELAY" 2>/dev/null &
+          sleep 1
           set +e
           docker run --rm --network host "$IMAGE" --relay "$RELAY" --source "$SOURCE" \
             --group "$GROUP" --timeout "$TIMEOUT" --json $flag \
@@ -99,6 +106,15 @@ jobs:
           rc=$?
           set -e
           { echo "ts_after=$(date -u +%FT%T.%NZ)"; echo "exit=$rc"; } | tee -a out/meta.txt
+          sleep 1; sudo pkill tcpdump; sleep 1
+          {
+            for t in 1 2 3 4 5 6 7; do
+              o=$(sudo tcpdump -nn -r out/amt.pcap "udp[8]&0x0f==$t and dst host $RELAY" 2>/dev/null | wc -l)
+              i=$(sudo tcpdump -nn -r out/amt.pcap "udp[8]&0x0f==$t and src host $RELAY" 2>/dev/null | wc -l)
+              echo "amt_type=$t out=$o in=$i"
+            done
+            sudo tcpdump -nn -tttt -r out/amt.pcap "udp[8]&0x0f==7" 2>/dev/null | sed 's/^/teardown: /'
+          } | tee out/wire.txt
           cat out/report.json; tail -n 40 out/stderr.txt
           echo "### case shape \`$SHAPE\` — exit $rc, GwIP \`$ip\`" >> "$GITHUB_STEP_SUMMARY"
           exit $rc
