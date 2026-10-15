@@ -62,6 +62,16 @@ enum TunnelPort {
     FirstRequest,
 }
 
+/// Datagrams from the gateway that the relay loses, the way a lossy or policed
+/// path into a real relay does: each field drops the first N datagrams of one
+/// message type unanswered. They are still recorded in
+/// `CapturedTraffic::message_types`, which counts what the gateway SENT.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Loss {
+    /// Requests dropped before one is answered with a Membership Query.
+    pub requests: usize,
+}
+
 pub struct FakeRelay {
     pub addr: SocketAddr,
     pub captured: Arc<Mutex<CapturedTraffic>>,
@@ -161,6 +171,7 @@ impl FakeRelay {
             None,
             TeardownSupport::Unsupported,
             TunnelPort::EachRequest,
+            Loss::default(),
         );
     }
 
@@ -174,6 +185,7 @@ impl FakeRelay {
             None,
             TeardownSupport::Supported,
             TunnelPort::FirstRequest,
+            Loss::default(),
         );
     }
 
@@ -189,6 +201,19 @@ impl FakeRelay {
             advertise,
             TeardownSupport::Supported,
             TunnelPort::EachRequest,
+            Loss::default(),
+        );
+    }
+
+    /// As `spawn`, but losing the gateway datagrams `loss` names.
+    #[allow(dead_code)]
+    pub fn spawn_lossy(&self, inner_payload: Vec<u8>, loss: Loss) {
+        self.spawn_with(
+            inner_payload,
+            None,
+            TeardownSupport::Supported,
+            TunnelPort::EachRequest,
+            loss,
         );
     }
 
@@ -198,6 +223,7 @@ impl FakeRelay {
         advertise: Option<IpAddr>,
         teardown: TeardownSupport,
         tunnel_port: TunnelPort,
+        loss: Loss,
     ) {
         let sock = self.sock.clone();
         let captured = self.captured.clone();
@@ -211,6 +237,7 @@ impl FakeRelay {
             // Request invalidates gateway A's in-flight Update.
             let mut req_nonce: HashMap<SocketAddr, u32> = HashMap::new();
             let mut first_port: HashMap<IpAddr, u16> = HashMap::new();
+            let mut lost_requests = 0;
             loop {
                 let (n, src) = match sock.recv_from(&mut buf).await {
                     Ok(v) => v,
@@ -251,6 +278,9 @@ impl FakeRelay {
                             relay_address: relay_ip,
                         };
                         let _ = sock.send_to(&advert.encode(), src).await;
+                    }
+                    AmtMessage::Request { .. } if lost_requests < loss.requests => {
+                        lost_requests += 1;
                     }
                     AmtMessage::Request { request_nonce, .. } => {
                         let tunnel = match tunnel_port {

@@ -239,6 +239,14 @@ fan-out shrinks to a `Map<(src, group), WTStream>` lookup.
    to restart the handshake. This is intentional: Request retransmits without a
    fresh Discovery would reuse a possibly-stale relay binding.
 
+   > **Amended 2026-10-15 (BLO-33585).** An unanswered Request now restarts relay
+   > discovery itself, at the configured Relay Discovery Address (RFC 7450
+   > §5.2.3.5.3), and emits `QueryFailed` only after `MAX_DISCOVERY_RESTARTS`
+   > of them. The restart is a fresh Discovery with a fresh Request nonce, so it
+   > reuses no relay binding, which was the reason given above. Leaving it to the
+   > caller did not work: no in-tree caller re-subscribed on `QueryFailed`, so one
+   > lost Request, or its lost Query, stranded the queued subscription for good.
+
 7. **Inner data demux is best-effort, never fatal**: a malformed inner IP/UDP packet
    inside `AmtMessage::MulticastData` produces `Event::Warning(MalformedInner)` and
    the manager continues. No `Event::Data` is emitted for that datagram.

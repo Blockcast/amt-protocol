@@ -27,6 +27,17 @@ pub const MAX_GROUPS_PER_TUNNEL: usize = 64;
 pub const DISCOVERY_TIMEOUT_MS: u64 = 5_000;
 pub const REQUEST_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_DISCOVERY_RETRIES: u32 = 3;
+/// Relay Discovery restarts that unanswered Requests may cause before the
+/// manager gives up with `QueryFailed`.
+///
+/// A gateway that uses relay discovery and gets no Membership Query in time
+/// "SHOULD stop waiting for a Membership Query message and restart relay
+/// discovery" (RFC 7450 §5.2.3.5.3). That is a bound on a handshake that went
+/// unanswered, and RFC 7450 gives the two solicitations of the handshake the
+/// same retransmission rule (§5.2.3.4.3 for Relay Discovery, §5.2.3.5.3 for
+/// Request), so it takes the budget an unanswered Discovery already has rather
+/// than a number of its own.
+pub const MAX_DISCOVERY_RESTARTS: u32 = MAX_DISCOVERY_RETRIES;
 
 pub struct SubscriptionManager<P: Platform> {
     inner: AmtGateway<P>,
@@ -37,6 +48,11 @@ pub struct SubscriptionManager<P: Platform> {
     last_discovery_at_ms: Option<u64>,
     last_request_at_ms: Option<u64>,
     discovery_retries: u32,
+    /// Relay Discovery restarts caused by unanswered Requests since the last
+    /// Membership Query was accepted; see `MAX_DISCOVERY_RESTARTS`. Unlike
+    /// `discovery_retries`, an Advertisement does not reset it: in the failure
+    /// it bounds, every Discovery IS answered and only the Request is not.
+    discovery_restarts: u32,
     out_queue: VecDeque<Event>,
     shutting_down: bool,
     /// True after shutdown() has been called. AsyncAmtGateway runtime uses
@@ -58,6 +74,7 @@ impl<P: Platform> SubscriptionManager<P> {
             last_discovery_at_ms: None,
             last_request_at_ms: None,
             discovery_retries: 0,
+            discovery_restarts: 0,
             out_queue: VecDeque::new(),
             shutting_down: false,
             closed: false,
@@ -300,6 +317,9 @@ impl<P: Platform> SubscriptionManager<P> {
             self.out_queue.push_back(Event::Warning(e));
             return Ok(());
         }
+        // The Request was answered: the next unanswered one starts a fresh
+        // restart budget.
+        self.discovery_restarts = 0;
         // RFC 7450 §5.2.3.7.1: a Query reporting a gateway endpoint other than
         // the one the last Update was sent from means the relay still forwards
         // to the tunnel at the old one. Tear it down ahead of the Update that
@@ -437,6 +457,7 @@ impl<P: Platform> SubscriptionManager<P> {
                     } else {
                         self.inner.reset();
                         self.discovery_retries = 0;
+                        self.discovery_restarts = 0;
                         self.last_discovery_at_ms = None;
                         self.out_queue
                             .push_back(Event::Warning(AmtError::DiscoveryFailed));
@@ -446,14 +467,33 @@ impl<P: Platform> SubscriptionManager<P> {
             }
             return Ok(());
         }
-        // 2. Request retry: if no Query within REQUEST_TIMEOUT_MS, give up to Idle.
+        // 2. Unanswered Request: restart relay discovery (RFC 7450 §5.2.3.5.3),
+        //    up to MAX_DISCOVERY_RESTARTS times, then give up to Idle. Before
+        //    this a single lost Request -- or its lost Query -- parked the
+        //    manager in Idle for good: nothing re-armed it, so a subscription
+        //    queued during the handshake was never announced at all.
+        //
+        //    The new Discovery goes to the configured Relay Discovery Address
+        //    (§5.2.2.1), not to the relay the last Advertisement named: the
+        //    point of restarting is to locate a relay that answers (§5.2.3.5.3),
+        //    and the new handshake mints a new Request nonce, so an answer to
+        //    the abandoned Request that arrives late fails the nonce check
+        //    instead of being taken for the new one.
         if self.inner.state() == GatewayState::Requesting {
             if let Some(t) = self.last_request_at_ms {
                 if now_ms.saturating_sub(t) >= REQUEST_TIMEOUT_MS {
                     self.inner.reset();
                     self.last_request_at_ms = None;
-                    self.out_queue
-                        .push_back(Event::Warning(AmtError::QueryFailed));
+                    if self.discovery_restarts < MAX_DISCOVERY_RESTARTS {
+                        self.discovery_restarts += 1;
+                        self.inner
+                            .set_relay(self.cfg.relay_address, self.cfg.relay_port);
+                        self.start_discovery(now_ms)?;
+                    } else {
+                        self.discovery_restarts = 0;
+                        self.out_queue
+                            .push_back(Event::Warning(AmtError::QueryFailed));
+                    }
                 }
             }
             return Ok(());
@@ -1469,6 +1509,214 @@ mod tests {
             GatewayState::Idle,
             "manager parks in Idle on give-up"
         );
+    }
+
+    fn request_nonce_from(events: &[Event]) -> u32 {
+        events
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x03 => {
+                    Some(u32::from_be_bytes([
+                        payload[4], payload[5], payload[6], payload[7],
+                    ]))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no Request transmit in events: {events:?}"))
+    }
+
+    fn advertisement(nonce: u32, relay: &str) -> Vec<u8> {
+        AmtMessage::RelayAdvertisement {
+            nonce,
+            relay_address: relay.parse().unwrap(),
+        }
+        .encode()
+    }
+
+    /// RFC 7450 §5.2.3.5.3. A Request nobody answers -- lost on the way out,
+    /// or its Query lost on the way back -- restarts relay discovery at the
+    /// configured Relay Discovery Address instead of parking the manager in
+    /// Idle with the queued subscription never announced. The relay's answer
+    /// to the abandoned Request, arriving late, carries the abandoned nonce and
+    /// is not taken for the new handshake's.
+    #[test]
+    fn unanswered_request_restarts_relay_discovery_at_the_configured_address() {
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(key.clone(), 1000).unwrap();
+        let disc = discovery_nonce_from(&drain(&mut m));
+        // Advertise a relay other than the configured address, so the restart
+        // is seen to go back to the configured one.
+        m.handle_datagram(&advertisement(disc, "198.51.100.200"), 1100)
+            .unwrap();
+        let abandoned = request_nonce_from(&drain(&mut m));
+        assert_eq!(m.relay_address(), Some("198.51.100.200".parse().unwrap()));
+
+        m.tick(1100 + REQUEST_TIMEOUT_MS).unwrap();
+        let restart = drain(&mut m);
+        assert!(
+            !restart
+                .iter()
+                .any(|ev| matches!(ev, Event::Warning(AmtError::QueryFailed))),
+            "{restart:?}"
+        );
+        let to = restart
+            .iter()
+            .find_map(|ev| match ev {
+                Event::Transmit {
+                    dst,
+                    port,
+                    payload,
+                    keepalive,
+                } if payload[0] == 0x01 => {
+                    assert!(!keepalive, "Discovery is not a keep-alive");
+                    Some(std::net::SocketAddr::new(*dst, *port))
+                }
+                _ => None,
+            })
+            .expect("an unanswered Request restarts relay discovery");
+        assert_eq!(
+            to,
+            "192.0.2.96:2268".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(m.state(), GatewayState::Discovering);
+        let disc = discovery_nonce_from(&restart);
+
+        let late = |nonce| AmtMessage::MembershipQuery {
+            request_nonce: nonce,
+            response_mac: [0; 6],
+            query_data: vec![0x11; 12],
+            gateway_address: Some(relay_observed_gateway()),
+        };
+        m.handle_datagram(&late(abandoned).encode(), 6150).unwrap();
+        assert!(
+            drain(&mut m)
+                .iter()
+                .all(|ev| !matches!(ev, Event::Transmit { .. })),
+            "a late Query for the abandoned Request is ignored while discovering"
+        );
+        assert_eq!(m.state(), GatewayState::Discovering);
+
+        m.handle_datagram(&advertisement(disc, "192.0.2.96"), 6200)
+            .unwrap();
+        let fresh = request_nonce_from(&drain(&mut m));
+        assert_ne!(fresh, abandoned, "the new handshake mints a new nonce");
+        m.handle_datagram(&late(abandoned).encode(), 6250).unwrap();
+        let events = drain(&mut m);
+        assert!(
+            events
+                .iter()
+                .any(|ev| matches!(ev, Event::Warning(AmtError::InvalidNonce))),
+            "{events:?}"
+        );
+        assert_eq!(m.state(), GatewayState::Requesting);
+
+        m.handle_datagram(&late(fresh).encode(), 6300).unwrap();
+        let events = drain(&mut m);
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, Event::Transmit { payload, .. } if payload[0] == 0x05)));
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, Event::HandshakeComplete)));
+        assert!(
+            m.groups().contains_key(&key),
+            "the queued group is announced"
+        );
+    }
+
+    /// The restarts are bounded: after MAX_DISCOVERY_RESTARTS unanswered
+    /// Requests, the next one gives up with QueryFailed and parks the manager in
+    /// Idle, as an unanswered Discovery does after its own retries. Each
+    /// Discovery IS answered here, so the Advertisement must not reset the
+    /// budget, or this would loop forever.
+    #[test]
+    fn unanswered_requests_give_up_after_the_restart_budget() {
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(key, 1000).unwrap();
+        let mut disc = discovery_nonce_from(&drain(&mut m));
+        let mut t = 1000;
+        for restart in 0..=MAX_DISCOVERY_RESTARTS {
+            t += 100;
+            m.handle_datagram(&advertisement(disc, "192.0.2.96"), t)
+                .unwrap();
+            request_nonce_from(&drain(&mut m));
+            t += REQUEST_TIMEOUT_MS;
+            m.tick(t).unwrap();
+            let events = drain(&mut m);
+            let gave_up = events
+                .iter()
+                .any(|ev| matches!(ev, Event::Warning(AmtError::QueryFailed)));
+            if restart < MAX_DISCOVERY_RESTARTS {
+                assert!(!gave_up, "restart {restart}: {events:?}");
+                disc = discovery_nonce_from(&events);
+            } else {
+                assert!(gave_up, "{events:?}");
+                assert!(
+                    events
+                        .iter()
+                        .all(|ev| !matches!(ev, Event::Transmit { .. })),
+                    "{events:?}"
+                );
+                assert_eq!(m.state(), GatewayState::Idle);
+                assert_eq!(m.next_wakeup_ms(), None, "nothing left armed");
+            }
+        }
+    }
+
+    /// Giving up on Discovery mid-restart clears the restart count too, so the
+    /// next subscribe starts with the whole budget rather than what the failed
+    /// attempt left over.
+    #[test]
+    fn discovery_failure_during_a_restart_resets_the_restart_budget() {
+        let mut m = mgr();
+        let key = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        m.subscribe(key.clone(), 1000).unwrap();
+        let disc = discovery_nonce_from(&drain(&mut m));
+        m.handle_datagram(&advertisement(disc, "192.0.2.96"), 1100)
+            .unwrap();
+        drain(&mut m);
+        let mut t = 1100 + REQUEST_TIMEOUT_MS;
+        m.tick(t).unwrap();
+        discovery_nonce_from(&drain(&mut m));
+        // The restarted Discovery goes unanswered through all its retries.
+        for _ in 0..=MAX_DISCOVERY_RETRIES {
+            t += DISCOVERY_TIMEOUT_MS;
+            m.tick(t).unwrap();
+        }
+        assert!(drain(&mut m)
+            .iter()
+            .any(|ev| matches!(ev, Event::Warning(AmtError::DiscoveryFailed))));
+        assert_eq!(m.state(), GatewayState::Idle);
+
+        m.subscribe(key, t).unwrap();
+        let mut disc = discovery_nonce_from(&drain(&mut m));
+        for restart in 0..MAX_DISCOVERY_RESTARTS {
+            t += 100;
+            m.handle_datagram(&advertisement(disc, "192.0.2.96"), t)
+                .unwrap();
+            drain(&mut m);
+            t += REQUEST_TIMEOUT_MS;
+            m.tick(t).unwrap();
+            let events = drain(&mut m);
+            assert!(
+                !events
+                    .iter()
+                    .any(|ev| matches!(ev, Event::Warning(AmtError::QueryFailed))),
+                "restart {restart}: {events:?}"
+            );
+            disc = discovery_nonce_from(&events);
+        }
     }
 
     #[test]
