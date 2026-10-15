@@ -8,7 +8,7 @@ use crate::error::{AmtError, Result};
 use crate::messages::{AmtMessage, GatewayAddress};
 use crate::platform::{generate_nonce, Platform};
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
 /// AMT Gateway States (RFC 7450 Section 5.2.1)
@@ -468,6 +468,31 @@ impl<P: Platform> AmtGateway<P> {
         }
 
         let behind_last_update = self.last_update_query.ok_or(AmtError::InvalidState)?;
+        let teardown = behind_last_update
+            .teardown()
+            .ok_or(AmtError::NoGatewayAddress)?;
+
+        self.state = GatewayState::Closed;
+
+        Ok(teardown)
+    }
+
+    /// [`send_teardown`](Self::send_teardown), except that a Query without
+    /// the Gateway Address fields does not refuse it: the Teardown then
+    /// carries an all-zero Gateway Address (port 0, `::`). That is not RFC
+    /// 7450 compliant; it reproduces what non-compliant gateways send to a
+    /// relay that set no G flag, for relay-side tests (BLO-46706).
+    pub fn send_forced_teardown(&mut self) -> Result<AmtMessage> {
+        if self.state != GatewayState::Active {
+            return Err(AmtError::InvalidState);
+        }
+        let mut behind_last_update = self.last_update_query.ok_or(AmtError::InvalidState)?;
+        behind_last_update
+            .gateway_address
+            .get_or_insert(GatewayAddress {
+                port: 0,
+                address: Ipv6Addr::UNSPECIFIED,
+            });
         let teardown = behind_last_update
             .teardown()
             .ok_or(AmtError::NoGatewayAddress)?;
@@ -1070,6 +1095,41 @@ mod tests {
 
         assert_eq!(gw.send_teardown(), Err(AmtError::NoGatewayAddress));
         assert_eq!(gw.state(), GatewayState::Active);
+    }
+
+    /// A forced Teardown is sent anyway, copying the Query's nonce and MAC and
+    /// naming the all-zero endpoint; with the fields present it is the
+    /// compliant Teardown (BLO-46706).
+    #[test]
+    fn forced_teardown_without_gateway_address_names_the_zero_endpoint() {
+        let mac = [1, 2, 3, 4, 5, 6];
+        let mut gw = AmtGateway::new(test_config(), test_platform());
+        let nonce = drive_to_active(&mut gw, mac, None);
+
+        assert_eq!(
+            gw.send_forced_teardown(),
+            Ok(AmtMessage::Teardown {
+                request_nonce: nonce,
+                response_mac: mac,
+                gateway_address: GatewayAddress {
+                    port: 0,
+                    address: Ipv6Addr::UNSPECIFIED,
+                },
+            })
+        );
+        assert_eq!(gw.state(), GatewayState::Closed);
+
+        let observed = relay_observed("203.0.113.7:40000");
+        let mut gw = AmtGateway::new(test_config(), test_platform());
+        let nonce = drive_to_active(&mut gw, mac, Some(observed));
+        assert_eq!(
+            gw.send_forced_teardown(),
+            Ok(AmtMessage::Teardown {
+                request_nonce: nonce,
+                response_mac: mac,
+                gateway_address: observed,
+            })
+        );
     }
 
     /// The fields belong to one Query: a later Query without them clears an

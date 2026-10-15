@@ -515,7 +515,12 @@ impl<P: Platform> SubscriptionManager<P> {
         self.shutting_down = true;
         if self.inner.state() == GatewayState::Active {
             let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
-            match self.inner.send_teardown() {
+            let teardown = if self.cfg.force_teardown {
+                self.inner.send_forced_teardown()
+            } else {
+                self.inner.send_teardown()
+            };
+            match teardown {
                 Ok(msg) => {
                     self.out_queue.push_back(Event::Transmit {
                         dst: relay,
@@ -1529,6 +1534,41 @@ mod tests {
             ),
             Err(AmtError::ShutdownInProgress)
         ));
+    }
+
+    /// With `force_teardown` the same relay still gets a Teardown, naming the
+    /// all-zero endpoint, as non-compliant gateways send (BLO-46706).
+    #[test]
+    fn forced_shutdown_against_relay_without_teardown_support_sends_teardown() {
+        let mut cfg = AmtConfig::new("192.0.2.96".parse::<IpAddr>().unwrap(), Some(2268));
+        cfg.force_teardown = true;
+        let mut m = SubscriptionManager::new(cfg, Arc::new(TestPlatform::new()));
+        let k = GroupKey {
+            group: "232.0.0.1".parse().unwrap(),
+            source: Some("10.0.0.1".parse().unwrap()),
+        };
+        let request_nonce = drive_to_active_via(&mut m, k, None);
+        let _ = drain(&mut m);
+
+        m.shutdown(1500).unwrap();
+        let teardown = drain(&mut m)
+            .into_iter()
+            .find_map(|ev| match ev {
+                Event::Transmit { payload, .. } if payload[0] == 0x07 => Some(payload),
+                _ => None,
+            })
+            .expect("expected Teardown transmit");
+        assert_eq!(
+            AmtMessage::decode(&teardown).unwrap(),
+            AmtMessage::Teardown {
+                request_nonce,
+                response_mac: [0; 6],
+                gateway_address: GatewayAddress {
+                    port: 0,
+                    address: std::net::Ipv6Addr::UNSPECIFIED,
+                },
+            }
+        );
     }
 
     #[test]

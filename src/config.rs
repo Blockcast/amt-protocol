@@ -28,6 +28,14 @@ pub struct AmtConfig {
     /// Default: 60 seconds, 0 to disable
     /// RFC 7450 Section 5.2.3.4: "The gateway MAY send periodic Membership Update messages"
     pub keepalive_interval_secs: u32,
+
+    /// Send a Teardown on shutdown even when the relay's last Membership
+    /// Query left the G flag unset (BLO-46706). Off by default, because such
+    /// a relay does not support Teardown (RFC 7450 §5.1.4.5) and a compliant
+    /// gateway sends none. On, the Teardown carries an all-zero Gateway
+    /// Address (port 0, `::`), the shape non-compliant gateways in the field
+    /// send. For relay-side billing tests only.
+    pub force_teardown: bool,
 }
 
 impl AmtConfig {
@@ -41,6 +49,7 @@ impl AmtConfig {
             relay_port: relay_port.unwrap_or(DEFAULT_AMT_PORT),
             enable_driad: false,
             keepalive_interval_secs: Self::DEFAULT_KEEPALIVE_SECS,
+            force_teardown: false,
         }
     }
 
@@ -52,6 +61,7 @@ impl AmtConfig {
             relay_port: relay_port.unwrap_or(DEFAULT_AMT_PORT),
             enable_driad: true,
             keepalive_interval_secs: Self::DEFAULT_KEEPALIVE_SECS,
+            force_teardown: false,
         }
     }
 
@@ -63,6 +73,7 @@ impl AmtConfig {
             relay_port: DEFAULT_AMT_PORT,
             enable_driad: true,
             keepalive_interval_secs: Self::DEFAULT_KEEPALIVE_SECS,
+            force_teardown: false,
         }
     }
 
