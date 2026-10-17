@@ -346,6 +346,14 @@ struct PidCounts {
     /// alongside `received` — a track with `received: 2` is a weak sample, and
     /// a repair track shows its full 1337 B on the first symbol.
     max_len: usize,
+    /// Every arrival on this track that cleared the header check, keyed by
+    /// UDP source port. Sums to `received + reordered + implausible` for the
+    /// track. The SSM filter pins the source ADDRESS, so more than one key
+    /// here means more than one socket emitting the same `packet_id`: two
+    /// emitters, not a muxer defect. That is the discriminator BLO-33585
+    /// needed for its pid 0/1/2 "second sequence space". Without this field
+    /// it took a production capture, which no agent seat can run.
+    src_ports: std::collections::BTreeMap<u16, u64>,
 }
 
 /// Mutable accumulator behind one [`PidCounts`]. Separate type because the
@@ -357,6 +365,7 @@ struct PidAcc {
     reordered: u64,
     implausible: u64,
     max_len: usize,
+    src_ports: std::collections::BTreeMap<u16, u64>,
 }
 
 /// Receiver-intrinsic loss accounting, parsed from the MMTP packet header
@@ -399,7 +408,7 @@ struct SeqTracker {
 }
 
 impl SeqTracker {
-    fn observe(&mut self, payload: &[u8]) {
+    fn observe(&mut self, src_port: u16, payload: &[u8]) {
         self.observed += 1;
         // Too short to hold a header, or a version this parser does not claim to
         // understand. Either way the layout assumption does not hold here.
@@ -416,6 +425,7 @@ impl SeqTracker {
         // sequence branches below and each one reuses it.
         let acc = self.per_pid.entry(pid).or_default();
         acc.max_len = acc.max_len.max(payload.len());
+        *acc.src_ports.entry(src_port).or_default() += 1;
         let Some(&prev) = self.last.get(&pid) else {
             self.last.insert(pid, seq);
             // Nothing before it on this track, so it can neither be in-sequence
@@ -478,6 +488,7 @@ impl SeqTracker {
                 reordered: a.reordered,
                 implausible: a.implausible,
                 max_len: a.max_len,
+                src_ports: a.src_ports,
             })
             .collect();
         // Sorted so two receipts of the same stream are diffable line for line;
@@ -724,7 +735,7 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
             Ok(evt) => {
                 packet_count += 1;
                 byte_count += evt.payload.len() as u64;
-                seq.observe(&evt.payload);
+                seq.observe(evt.src_port, &evt.payload);
                 elapsed_ms = Some(data_started.elapsed().as_millis() as u64);
                 data_ended_at_ms = Some(unix_millis());
                 if let Some(f) = fwd.as_mut() {
@@ -1693,7 +1704,7 @@ mod tests {
     fn track(pkts: &[(u16, u32)]) -> MmtpLoss {
         let mut t = SeqTracker::default();
         for &(id, s) in pkts {
-            t.observe(&mmtp(id, s));
+            t.observe(5004, &mmtp(id, s));
         }
         t.finish().expect("observed packets yield a report")
     }
@@ -1715,7 +1726,8 @@ mod tests {
                     gaps: 3,
                     reordered: 1,
                     implausible: 0,
-                    max_len: 32
+                    max_len: 32,
+                    src_ports: [(5004, 4)].into(),
                 },
                 PidCounts {
                     pid: 2,
@@ -1723,7 +1735,8 @@ mod tests {
                     gaps: 0,
                     reordered: 0,
                     implausible: 0,
-                    max_len: 32
+                    max_len: 32,
+                    src_ports: [(5004, 3)].into(),
                 },
             ]
         );
@@ -1753,11 +1766,11 @@ mod tests {
     #[test]
     fn by_pid_implausible_is_a_lower_bound_on_the_whole_stream_figure() {
         let mut t = SeqTracker::default();
-        t.observe(&mmtp(1, 0));
+        t.observe(5004, &mmtp(1, 0));
         // Attributable: past MAX_PLAUSIBLE_GAP on a track already established.
-        t.observe(&mmtp(1, MAX_PLAUSIBLE_GAP + 2));
+        t.observe(5004, &mmtp(1, MAX_PLAUSIBLE_GAP + 2));
         // Unattributable: too short to carry a `packet_id` at all.
-        t.observe(&[0u8; 4]);
+        t.observe(5004, &[0u8; 4]);
         let got = t.finish().expect("observed packets yield a report");
         assert_eq!(got.implausible, 2);
         assert_eq!(got.by_pid.iter().map(|p| p.implausible).sum::<u64>(), 1);
@@ -1823,10 +1836,10 @@ mod tests {
     #[test]
     fn by_pid_max_len_tracks_the_largest_packet_on_each_track() {
         let mut t = SeqTracker::default();
-        t.observe(&mmtp_len(1, 0, 900));
-        t.observe(&mmtp_len(1, 1, 1316));
-        t.observe(&mmtp_len(1, 2, 1200)); // smaller: must not lower the mark
-        t.observe(&mmtp_len(32769, 0, 1337));
+        t.observe(5004, &mmtp_len(1, 0, 900));
+        t.observe(5004, &mmtp_len(1, 1, 1316));
+        t.observe(5004, &mmtp_len(1, 2, 1200)); // smaller: must not lower the mark
+        t.observe(5004, &mmtp_len(32769, 0, 1337));
         let got = t.finish().expect("observed packets yield a report");
         assert_eq!(
             got.by_pid
@@ -2002,13 +2015,37 @@ mod tests {
     #[test]
     fn short_or_wrong_version_payloads_are_implausible() {
         let mut t = SeqTracker::default();
-        t.observe(b"tiny");
+        t.observe(5004, b"tiny");
         let mut wrong_version = mmtp(1, 1);
         wrong_version[0] = 0x40; // version 1
-        t.observe(&wrong_version);
+        t.observe(5004, &wrong_version);
         let got = t.finish().expect("observed packets yield a report");
         assert_eq!(got.implausible, 2);
         assert_eq!(got.loss_ratio, None);
+    }
+
+    /// BLO-33585: two sockets interleaving one `packet_id` read as a burst of
+    /// "reordered" arrivals with almost no gaps. `src_ports` must separate them
+    /// by port and still partition every arrival that cleared the header check.
+    #[test]
+    fn by_pid_src_ports_separates_two_emitters_on_one_track() {
+        let mut t = SeqTracker::default();
+        for s in 100..110 {
+            t.observe(5004, &mmtp(1, s));
+            t.observe(5006, &mmtp(1, s - 50)); // second space, behind the mark
+        }
+        t.observe(5004, &mmtp(2, 7));
+        t.observe(5004, b"tiny"); // no pid: must not appear under any track
+        let got = t.finish().expect("observed packets yield a report");
+        let p1 = &got.by_pid[0];
+        assert_eq!(p1.src_ports, [(5004, 10), (5006, 10)].into());
+        for p in &got.by_pid {
+            assert_eq!(
+                p.src_ports.values().sum::<u64>(),
+                p.received + p.reordered + p.implausible
+            );
+        }
+        assert_eq!(got.by_pid[1].src_ports, [(5004, 1)].into());
     }
 
     #[test]
