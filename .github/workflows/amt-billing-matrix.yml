@@ -142,6 +142,39 @@ jobs:
           cat out/report.json; tail -n 40 out/stderr.txt
           echo "### case shape \`$SHAPE\` — exit $rc, GwIP \`$ip\`" >> "$GITHUB_STEP_SUMMARY"
           exit $rc
+      - name: v6 egress via Cloudflare WARP (case 4; hosted runners have no native v6)
+        # BLO-47085: GitHub-hosted runners have no IPv6 egress, so the v6 step
+        # below always skipped. A v6-only WireGuard tunnel to WARP gives this
+        # off-cluster runner a public v6 address without touching v4, which
+        # the v4 step's GwIP and GitHub's own control connection ride on.
+        if: always() && env.RELAY6 != ''
+        continue-on-error: true
+        run: |
+          curl -fsS -6 -m 5 https://api6.ipify.org && { echo " native v6; WARP not needed"; exit 0; }
+          sudo apt-get install -y -q wireguard-tools >/dev/null
+          curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.3.1/wgcf_2.3.1_linux_amd64
+          echo "4fb7a136aa470ece11d17949c7db07b040ec9c604742dc8680bcf1889f85d0c8  wgcf" | sha256sum -c -
+          chmod +x wgcf
+          ./wgcf register --accept-tos >/dev/null
+          ./wgcf generate >/dev/null
+          # Keep only the v6 half: drop v4 addresses/routes and DNS so v4 stays native.
+          python3 - <<'PY'
+          import re
+          out=[]
+          for l in open('wgcf-profile.conf'):
+              k,_,v=l.partition('=')
+              k=k.strip()
+              if k=='DNS': continue
+              if k in ('Address','AllowedIPs'):
+                  vals=[x.strip() for x in v.split(',') if ':' in x]
+                  if not vals: continue
+                  l=f"{k} = {', '.join(vals)}\n"
+              out.append(l)
+          open('wg6.conf','w').write(''.join(out))
+          PY
+          sudo install -m 600 wg6.conf /etc/wireguard/wg6.conf
+          sudo wg-quick up wg6
+          curl -fsS -6 -m 10 https://api6.ipify.org; echo " <- WARP v6 egress"
       - name: v6 attempt (case 4, informational)
         if: always() && env.RELAY6 != ''
         continue-on-error: true
