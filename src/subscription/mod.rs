@@ -53,9 +53,12 @@ pub struct SubscriptionManager<P: Platform> {
     cfg: AmtConfig,
     groups: HashMap<GroupKey, GroupState>,
     pending: VecDeque<GroupKey>,
-    last_update_at_ms: Option<u64>,
     last_discovery_at_ms: Option<u64>,
     last_request_at_ms: Option<u64>,
+    /// When the last Membership Query was accepted. With `last_request_at_ms`
+    /// it starts the query timer of RFC 7450 §5.2.3.5.4: while Active, the
+    /// next keep-alive Request is due one interval after the later of the two.
+    last_query_at_ms: Option<u64>,
     discovery_retries: u32,
     /// Relay Discovery restarts caused by unanswered Requests since the last
     /// Membership Query was accepted; see `MAX_DISCOVERY_RESTARTS`. Unlike
@@ -95,9 +98,9 @@ impl<P: Platform> SubscriptionManager<P> {
             cfg,
             groups: HashMap::new(),
             pending: VecDeque::new(),
-            last_update_at_ms: None,
             last_discovery_at_ms: None,
             last_request_at_ms: None,
+            last_query_at_ms: None,
             discovery_retries: 0,
             discovery_restarts: 0,
             robustness: None,
@@ -157,7 +160,7 @@ impl<P: Platform> SubscriptionManager<P> {
                     let mut state = GroupState::new(key.clone(), now_ms);
                     state.announced = true;
                     self.groups.insert(key.clone(), state);
-                    self.emit_incremental_allow(&key, now_ms)?;
+                    self.emit_incremental_allow(&key)?;
                     joined = true;
                 }
                 if joined {
@@ -355,8 +358,9 @@ impl<P: Platform> SubscriptionManager<P> {
             }
         };
         // The Request was answered: the next unanswered one starts a fresh
-        // restart budget.
+        // restart budget, and the query timer restarts from here.
         self.discovery_restarts = 0;
+        self.last_query_at_ms = Some(now_ms);
         self.robustness = query::querier_robustness(&general_query);
         // RFC 7450 §5.2.3.7.1: a Query reporting a gateway endpoint other than
         // the one the last Update was sent from means the relay still forwards
@@ -391,7 +395,7 @@ impl<P: Platform> SubscriptionManager<P> {
         //
         // Nothing else depends on this order. In particular the keep-alive
         // witness does not: the Update carries its own `keepalive` label.
-        self.send_current_state_update(now_ms, !initial_handshake)?;
+        self.transmit_current_state_report(!initial_handshake)?;
         if initial_handshake {
             // This Update is the first report of every join queued during the
             // handshake. A re-Query's Update while Active is a current-state
@@ -402,19 +406,12 @@ impl<P: Platform> SubscriptionManager<P> {
         Ok(())
     }
 
-    /// Emit a current-state Membership Update. `keepalive` labels the event for
-    /// consumers that count keep-alives: false for the initial Update that
-    /// completes the handshake, true for every later one (periodic tick, or a
-    /// re-Query arriving while already Active). Robustness retransmissions of
-    /// a join are not keep-alives either: see `retransmit_join_report`.
-    fn send_current_state_update(&mut self, now_ms: u64, keepalive: bool) -> Result<()> {
-        self.transmit_current_state_report(keepalive)?;
-        self.last_update_at_ms = Some(now_ms);
-        Ok(())
-    }
-
     /// Queue a Membership Update carrying the current-state report of every
-    /// group, without touching the keep-alive schedule.
+    /// group. `keepalive` labels the event for consumers that count
+    /// keep-alives: false for the initial Update that completes the handshake,
+    /// true for the Update answering every later Query, i.e. the relay's reply
+    /// to a query-timer Request. Robustness retransmissions of a join are not
+    /// keep-alives either: see `retransmit_join_report`.
     fn transmit_current_state_report(&mut self, keepalive: bool) -> Result<()> {
         let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
         let port = self.inner.relay_port();
@@ -491,7 +488,7 @@ impl<P: Platform> SubscriptionManager<P> {
     /// Unsubscribe from a (group, source). In Active state, emits an incremental
     /// BLOCK_OLD_SOURCES Update. In all other states, just removes from groups/pending.
     /// Unknown keys are a silent no-op.
-    pub fn unsubscribe(&mut self, key: &GroupKey, now_ms: u64) -> Result<()> {
+    pub fn unsubscribe(&mut self, key: &GroupKey, _now_ms: u64) -> Result<()> {
         if self.shutting_down {
             return Err(AmtError::ShutdownInProgress);
         }
@@ -522,11 +519,10 @@ impl<P: Platform> SubscriptionManager<P> {
             payload: msg.encode(),
             keepalive: false,
         });
-        self.last_update_at_ms = Some(now_ms);
         Ok(())
     }
 
-    fn emit_incremental_allow(&mut self, key: &GroupKey, now_ms: u64) -> Result<()> {
+    fn emit_incremental_allow(&mut self, key: &GroupKey) -> Result<()> {
         let relay = self.inner.relay_address().ok_or(AmtError::InvalidState)?;
         let report = match relay {
             IpAddr::V4(_) => crate::subscription::report::build_allow_v4(key)?,
@@ -539,11 +535,10 @@ impl<P: Platform> SubscriptionManager<P> {
             payload: msg.encode(),
             keepalive: false,
         });
-        self.last_update_at_ms = Some(now_ms);
         Ok(())
     }
 
-    /// Advance time-driven state: keep-alive Updates, Discovery/Request retries.
+    /// Advance time-driven state: keep-alive Requests, Discovery/Request retries.
     pub fn tick(&mut self, now_ms: u64) -> Result<()> {
         if self.shutting_down {
             return Ok(());
@@ -610,21 +605,34 @@ impl<P: Platform> SubscriptionManager<P> {
                 }
             }
         }
-        // 4. Active keep-alive.
-        if self.inner.state() == GatewayState::Active && !self.groups.is_empty() {
-            let interval_ms = (self.cfg.keepalive_interval_secs as u64) * 1000;
-            if interval_ms == 0 {
-                return Ok(());
-            }
-            let due = match self.last_update_at_ms {
-                Some(t) => now_ms.saturating_sub(t) >= interval_ms,
-                None => false,
-            };
-            if due {
-                self.send_current_state_update(now_ms, true)?;
+        // 4. Query timer (RFC 7450 §5.2.3.5.4-5): re-run the membership query
+        //    procedure, i.e. send a Request. The relay's answering Query
+        //    carries a fresh Response MAC, and `handle_query` answers it with
+        //    the current-state Update, which is the keep-alive. Refreshing
+        //    with bare Updates instead reused the handshake's MAC for the life
+        //    of the tunnel, which a relay rotating its MAC secret (§5.3.6)
+        //    eventually refuses (BLO-51065).
+        if let Some(due) = self.query_timer_deadline_ms() {
+            if now_ms >= due {
+                self.send_request(now_ms)?;
             }
         }
         Ok(())
+    }
+
+    /// When the query timer next fires while Active, if it is armed. A lost
+    /// Request or Query re-arms it one interval after the Request, not on
+    /// every tick.
+    fn query_timer_deadline_ms(&self) -> Option<u64> {
+        if self.inner.state() != GatewayState::Active || self.groups.is_empty() {
+            return None;
+        }
+        let interval_ms = (self.cfg.keepalive_interval_secs as u64) * 1000;
+        if interval_ms == 0 {
+            return None;
+        }
+        let since = self.last_query_at_ms.max(self.last_request_at_ms)?;
+        Some(since + interval_ms)
     }
 
     /// Earliest future wall-clock (ms) at which a `tick(now_ms)` call would emit work,
@@ -641,13 +649,8 @@ impl<P: Platform> SubscriptionManager<P> {
                 candidates.push(t + REQUEST_TIMEOUT_MS);
             }
         }
-        if self.inner.state() == GatewayState::Active && !self.groups.is_empty() {
-            let interval_ms = (self.cfg.keepalive_interval_secs as u64) * 1000;
-            if interval_ms > 0 {
-                if let Some(t) = self.last_update_at_ms {
-                    candidates.push(t + interval_ms);
-                }
-            }
+        if let Some(t) = self.query_timer_deadline_ms() {
+            candidates.push(t);
         }
         if self.inner.state() == GatewayState::Active {
             if let Some(t) = self.next_report_retransmission_ms {
@@ -1697,32 +1700,123 @@ mod tests {
         assert!(events.is_empty(), "no events on unsubscribe of unknown key");
     }
 
-    #[test]
-    fn tick_emits_keepalive_update_after_interval() {
-        let mut m = mgr();
-        let k = GroupKey {
-            group: "232.0.0.1".parse().unwrap(),
-            source: Some("10.0.0.1".parse().unwrap()),
-        };
-        drive_to_active(&mut m, k);
-        let _ = drain(&mut m);
+    /// The relay's answer to a keep-alive Request: a Query echoing `nonce`
+    /// with a MAC of its choosing.
+    fn refresh_query(nonce: u32, mac: [u8; 6]) -> Vec<u8> {
+        AmtMessage::MembershipQuery {
+            request_nonce: nonce,
+            response_mac: mac,
+            query_data: vec![0x11; 12],
+            gateway_address: Some(relay_observed_gateway()),
+        }
+        .encode()
+    }
 
-        // Default keep-alive is 60s. Advance just past it.
-        let ka_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
-        m.tick(1200 + ka_ms + 1).unwrap();
-
-        let events = drain(&mut m);
-        let update = events
+    /// The AMT message types among `events`' transmits, in order.
+    fn sent_types(events: &[Event]) -> Vec<u8> {
+        events
             .iter()
-            .find_map(|ev| match ev {
-                Event::Transmit { payload, .. } if payload[0] == 0x05 => Some(payload.clone()),
+            .filter_map(|ev| match ev {
+                Event::Transmit { payload, .. } => Some(payload[0]),
                 _ => None,
             })
-            .expect("expected keep-alive Update");
-        // Skip AMT (12B) + IPv4(RA) (24B) to reach the IGMPv3 body.
-        let report = &update[12 + 24..];
-        assert_eq!(report[0], 0x22);
-        assert_eq!(u16::from_be_bytes([report[6], report[7]]), 1);
+            .collect()
+    }
+
+    /// RFC 7450 §5.2.3.5.4-5: when the query timer expires the gateway runs
+    /// the membership query procedure again -- it sends a Request, not a bare
+    /// Update -- and the Update answering the relay's Query carries THAT
+    /// Query's MAC (§5.2.3.6.2). Refreshing with Updates alone reused the
+    /// handshake's MAC forever, which a relay rotating its MAC secret
+    /// (§5.3.6) refuses within minutes (BLO-51065).
+    #[test]
+    fn query_timer_sends_a_request_each_period_and_updates_carry_the_newest_mac() {
+        let mut m = mgr();
+        let nonce = drive_to_active(&mut m, ssm("232.0.0.1", "10.0.0.1"));
+        let ka_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
+        let mut t = 1200;
+        for period in 1..=5u8 {
+            assert_eq!(m.next_wakeup_ms(), Some(t + ka_ms), "period {period}");
+            m.tick(t + ka_ms - 1).unwrap();
+            assert!(drain(&mut m).is_empty(), "period {period}: early");
+
+            t += ka_ms;
+            m.tick(t).unwrap();
+            let sent = drain(&mut m);
+            assert_eq!(
+                sent_types(&sent),
+                vec![0x03],
+                "period {period}: one Request, no Update"
+            );
+            let request = match &sent[0] {
+                Event::Transmit {
+                    payload, keepalive, ..
+                } => {
+                    assert!(!keepalive, "the Request is not the keep-alive");
+                    AmtMessage::decode(payload).unwrap()
+                }
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(request, AmtMessage::Request { request_nonce, p_flag: false } if request_nonce == nonce),
+                "period {period}: {request:?}"
+            );
+            // Nothing more until the relay answers.
+            m.tick(t + 1).unwrap();
+            assert!(
+                drain(&mut m).is_empty(),
+                "period {period}: Request repeated"
+            );
+
+            let mac = [period; 6];
+            t += 40;
+            m.handle_datagram(&refresh_query(nonce, mac), t).unwrap();
+            let answered = updates(&drain(&mut m));
+            assert_eq!(answered.len(), 1, "period {period}");
+            let (update, keepalive) = &answered[0];
+            assert!(keepalive, "the answering Update is the keep-alive");
+            assert!(
+                matches!(update, AmtMessage::MembershipUpdate { request_nonce, response_mac, .. }
+                    if *request_nonce == nonce && *response_mac == mac),
+                "period {period}: Update must carry the newest Query's MAC: {update:?}"
+            );
+            assert_eq!(m.state(), GatewayState::Active);
+        }
+    }
+
+    /// A lost Request (or lost Query) re-arms the timer one interval after the
+    /// Request, rather than resending it on every tick.
+    #[test]
+    fn an_unanswered_keepalive_request_is_retried_after_one_interval() {
+        let mut m = mgr();
+        drive_to_active(&mut m, ssm("232.0.0.1", "10.0.0.1"));
+        let ka_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
+        m.tick(1200 + ka_ms).unwrap();
+        assert_eq!(sent_types(&drain(&mut m)), vec![0x03]);
+        m.tick(1200 + 2 * ka_ms - 1).unwrap();
+        assert!(drain(&mut m).is_empty());
+        assert_eq!(m.next_wakeup_ms(), Some(1200 + 2 * ka_ms));
+        m.tick(1200 + 2 * ka_ms).unwrap();
+        assert_eq!(sent_types(&drain(&mut m)), vec![0x03]);
+        assert_eq!(
+            m.state(),
+            GatewayState::Active,
+            "data keeps flowing meanwhile"
+        );
+    }
+
+    /// An incremental join's Update carries no fresh MAC, so it must not push
+    /// the next Request back; otherwise frequent joins starve the refresh.
+    #[test]
+    fn an_incremental_update_does_not_delay_the_query_timer() {
+        let mut m = mgr();
+        drive_to_active(&mut m, ssm("232.0.0.1", "10.0.0.1"));
+        let ka_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
+        m.subscribe(ssm("232.0.0.2", "10.0.0.1"), 1200 + ka_ms - 10)
+            .unwrap();
+        drain(&mut m);
+        m.tick(1200 + ka_ms).unwrap();
+        assert!(sent_types(&drain(&mut m)).contains(&0x03));
     }
 
     fn keepalive_labels_of_updates(events: &[Event]) -> Vec<bool> {
@@ -1788,13 +1882,19 @@ mod tests {
             "initial Update, not a keep-alive"
         );
 
-        // The periodic one is.
+        // The Update answering the query timer's Request is.
         let ka_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
         m.tick(1200 + ka_ms + 1).unwrap();
         assert_eq!(
             keepalive_labels_of_updates(&drain(&mut m)),
+            Vec::<bool>::new()
+        );
+        m.handle_datagram(&refresh_query(req_nonce, [7; 6]), 1200 + ka_ms + 50)
+            .unwrap();
+        assert_eq!(
+            keepalive_labels_of_updates(&drain(&mut m)),
             vec![true],
-            "tick Update is a keep-alive"
+            "the refresh Update is a keep-alive"
         );
     }
 
@@ -1806,8 +1906,8 @@ mod tests {
             source: Some("10.0.0.1".parse().unwrap()),
         };
         drive_to_active(&mut m, k);
-        // After drive_to_active, last_update_at_ms is 1200 (the synthesized
-        // Query timestamp). next_wakeup_ms = last_update_at + 60s.
+        // After drive_to_active the handshake Query arrived at 1200, which
+        // starts the query timer: next_wakeup_ms = 1200 + 60s.
         let ka_ms = (AmtConfig::DEFAULT_KEEPALIVE_SECS as u64) * 1000;
         assert_eq!(m.next_wakeup_ms(), Some(1200 + ka_ms));
     }

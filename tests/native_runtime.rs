@@ -370,3 +370,57 @@ async fn driad_build_keeps_the_checked_socket_for_an_address_keyed_relay() {
     assert_eq!(gw.relay(), relay.addr.ip());
     assert_data_flows(gw).await;
 }
+
+/// A relay that rotates its MAC secret (RFC 7450 §5.3.6) refuses an Update
+/// carrying a MAC it no longer retains. Here a MAC lives 0.6-0.8 s, under one
+/// 1 s keep-alive period, so a gateway refreshing with bare Updates (reusing
+/// the handshake's MAC) gets data once and never again. Re-Requesting on the
+/// query timer gets a fresh MAC each cycle, so every cycle's Update is
+/// accepted and draws data, on the one tunnel the handshake built (BLO-51065).
+/// A time-scaled stand-in for linux-amt #391 (4 generations of 60 s).
+#[tokio::test(flavor = "current_thread")]
+async fn keepalive_requests_survive_a_relay_rotating_its_mac_secret() {
+    use common::fake_relay::MacRotation;
+    let relay = FakeRelay::bind("v4").await;
+    relay.spawn_rotating_mac(
+        synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x"),
+        MacRotation {
+            period: Duration::from_millis(200),
+            generations: 4,
+        },
+    );
+    let gw = AsyncAmtGateway::builder(relay.addr.ip())
+        .relay_port(relay.addr.port())
+        .keepalive(Duration::from_secs(1))
+        .build()
+        .await
+        .unwrap();
+    let mut data_rx = gw.subscribe_data();
+    gw.subscribe(
+        "232.0.0.1".parse().unwrap(),
+        Some("10.0.0.1".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let start = tokio::time::Instant::now();
+    let mut received = 0;
+    let mut last = Duration::ZERO;
+    while let Ok(Ok(_)) =
+        tokio::time::timeout_at(start + Duration::from_millis(6_500), data_rx.recv()).await
+    {
+        received += 1;
+        last = start.elapsed();
+    }
+    assert!(
+        received >= 6,
+        "data must keep arriving every cycle: {received}"
+    );
+    assert!(last >= Duration::from_secs(5), "data stopped at {last:?}");
+
+    let types = relay.captured.lock().await.message_types.clone();
+    let count = |t: u8| types.iter().filter(|&&x| x == t).count();
+    assert_eq!(count(1), 1, "no re-handshake: {types:?}");
+    assert!(count(3) >= 6, "one Request per cycle: {types:?}");
+    gw.shutdown().await.unwrap();
+}

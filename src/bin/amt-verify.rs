@@ -1096,10 +1096,10 @@ outer source address (distinct ephemeral ports only), so `distinct_outer_sources
 of `requested`. RFC 7450 s4.2.2 keys a tunnel on the (address, port) endpoint, but linux-amt as \
 deployed matches on the outer source ADDRESS alone (`tunnel->addr.ip4 == iph->saddr`, amt.c \
 amt_request_handler), overwriting `source_port` from the newest Request. So N gateways from one \
-address occupy exactly ONE relay tunnel entry while every one of them still reads Active and still \
-sends keep-alives -- `alive` is a SEND-side self-report (state == Active && keepalives_sent >= 1; \
-all three not-alive reasons are client-local) and cannot witness relay state at all. An `alive` of \
-N is therefore indistinguishable from one tunnel aliased N ways. This mode CANNOT produce a relay \
+address occupy exactly ONE relay tunnel entry while every one of them can still read Active. `alive` \
+(state == Active && a query-timer Request answered by the relay within the last two keep-alive \
+intervals) is relay-answered but per gateway, so an `alive` of N is indistinguishable from one \
+tunnel aliased N ways. This mode CANNOT produce a relay \
 tunnel-state ceiling; see BLO-33636 for the keying fix and linux-amt \
 kernel/selftests/amt_capacity.sh for a rig that provisions distinct source addresses and takes \
 ground truth from the relay's own admit/refuse reply.";
@@ -1131,6 +1131,7 @@ fn classify_held_tunnel(
     has_fatal: bool,
     state: GatewayState,
     keepalives: u64,
+    answered_recently: bool,
     establish_ms: u64,
     rx: u64,
 ) -> TunnelOutcome {
@@ -1143,11 +1144,17 @@ fn classify_held_tunnel(
             reason: "state_left_active",
         }
     } else if keepalives == 0 {
-        // Held past one full keep-alive interval and emitted nothing: the
-        // tunnel was established but is not demonstrably maintained, so it
-        // must not be counted as live state.
+        // Held past one full keep-alive interval and the relay answered no
+        // query-timer Request, so no keep-alive Update went out: the tunnel
+        // was established but is not demonstrably maintained, so it must not
+        // be counted as live state.
         TunnelOutcome::NotAlive {
             reason: "no_keepalive_sent",
+        }
+    } else if !answered_recently {
+        // The relay answered earlier Requests but not the latest ones.
+        TunnelOutcome::NotAlive {
+            reason: "relay_stopped_answering",
         }
     } else {
         TunnelOutcome::Alive {
@@ -1404,10 +1411,15 @@ async fn run_tunnels(
     for (gw, establish_ms) in &up {
         let keepalives = gw.keepalives_sent();
         let rx = gw.rx_datagrams();
+        // One lost Request is tolerated; two consecutive unanswered ones are not.
+        let answered_recently = gw
+            .since_last_keepalive()
+            .is_some_and(|age| age <= 2 * keepalive);
         outcomes.push(classify_held_tunnel(
             gw.has_fatal().await,
             gw.state(),
             keepalives,
+            answered_recently,
             *establish_ms,
             rx,
         ));
@@ -1533,7 +1545,7 @@ mod tests {
     }
 
     fn alive_one() -> TunnelOutcome {
-        classify_held_tunnel(false, GatewayState::Active, 1, 5, 0)
+        classify_held_tunnel(false, GatewayState::Active, 1, true, 5, 0)
     }
 
     #[test]
@@ -1552,17 +1564,23 @@ mod tests {
             // case that would otherwise be counted as live relay state.
             (
                 "fatal_runtime_error",
-                classify_held_tunnel(true, GatewayState::Active, 3, 5, 0),
+                classify_held_tunnel(true, GatewayState::Active, 3, true, 5, 0),
             ),
             // Left Active during the hold.
             (
                 "state_left_active",
-                classify_held_tunnel(false, GatewayState::Discovering, 3, 5, 0),
+                classify_held_tunnel(false, GatewayState::Discovering, 3, true, 5, 0),
             ),
             // Established but never maintained across a keep-alive interval.
             (
                 "no_keepalive_sent",
-                classify_held_tunnel(false, GatewayState::Active, 0, 5, 0),
+                classify_held_tunnel(false, GatewayState::Active, 0, true, 5, 0),
+            ),
+            // The relay answered earlier query-timer Requests, then went
+            // quiet (BLO-51065).
+            (
+                "relay_stopped_answering",
+                classify_held_tunnel(false, GatewayState::Active, 3, false, 5, 0),
             ),
         ] {
             let r = summarize_n(vec![alive_one(), alive_one(), failed], 3);
@@ -1584,8 +1602,8 @@ mod tests {
         // makes "survived an interval" a measurement rather than an assumption.
         let r = summarize_n(
             vec![
-                classify_held_tunnel(false, GatewayState::Active, 9, 5, 0),
-                classify_held_tunnel(false, GatewayState::Active, 1, 5, 0),
+                classify_held_tunnel(false, GatewayState::Active, 9, true, 5, 0),
+                classify_held_tunnel(false, GatewayState::Active, 1, true, 5, 0),
             ],
             2,
         );

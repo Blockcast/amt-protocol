@@ -72,6 +72,20 @@ pub struct Loss {
     pub requests: usize,
     /// Membership Updates dropped before one is answered with data.
     pub updates: usize,
+    /// If set, Requests after this many answered ones are dropped: the relay
+    /// goes quiet on a live tunnel.
+    pub answered_requests: Option<usize>,
+}
+
+/// A relay that rotates the secret behind its Response MACs (RFC 7450 §5.3.6)
+/// every `period`, accepting an Update whose MAC was minted in any of the last
+/// `generations` periods, the way linux-amt #391 does (4 generations of 60 s).
+/// A gateway that refreshes with bare Updates keeps the handshake's MAC and is
+/// refused once it ages out; one that re-Requests gets a fresh MAC each cycle.
+#[derive(Debug, Clone, Copy)]
+pub struct MacRotation {
+    pub period: std::time::Duration,
+    pub generations: u64,
 }
 
 /// The datagram a Membership Query encapsulates (§5.1.4.8).
@@ -141,9 +155,16 @@ fn gateway_address_fields(endpoint: SocketAddr) -> GatewayAddressFields {
 /// (§5.3.5). It differs per endpoint, so a Teardown naming any endpoint but
 /// the tunnel's fails authentication here as it would at a real relay.
 fn response_mac(gateway: &GatewayAddressFields, nonce: u32) -> [u8; 6] {
+    rotated_mac(gateway, nonce, None)
+}
+
+/// `response_mac` under secret generation `generation`; `None` is the fixed
+/// secret of a relay that does not rotate.
+fn rotated_mac(gateway: &GatewayAddressFields, nonce: u32, generation: Option<u64>) -> [u8; 6] {
     let mut hasher = DefaultHasher::new();
     gateway.hash(&mut hasher);
     nonce.hash(&mut hasher);
+    generation.hash(&mut hasher);
     let digest = hasher.finish().to_be_bytes();
     [
         digest[0], digest[1], digest[2], digest[3], digest[4], digest[5],
@@ -217,6 +238,7 @@ impl FakeRelay {
             TunnelPort::EachRequest,
             Loss::default(),
             EncapsulatedQuery::Placeholder,
+            None,
         );
     }
 
@@ -232,6 +254,7 @@ impl FakeRelay {
             TunnelPort::FirstRequest,
             Loss::default(),
             EncapsulatedQuery::Placeholder,
+            None,
         );
     }
 
@@ -249,6 +272,7 @@ impl FakeRelay {
             TunnelPort::EachRequest,
             Loss::default(),
             EncapsulatedQuery::Placeholder,
+            None,
         );
     }
 
@@ -262,6 +286,7 @@ impl FakeRelay {
             TunnelPort::EachRequest,
             loss,
             EncapsulatedQuery::Placeholder,
+            None,
         );
     }
 
@@ -277,9 +302,25 @@ impl FakeRelay {
             TunnelPort::EachRequest,
             loss,
             EncapsulatedQuery::Igmpv3General { qrv },
+            None,
         );
     }
 
+    /// As `spawn`, for a relay rotating its MAC secret (see [`MacRotation`]).
+    #[allow(dead_code)]
+    pub fn spawn_rotating_mac(&self, inner_payload: Vec<u8>, rotation: MacRotation) {
+        self.spawn_with(
+            inner_payload,
+            None,
+            TeardownSupport::Supported,
+            TunnelPort::EachRequest,
+            Loss::default(),
+            EncapsulatedQuery::Placeholder,
+            Some(rotation),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn spawn_with(
         &self,
         inner_payload: Vec<u8>,
@@ -288,6 +329,7 @@ impl FakeRelay {
         tunnel_port: TunnelPort,
         loss: Loss,
         query: EncapsulatedQuery,
+        rotation: Option<MacRotation>,
     ) {
         let sock = self.sock.clone();
         let captured = self.captured.clone();
@@ -302,8 +344,24 @@ impl FakeRelay {
                 unreachable!("spawn_querying refuses an IPv6 relay")
             }
         };
+        let started = std::time::Instant::now();
+        // The current secret generation, or `None` for a fixed secret.
+        let generation = move || {
+            rotation.map(|r| started.elapsed().as_millis() as u64 / r.period.as_millis() as u64)
+        };
+        // Whether `mac` is one this relay minted for (gateway, nonce) under a
+        // secret it still retains.
+        let accepts = move |gateway: &GatewayAddressFields, nonce: u32, mac: [u8; 6]| match (
+            rotation,
+            generation(),
+        ) {
+            (Some(r), Some(now)) => (now.saturating_sub(r.generations - 1)..=now)
+                .any(|g| mac == rotated_mac(gateway, nonce, Some(g))),
+            _ => mac == response_mac(gateway, nonce),
+        };
         tokio::spawn(async move {
             let mut buf = [0u8; 65535];
+            let mut answered_requests = 0;
             // Keyed by the gateway's ephemeral source address, NOT a single
             // shared slot: `--tunnels N` puts N gateways on this one relay
             // socket concurrently, and a shared nonce means gateway B's
@@ -356,7 +414,12 @@ impl FakeRelay {
                     AmtMessage::Request { .. } if lost_requests < loss.requests => {
                         lost_requests += 1;
                     }
+                    AmtMessage::Request { .. }
+                        if loss
+                            .answered_requests
+                            .is_some_and(|max| answered_requests >= max) => {}
                     AmtMessage::Request { request_nonce, .. } => {
+                        answered_requests += 1;
                         let tunnel = match tunnel_port {
                             TunnelPort::EachRequest => src,
                             TunnelPort::FirstRequest => SocketAddr::new(
@@ -368,7 +431,7 @@ impl FakeRelay {
                         let observed = gateway_address_fields(tunnel);
                         let query = membership_query(
                             request_nonce,
-                            response_mac(&observed, request_nonce),
+                            rotated_mac(&observed, request_nonce, generation()),
                             &general_query,
                             (teardown == TeardownSupport::Supported).then_some(observed),
                         );
@@ -384,7 +447,7 @@ impl FakeRelay {
                         response_mac: mac,
                         ..
                     } if req_nonce.get(&src) == Some(&request_nonce)
-                        && mac == response_mac(&gateway_address_fields(src), request_nonce) =>
+                        && accepts(&gateway_address_fields(src), request_nonce, mac) =>
                     {
                         let data = AmtMessage::MulticastData {
                             ip_packet: inner_payload.clone(),
