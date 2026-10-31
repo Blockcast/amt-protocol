@@ -57,19 +57,21 @@ pub struct AsyncAmtGateway {
     /// the spawned task exited because of one. `shutdown()` checks this and
     /// returns Err(...) instead of Ok(()) when set.
     pub(crate) fatal: Arc<Mutex<Option<anyhow::Error>>>,
-    /// Membership Updates SUCCESSFULLY transmitted after the handshake
-    /// completed, i.e. keep-alives. Incremented only once `send_to` has
-    /// returned Ok, so a keep-alive that failed to leave the process is not
-    /// counted. The initial current-state Update is excluded because the
-    /// manager labels it `keepalive: false` on the event itself — this does
-    /// not depend on the drain position of `HandshakeComplete`, nor on
-    /// sampling `state`.
+    /// Keep-alive Membership Updates SUCCESSFULLY transmitted, i.e. the
+    /// Updates answering a relay Query to a query-timer Request after the
+    /// handshake (RFC 7450 §5.2.3.5.4). Incremented only once `send_to` has
+    /// returned Ok. The initial current-state Update is excluded because the
+    /// manager labels it `keepalive: false` on the event itself.
     ///
-    /// A tunnel is only demonstrably held across a keep-alive interval if this
-    /// is >= 1. Note what it does NOT prove: it is client-side emission, not
-    /// relay-side acceptance. Relay-side occupancy must come from the relay
+    /// Since the manager refreshes with a Request rather than a bare Update
+    /// (BLO-51065), each one exists only because the relay answered that
+    /// Request: >= 1 is relay-originated evidence that the relay still
+    /// authenticates this tunnel, not merely client-side emission. It is NOT
+    /// relay-side forwarding state; that must come from the relay
     /// (`amt_relay_active_tunnels`) — see BLO-33457.
     pub(crate) keepalives: Arc<AtomicU64>,
+    /// When the latest of `keepalives` left the process.
+    pub(crate) last_keepalive: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Datagrams received from the relay over this tunnel's socket, all types.
     /// Relay-originated, so non-zero is positive evidence the relay is still
     /// talking to us; zero is NOT evidence of death, because an AMT relay owes
@@ -140,6 +142,12 @@ impl AsyncAmtGateway {
     /// See the field docs for exactly what this does and does not witness.
     pub fn keepalives_sent(&self) -> u64 {
         self.keepalives.load(Ordering::Relaxed)
+    }
+
+    /// Time since the latest keep-alive Update was sent, i.e. since the relay
+    /// last answered a query-timer Request. `None` before the first one.
+    pub fn since_last_keepalive(&self) -> Option<std::time::Duration> {
+        self.last_keepalive.lock().unwrap().map(|t| t.elapsed())
     }
 
     /// Datagrams received from the relay on this tunnel's socket.
@@ -260,6 +268,7 @@ impl AsyncAmtGatewayBuilder {
         let state = Arc::new(AtomicU8::new(state_to_u8(GatewayState::Idle)));
         let fatal: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
         let keepalives = Arc::new(AtomicU64::new(0));
+        let last_keepalive = Arc::new(std::sync::Mutex::new(None));
         let rx_datagrams = Arc::new(AtomicU64::new(0));
 
         let task = tokio::spawn(run_task(
@@ -270,6 +279,7 @@ impl AsyncAmtGatewayBuilder {
             state.clone(),
             fatal.clone(),
             keepalives.clone(),
+            last_keepalive.clone(),
             rx_datagrams.clone(),
             self.recv_buf_bytes,
             self.log_target,
@@ -283,6 +293,7 @@ impl AsyncAmtGatewayBuilder {
             task: Mutex::new(Some(task)),
             fatal,
             keepalives,
+            last_keepalive,
             rx_datagrams,
         }
     }
@@ -316,6 +327,7 @@ async fn run_task(
     state: Arc<AtomicU8>,
     fatal: Arc<Mutex<Option<anyhow::Error>>>,
     keepalives: Arc<AtomicU64>,
+    last_keepalive: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     rx_datagrams: Arc<AtomicU64>,
     recv_buf_bytes: usize,
     _log_target: &'static str,
@@ -393,6 +405,7 @@ async fn run_task(
                         // `state == Active && keepalives_sent >= 1`, which is the
                         // exact shape a caller reads as a surviving tunnel.
                         keepalives.fetch_add(1, Ordering::Relaxed);
+                        *last_keepalive.lock().unwrap() = Some(std::time::Instant::now());
                     }
                 }
                 Event::Data {

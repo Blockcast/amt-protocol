@@ -19,11 +19,12 @@ pub enum Event {
         dst: IpAddr,
         port: u16,
         payload: Vec<u8>,
-        /// True only for a *keep-alive* current-state Membership Update — one
-        /// emitted while the tunnel was already Active. False for everything
-        /// else the manager transmits, including the initial current-state
-        /// Update that completes the handshake, Discovery, Request,
-        /// incremental ALLOW/BLOCK and Teardown.
+        /// True only for a *keep-alive* current-state Membership Update — the
+        /// one answering a relay Query while the tunnel was already Active,
+        /// i.e. the relay's reply to a query-timer Request. False for
+        /// everything else the manager transmits, including the initial
+        /// current-state Update that completes the handshake, Discovery, the
+        /// query-timer Request itself, incremental ALLOW/BLOCK and Teardown.
         ///
         /// The emitting side is the only place that knows this. A consumer
         /// counting keep-alives reads this flag; it must NOT infer the answer

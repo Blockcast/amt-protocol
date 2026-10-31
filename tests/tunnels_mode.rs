@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::fake_relay::{synth_v4_udp, FakeRelay};
+use common::fake_relay::{synth_v4_udp, FakeRelay, Loss};
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -105,8 +105,9 @@ async fn tunnels_mode_reports_per_tunnel_survival() {
     // workflow verdict gates on it, and a reader who trusts `alive` is exactly
     // the reader who will not finish the caveat. All 3 gateways bound the host
     // default source, so on a relay keying tunnels by outer address alone they
-    // are ONE tunnel entry -- while `alive` says 3, because `alive` is a
-    // send-side self-report and every aliased gateway still sends.
+    // are ONE tunnel entry -- while `alive` says 3, because `alive` is per
+    // gateway and this fake relay answers each gateway's Requests at its own
+    // port.
     //
     // This asserting `1` rather than `<= requested` is deliberate: if someone
     // gives the gateways distinct sources, this test must FAIL and make them
@@ -258,4 +259,47 @@ async fn tunnels_mode_scales_to_512_concurrent() {
          INSTRUMENT, not the relay: {out}"
     );
     assert!(status.success(), "{out}");
+}
+
+/// `alive` is evidence from the relay, not a successful local send (BLO-51065):
+/// a tunnel whose relay stops answering its query-timer Requests is not alive,
+/// whether it goes quiet right after the handshake or after a few cycles.
+#[tokio::test(flavor = "multi_thread")]
+async fn tunnels_mode_reports_not_alive_when_the_relay_stops_answering() {
+    for (answered, reason) in [(1, "no_keepalive_sent"), (2, "relay_stopped_answering")] {
+        let relay = FakeRelay::bind("v4").await;
+        relay.spawn_lossy(
+            synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x"),
+            Loss {
+                answered_requests: Some(answered),
+                ..Loss::default()
+            },
+        );
+        let port = relay.addr.port().to_string();
+        let (status, out) = run_amt_verify(&[
+            "--relay",
+            &relay.addr.ip().to_string(),
+            "--port",
+            &port,
+            "--group",
+            "232.0.0.1",
+            "--source",
+            "10.0.0.1",
+            "--tunnels",
+            "1",
+            "--keepalive",
+            "1",
+            "--hold",
+            "5",
+            "--timeout",
+            "5",
+            "--json",
+        ])
+        .await;
+        assert_eq!(status.code(), Some(1), "{reason}: {out}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect(&out);
+        assert_eq!(v["established"], 1, "{reason}: {out}");
+        assert_eq!(v["alive"], 0, "{reason}: {out}");
+        assert_eq!(v["not_alive"][reason], 1, "{reason}: {out}");
+    }
 }

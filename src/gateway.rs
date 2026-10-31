@@ -248,16 +248,11 @@ impl<P: Platform> AmtGateway<P> {
     ///   `handle_query` accepting `Active`: a Query can only arrive while
     ///   Active if a Request could be sent from Active in the first place.
     ///
-    /// This is a library primitive for embedders, not something the in-crate
-    /// driver reaches. `subscription`'s only caller of `send_request` is
-    /// `handle_advertisement`, where the gateway is `Idle`, and `tick()`'s
-    /// Active branch emits a Membership *Update* via
-    /// `send_current_state_update` rather than a Request — so nothing in this
-    /// crate takes the `Active` arm. The callers that do are the FFI, JNI and
-    /// WASM bindings; go-amt's `keepaliveLoop` drives it through
-    /// `amt_gateway_request_membership`, which is what BLO-28805 needed.
-    /// Wiring the crate's own `tick()` to re-Request on the QQIC-derived
-    /// timer is a separate change.
+    /// `subscription::SubscriptionManager::tick()` takes the `Active` arm on
+    /// every query-timer expiry (RFC 7450 §5.2.3.5.4-5, BLO-51065), and the
+    /// FFI, JNI and WASM bindings expose it to embedders; go-amt's
+    /// `keepaliveLoop` drives it through `amt_gateway_request_membership`,
+    /// which is what BLO-28805 needed.
     ///
     /// # Nonce reuse here is a deliberate deviation, not what the RFC says
     ///
