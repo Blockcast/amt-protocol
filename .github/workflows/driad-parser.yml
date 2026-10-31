@@ -26,7 +26,7 @@ concurrency:
 jobs:
   tests:
     name: golden corpus + mutation harness
-    runs-on: ubuntu-latest
+    runs-on: default
     steps:
       - uses: actions/checkout@v4
       # Kept equal to rust-toolchain.toml's `channel`, which would silently
