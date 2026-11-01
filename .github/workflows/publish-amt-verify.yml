@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   publish:
+    timeout-minutes: 15  # 2x longest of last 15 runs (~4m)
     runs-on: arc-e2e
     steps:
       - uses: actions/checkout@v4
