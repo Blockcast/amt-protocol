@@ -402,7 +402,7 @@ chmod +x "$WORK/nopy/python3"
 # ---------------------------------------------------------------------------
 # LIVE DIAL. The one case that reads the real /proc and the real loopback, and
 # the only one that can distinguish a responsive RcvbufErrors from a dead one.
-# Runs on the ARC Docker pool, the same runner class that runs the probe, so a failure
+# Runs on ubuntu-latest, the same runner class that runs the probe, so a failure
 # here is a genuine finding about the instrument rather than a fixture problem.
 #
 # The forcing magnitude is PRINTED rather than asserted. A control licenses the
