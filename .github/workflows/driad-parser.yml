@@ -27,7 +27,7 @@ jobs:
   tests:
     timeout-minutes: 40
     name: golden corpus + mutation harness
-    runs-on: default
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'default' }}
     steps:
       - uses: actions/checkout@v4
       # Kept equal to rust-toolchain.toml's `channel`, which would silently
@@ -58,7 +58,7 @@ jobs:
 
   wasm-shape:
     name: wasm-bindgen JS shape
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'default' }}
     steps:
       - uses: actions/checkout@v4
       # Kept equal to rust-toolchain.toml's `channel` (BLO-41503).
@@ -87,7 +87,7 @@ jobs:
 
   fuzz:
     name: libFuzzer (bounded)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'default' }}
     # `cargo fuzz` needs nightly, and `dtolnay/rust-toolchain@nightly` below only
     # gets it there via `rustup default nightly`. rust-toolchain.toml (BLO-41503)
     # outranks `rustup default`, so without this every cargo call in this job
@@ -97,6 +97,11 @@ jobs:
     # channel, and `RUSTUP_TOOLCHAIN=stable rustup which cargo` did not.
     env:
       RUSTUP_TOOLCHAIN: nightly
+      # libFuzzer's -detect_leaks=0 below only stops leak checks DURING the run.
+      # The shutdown leak pass is ASan's own and needs ptrace, which ARC pods on
+      # some nodes refuse; a clean run then ends red with "LeakSanitizer has
+      # encountered a fatal error" and an empty crash input. Turn that pass off too.
+      ASAN_OPTIONS: detect_leaks=0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -110,15 +115,18 @@ jobs:
 
       # Bounded so this is a regression gate, not an open-ended fuzzing session:
       # each target runs the checked-in seed corpus plus a fixed time budget.
-      # A crash writes to fuzz/artifacts/ and fails the job.
+      # A crash writes to fuzz/artifacts/ and fails the job. ARC's runner pods
+      # cannot grant LeakSanitizer the ptrace permission it needs at shutdown;
+      # without this flag an otherwise successful bounded run ends red with
+      # "LeakSanitizer has encountered a fatal error" after the corpus pass.
       - name: fuzz parse_dns_response
-        run: cargo fuzz run driad_parse_response -- -max_total_time=120 -max_len=4096
+        run: cargo fuzz run driad_parse_response -- -max_total_time=120 -max_len=4096 -detect_leaks=0
       - name: fuzz parse_amtrelay_rdata
-        run: cargo fuzz run driad_amtrelay_rdata -- -max_total_time=120 -max_len=512
+        run: cargo fuzz run driad_amtrelay_rdata -- -max_total_time=120 -max_len=512 -detect_leaks=0
       - name: fuzz validated/unvalidated differential
-        run: cargo fuzz run driad_query_roundtrip -- -max_total_time=120 -max_len=4096
+        run: cargo fuzz run driad_query_roundtrip -- -max_total_time=120 -max_len=4096 -detect_leaks=0
       - name: fuzz candidate list
-        run: cargo fuzz run driad_candidates -- -max_total_time=120 -max_len=4096
+        run: cargo fuzz run driad_candidates -- -max_total_time=120 -max_len=4096 -detect_leaks=0
 
       - name: upload crash artifacts
         if: failure()
