@@ -25,6 +25,7 @@ concurrency:
 
 jobs:
   tests:
+    timeout-minutes: 40
     name: golden corpus + mutation harness
     runs-on: default
     steps:

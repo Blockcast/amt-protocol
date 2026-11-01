@@ -65,7 +65,7 @@ permissions:
 
 jobs:
   run:
-    runs-on: arc-e2e
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
       IMAGE: ghcr.io/blockcast/amt-verify:main
@@ -142,8 +142,8 @@ jobs:
           cat out/report.json; tail -n 40 out/stderr.txt
           echo "### case shape \`$SHAPE\` — exit $rc, GwIP \`$ip\`" >> "$GITHUB_STEP_SUMMARY"
           exit $rc
-      - name: v6 egress via Cloudflare WARP (case 4; ARC runners have no native v6)
-        # BLO-47085: ARC runners have no IPv6 egress, so the v6 step
+      - name: v6 egress via Cloudflare WARP (case 4; hosted runners have no native v6)
+        # BLO-47085: GitHub-hosted runners have no IPv6 egress, so the v6 step
         # below always skipped. A v6-only WireGuard tunnel to WARP gives this
         # off-cluster runner a public v6 address without touching v4, which
         # the v4 step's GwIP and GitHub's own control connection ride on.

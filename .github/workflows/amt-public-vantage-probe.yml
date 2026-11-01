@@ -187,7 +187,7 @@ env:
 jobs:
   probe:
     if: ${{ (inputs.mode || 'oneshot') == 'oneshot' }}
-    runs-on: arc-e2e
+    runs-on: ubuntu-latest
     # An EXCEEDED job timeout CANCELS the job. MEASURED, not inferred -- the
     # docs do not state it, and it decides how `Route probe failure` must be
     # gated, so it was settled by experiment rather than by reading:
@@ -338,7 +338,7 @@ jobs:
           # attribution is by COVARIATION across lossy/clean, not by a threshold.
           #
           # Caveat, and it is real: this counter is netns-WIDE, not per-socket.
-          # On an otherwise-idle ARC runner ours is the only meaningful UDP
+          # On an otherwise-idle hosted runner ours is the only meaningful UDP
           # traffic, but a non-zero delta is evidence about the netns, so do not
           # read a small one as proof it was us.
           #
@@ -1007,7 +1007,7 @@ jobs:
       # `job.status != 'success' && env.ZERO_DATA != '1'` is true for any
       # non-verdict bad end, and those are third-party-network steps: ipify in
       # the vantage receipt, actions/checkout, the ghcr login, upload-artifact.
-      # The cron fires 96x/day on ARC runners, so a blip inside the first
+      # The cron fires 96x/day on hosted runners, so a blip inside the first
       # few days is close to certain. Once one files `[amt-probe][infra] ...`, the exact
       # title dedup above routes every LATER detector death to `gh issue
       # comment` on that stale row -- so a persistent death (ghcr token expiry,
@@ -1082,7 +1082,7 @@ jobs:
   # (each_deliberate_failure_mode_reduces_the_alive_count).
   tunnels-ramp:
     if: ${{ inputs.mode == 'tunnels-ramp' }}
-    runs-on: arc-e2e
+    runs-on: ubuntu-latest
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
       SOURCE: ${{ inputs.source || '69.25.95.192' }}
@@ -1709,7 +1709,7 @@ jobs:
   # them distinguishable.
   loss-delta-preflight:
     if: ${{ inputs.mode == 'loss-delta' }}
-    runs-on: arc-e2e
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1779,7 +1779,7 @@ jobs:
   loss-delta:
     if: ${{ inputs.mode == 'loss-delta' }}
     needs: loss-delta-preflight
-    runs-on: arc-e2e
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       # A dead leg must NOT cancel its siblings. The surviving legs and their
@@ -2016,7 +2016,7 @@ jobs:
     # below is unaffected; it is not an expression.
     if: ${{ !cancelled() && inputs.mode == 'loss-delta' && needs['loss-delta-preflight'].result == 'success' }}
     needs: [loss-delta-preflight, loss-delta]
-    runs-on: arc-e2e
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     # No `issues: write`: this mode is dispatch-only measurement and must never
     # file an outage row. Routing belongs to the scheduled oneshot probe.
