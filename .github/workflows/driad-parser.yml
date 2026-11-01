@@ -109,15 +109,18 @@ jobs:
 
       # Bounded so this is a regression gate, not an open-ended fuzzing session:
       # each target runs the checked-in seed corpus plus a fixed time budget.
-      # A crash writes to fuzz/artifacts/ and fails the job.
+      # A crash writes to fuzz/artifacts/ and fails the job. ARC's runner pods
+      # cannot grant LeakSanitizer the ptrace permission it needs at shutdown;
+      # without this flag an otherwise successful bounded run ends red with
+      # "LeakSanitizer has encountered a fatal error" after the corpus pass.
       - name: fuzz parse_dns_response
-        run: cargo fuzz run driad_parse_response -- -max_total_time=120 -max_len=4096
+        run: cargo fuzz run driad_parse_response -- -max_total_time=120 -max_len=4096 -detect_leaks=0
       - name: fuzz parse_amtrelay_rdata
-        run: cargo fuzz run driad_amtrelay_rdata -- -max_total_time=120 -max_len=512
+        run: cargo fuzz run driad_amtrelay_rdata -- -max_total_time=120 -max_len=512 -detect_leaks=0
       - name: fuzz validated/unvalidated differential
-        run: cargo fuzz run driad_query_roundtrip -- -max_total_time=120 -max_len=4096
+        run: cargo fuzz run driad_query_roundtrip -- -max_total_time=120 -max_len=4096 -detect_leaks=0
       - name: fuzz candidate list
-        run: cargo fuzz run driad_candidates -- -max_total_time=120 -max_len=4096
+        run: cargo fuzz run driad_candidates -- -max_total_time=120 -max_len=4096 -detect_leaks=0
 
       - name: upload crash artifacts
         if: failure()
