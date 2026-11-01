@@ -97,6 +97,11 @@ jobs:
     # channel, and `RUSTUP_TOOLCHAIN=stable rustup which cargo` did not.
     env:
       RUSTUP_TOOLCHAIN: nightly
+      # libFuzzer's -detect_leaks=0 below only stops leak checks DURING the run.
+      # The shutdown leak pass is ASan's own and needs ptrace, which ARC pods on
+      # some nodes refuse; a clean run then ends red with "LeakSanitizer has
+      # encountered a fatal error" and an empty crash input. Turn that pass off too.
+      ASAN_OPTIONS: detect_leaks=0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
