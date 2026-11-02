@@ -1,8 +1,8 @@
 name: AMT public-vantage probe
 
-# BLO-21823. Runs the real amt-verify from a GitHub-HOSTED runner (public egress,
-# arbitrary outbound UDP). Deliberately NOT a self-hosted ARC runner: those are
-# in-cluster, so the relay sees an RFC1918 source and its reply is unroutable.
+# BLO-21823. Runs the real amt-verify from the ARC public-egress runner pool
+# (arbitrary outbound UDP). The runner must retain a routable source address so
+# the relay can return its traffic.
 # That vantage artifact is what five weeks of in-cluster probes actually measured.
 
 on:
@@ -187,7 +187,9 @@ env:
 jobs:
   probe:
     if: ${{ (inputs.mode || 'oneshot') == 'oneshot' }}
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-light
     # An EXCEEDED job timeout CANCELS the job. MEASURED, not inferred -- the
     # docs do not state it, and it decides how `Route probe failure` must be
     # gated, so it was settled by experiment rather than by reading:
@@ -1082,7 +1084,9 @@ jobs:
   # (each_deliberate_failure_mode_reduces_the_alive_count).
   tunnels-ramp:
     if: ${{ inputs.mode == 'tunnels-ramp' }}
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-light
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
       SOURCE: ${{ inputs.source || '69.25.95.192' }}
@@ -1709,7 +1713,9 @@ jobs:
   # them distinguishable.
   loss-delta-preflight:
     if: ${{ inputs.mode == 'loss-delta' }}
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-light
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1779,7 +1785,9 @@ jobs:
   loss-delta:
     if: ${{ inputs.mode == 'loss-delta' }}
     needs: loss-delta-preflight
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-light
     timeout-minutes: 15
     strategy:
       # A dead leg must NOT cancel its siblings. The surviving legs and their
@@ -2016,7 +2024,9 @@ jobs:
     # below is unaffected; it is not an expression.
     if: ${{ !cancelled() && inputs.mode == 'loss-delta' && needs['loss-delta-preflight'].result == 'success' }}
     needs: [loss-delta-preflight, loss-delta]
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-light
     timeout-minutes: 10
     # No `issues: write`: this mode is dispatch-only measurement and must never
     # file an outage row. Routing belongs to the scheduled oneshot probe.
