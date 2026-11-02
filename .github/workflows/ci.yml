@@ -109,19 +109,17 @@ jobs:
   # tests/toolchain_pin_test.sh does.
   probe-verdict:
     name: probe verdict logic
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'default' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      # BLO-38861. probe_verdict_test.sh and probe_counters_test.sh deliberately
-      # get no PyYAML bootstrap. On the runner the image ships it, so the deleted
-      # `|| pip install ...` fallback does not fire -- this job going green with
-      # no bootstrap is the measurement, since an absent PyYAML drives both of
-      # them to exit 2. (That string is elided on purpose: BLO-38861 AC1 greps
-      # this file for the literal.) Off the runner it bought nothing either --
-      # both already fail closed on their own extraction precondition: `ABORT:
-      # ... or pyyaml absent`, exit 2, with the ModuleNotFoundError left in
-      # front of it as evidence. Re-adding one only moves that into pip's voice.
+      - name: Install PyYAML in an isolated environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyyaml-venv"
+          "$RUNNER_TEMP/pyyaml-venv/bin/python" -m pip install --quiet pyyaml
+          echo "$RUNNER_TEMP/pyyaml-venv/bin" >> "$GITHUB_PATH"
+      # Keep the parser dependency isolated from the ARC image. The tests fail
+      # closed when PyYAML is absent, so make that prerequisite explicit here.
       #
       # The third step below is NOT this case -- do not harmonise it. BLO-38826
       # gave workflow_expression_budget_test.sh a bootstrap in its own voice by
@@ -131,9 +129,8 @@ jobs:
         run: bash tests/probe_verdict_test.sh
       # Same job, not a new one: it shares the extraction and the stub pattern,
       # and a second job would double the checkout for one more answer. Its
-      # `live dial` case needs a bare runner with working loopback -- which is
-      # what this job already is, and the same runner class the probe itself
-      # uses, so a failure there is a finding about the instrument.
+      # `live dial` case needs a bare runner with working loopback, which the
+      # self-hosted default pool provides.
       - name: tests/probe_counters_test.sh
         run: bash tests/probe_counters_test.sh
       # BLO-38732. Static, so it fires on the PR that would break parsing rather
