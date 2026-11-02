@@ -47,7 +47,9 @@ jobs:
     # Fork PRs are intentionally skipped: this job executes PR-controlled code
     # on the trusted in-cluster ARC pool.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: default
+    runs-on:
+      group: default-tools
+      labels: arc-light
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -115,7 +117,9 @@ jobs:
     # Fork PRs are intentionally skipped: this job executes PR-controlled code
     # on the trusted in-cluster ARC pool.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: default
+    runs-on:
+      group: default-tools
+      labels: arc-light
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -159,7 +163,9 @@ jobs:
     # Fork PRs are intentionally skipped: this job executes PR-controlled code
     # on the trusted in-cluster ARC pool.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: default
+    runs-on:
+      group: default-tools
+      labels: arc-light
     # The native leg's integration tests are not uniformly bounded: tests/cli_json.rs
     # awaits `read_to_string` then `child.wait()` on a spawned amt-verify with no
     # `tokio::time::timeout` wrapper, and tests/watch_smoke.rs awaits `shutdown()`
