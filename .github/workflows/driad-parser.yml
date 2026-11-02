@@ -30,7 +30,9 @@ jobs:
     # Fork PRs are intentionally skipped: this job executes PR-controlled code
     # on the trusted in-cluster ARC pool.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: default
+    runs-on:
+      group: default-tools
+      labels: arc-light
     steps:
       - uses: actions/checkout@v4
       # Kept equal to rust-toolchain.toml's `channel`, which would silently
@@ -64,7 +66,9 @@ jobs:
     # Fork PRs are intentionally skipped: this job executes PR-controlled code
     # on the trusted in-cluster ARC pool.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: default
+    runs-on:
+      group: default-tools
+      labels: arc-light
     steps:
       - uses: actions/checkout@v4
       # Kept equal to rust-toolchain.toml's `channel` (BLO-41503).
@@ -96,7 +100,9 @@ jobs:
     # Fork PRs are intentionally skipped: this job executes PR-controlled code
     # on the trusted in-cluster ARC pool.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: default
+    runs-on:
+      group: default-tools
+      labels: arc-light
     # `cargo fuzz` needs nightly, and `dtolnay/rust-toolchain@nightly` below only
     # gets it there via `rustup default nightly`. rust-toolchain.toml (BLO-41503)
     # outranks `rustup default`, so without this every cargo call in this job
