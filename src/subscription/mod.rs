@@ -88,6 +88,19 @@ pub struct SubscriptionManager<P: Platform> {
     /// because the inner state machine only reaches Closed on the Active-
     /// path teardown.
     closed: bool,
+    /// Multicast Data dropped by the (S,G) filter, by why it missed; see
+    /// [`SubscriptionManager::filter_drops`].
+    filter_drops: FilterDrops,
+}
+
+/// Inner packets [`SubscriptionManager::handle_datagram`] dropped because no
+/// subscription matched them. The drop itself emits no event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FilterDrops {
+    /// No subscription names the packet's destination group.
+    pub foreign_group: u64,
+    /// The group is subscribed, but not from the packet's source.
+    pub foreign_source: u64,
 }
 
 impl<P: Platform> SubscriptionManager<P> {
@@ -110,6 +123,7 @@ impl<P: Platform> SubscriptionManager<P> {
             out_queue: VecDeque::new(),
             shutting_down: false,
             closed: false,
+            filter_drops: FilterDrops::default(),
         }
     }
 
@@ -124,6 +138,11 @@ impl<P: Platform> SubscriptionManager<P> {
     }
     pub fn groups(&self) -> &HashMap<GroupKey, GroupState> {
         &self.groups
+    }
+
+    /// Running totals of Multicast Data the (S,G) filter dropped.
+    pub fn filter_drops(&self) -> FilterDrops {
+        self.filter_drops
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -257,7 +276,14 @@ impl<P: Platform> SubscriptionManager<P> {
                         if !self.groups.contains_key(&ssm_key)
                             && !self.groups.contains_key(&asm_key)
                         {
-                            // Not a subscription we care about. No event.
+                            // Not a subscription we care about. No event;
+                            // counted by why it missed.
+                            let d = &mut self.filter_drops;
+                            if self.groups.keys().any(|k| k.group == p.dst) {
+                                d.foreign_source = d.foreign_source.saturating_add(1);
+                            } else {
+                                d.foreign_group = d.foreign_group.saturating_add(1);
+                            }
                             return Ok(());
                         }
                         self.out_queue.push_back(Event::Data {
@@ -1603,6 +1629,13 @@ mod tests {
         );
         // Also no Warning — silent drop is the intent.
         assert!(events.is_empty(), "expected zero events; got: {:?}", events);
+        assert_eq!(
+            m.filter_drops(),
+            FilterDrops {
+                foreign_group: 1,
+                foreign_source: 0
+            }
+        );
     }
 
     #[test]
@@ -1620,6 +1653,22 @@ mod tests {
         m.handle_datagram(&data_msg.encode(), 1300).unwrap();
         let events = drain(&mut m);
         assert!(!events.iter().any(|ev| matches!(ev, Event::Data { .. })));
+        assert_eq!(
+            m.filter_drops(),
+            FilterDrops {
+                foreign_group: 0,
+                foreign_source: 1
+            }
+        );
+
+        // A subscribed (S,G) is delivered and counts nothing.
+        let inner = synth_v4_udp_packet([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"y");
+        let data_msg = AmtMessage::MulticastData { ip_packet: inner };
+        m.handle_datagram(&data_msg.encode(), 1400).unwrap();
+        assert!(drain(&mut m)
+            .iter()
+            .any(|ev| matches!(ev, Event::Data { .. })));
+        assert_eq!(m.filter_drops().foreign_source, 1);
     }
 
     #[test]
