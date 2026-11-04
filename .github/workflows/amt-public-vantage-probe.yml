@@ -1,9 +1,9 @@
 name: AMT public-vantage probe
 
-# BLO-21823. Runs the real amt-verify from a GitHub-HOSTED runner (public egress,
-# arbitrary outbound UDP). Deliberately NOT a self-hosted ARC runner: those are
-# in-cluster, so the relay sees an RFC1918 source and its reply is unroutable.
-# That vantage artifact is what five weeks of in-cluster probes actually measured.
+# BLO-21823. Runs the real amt-verify from the tools-cluster ARC DinD pool
+# (public egress, arbitrary outbound UDP). The tools worker NAT gives the job a
+# routable public source, so this remains an off-cluster vantage rather than an
+# RFC1918 in-cluster probe.
 
 on:
   workflow_dispatch:
@@ -187,7 +187,9 @@ env:
 jobs:
   probe:
     if: ${{ (inputs.mode || 'oneshot') == 'oneshot' }}
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-dind
     # An EXCEEDED job timeout CANCELS the job. MEASURED, not inferred -- the
     # docs do not state it, and it decides how `Route probe failure` must be
     # gated, so it was settled by experiment rather than by reading:
@@ -220,6 +222,11 @@ jobs:
       issues: write
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
+      # The production relay VIP is allocated from this LB pool. The tools
+      # ARC egress must be outside it: an address in the pool could make an
+      # in-cluster path look like the independent public vantage this probe
+      # exists to measure.
+      RELAY_PREFIX: 69.25.95.128/26
       SOURCE: ${{ inputs.source || '69.25.95.192' }}
       GROUP: ${{ inputs.group || '232.1.1.60' }}
       TIMEOUT: ${{ inputs.timeout || '30' }}
@@ -228,8 +235,28 @@ jobs:
     steps:
       - name: Vantage receipt
         run: |
+          set -euo pipefail
+          public_ip=$(curl -fsS -4 https://api.ipify.org)
+          python3 - "$public_ip" "${RELAY_PREFIX:-69.25.95.128/26}" <<'PY'
+          import ipaddress
+          import sys
+
+          public = ipaddress.ip_address(sys.argv[1])
+          relay_prefix = ipaddress.ip_network(sys.argv[2], strict=False)
+          rfc1918 = tuple(ipaddress.ip_network(cidr) for cidr in (
+              "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+          ))
+          if public.version != 4:
+              raise SystemExit(f"::error::public_ip is not IPv4: {public}")
+          if any(public in network for network in rfc1918):
+              raise SystemExit(f"::error::public_ip is RFC1918/private: {public}")
+          if public in relay_prefix:
+              raise SystemExit(
+                  f"::error::public_ip {public} is inside relay prefix {relay_prefix}"
+              )
+          PY
           echo "utc=$(date -u +%FT%TZ)"
-          echo "public_ip=$(curl -fsS https://api.ipify.org)"
+          echo "public_ip=$public_ip relay_prefix=$RELAY_PREFIX"
           echo "target=$RELAY:2268 sg=($SOURCE,$GROUP)"
           # BLO-33455. The fan-out ramp's stop rule is RECEIVER headroom: the
           # relay fans one stream into N unicast tunnels and this NIC absorbs
@@ -338,7 +365,7 @@ jobs:
           # attribution is by COVARIATION across lossy/clean, not by a threshold.
           #
           # Caveat, and it is real: this counter is netns-WIDE, not per-socket.
-          # On an otherwise-idle hosted runner ours is the only meaningful UDP
+          # On an otherwise-idle ARC runner ours is the only meaningful UDP
           # traffic, but a non-zero delta is evidence about the netns, so do not
           # read a small one as proof it was us.
           #
@@ -1007,7 +1034,7 @@ jobs:
       # `job.status != 'success' && env.ZERO_DATA != '1'` is true for any
       # non-verdict bad end, and those are third-party-network steps: ipify in
       # the vantage receipt, actions/checkout, the ghcr login, upload-artifact.
-      # The cron fires 96x/day on hosted runners, so a blip inside the first
+      # The cron fires 96x/day on ARC runners, so a blip inside the first
       # few days is close to certain. Once one files `[amt-probe][infra] ...`, the exact
       # title dedup above routes every LATER detector death to `gh issue
       # comment` on that stale row -- so a persistent death (ghcr token expiry,
@@ -1082,9 +1109,12 @@ jobs:
   # (each_deliberate_failure_mode_reduces_the_alive_count).
   tunnels-ramp:
     if: ${{ inputs.mode == 'tunnels-ramp' }}
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-dind
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
+      RELAY_PREFIX: 69.25.95.128/26
       SOURCE: ${{ inputs.source || '69.25.95.192' }}
       GROUP: ${{ inputs.group || '232.1.1.60' }}
       # Must MATCH the declared input default. It read
@@ -1105,8 +1135,28 @@ jobs:
     steps:
       - name: Vantage receipt
         run: |
+          set -euo pipefail
+          public_ip=$(curl -fsS -4 https://api.ipify.org)
+          python3 - "$public_ip" "${RELAY_PREFIX:-69.25.95.128/26}" <<'PY'
+          import ipaddress
+          import sys
+
+          public = ipaddress.ip_address(sys.argv[1])
+          relay_prefix = ipaddress.ip_network(sys.argv[2], strict=False)
+          rfc1918 = tuple(ipaddress.ip_network(cidr) for cidr in (
+              "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+          ))
+          if public.version != 4:
+              raise SystemExit(f"::error::public_ip is not IPv4: {public}")
+          if any(public in network for network in rfc1918):
+              raise SystemExit(f"::error::public_ip is RFC1918/private: {public}")
+          if public in relay_prefix:
+              raise SystemExit(
+                  f"::error::public_ip {public} is inside relay prefix {relay_prefix}"
+              )
+          PY
           echo "utc=$(date -u +%FT%TZ)"
-          echo "public_ip=$(curl -fsS https://api.ipify.org)"
+          echo "public_ip=$public_ip relay_prefix=$RELAY_PREFIX"
           echo "target=$RELAY:2268 sg=($SOURCE,$GROUP) steps=$STEPS"
 
       # THE STEP LIST IS A CONTRACT AND IT WAS NEVER CHECKED.
@@ -1709,7 +1759,9 @@ jobs:
   # them distinguishable.
   loss-delta-preflight:
     if: ${{ inputs.mode == 'loss-delta' }}
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-dind
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1779,7 +1831,9 @@ jobs:
   loss-delta:
     if: ${{ inputs.mode == 'loss-delta' }}
     needs: loss-delta-preflight
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-dind
     timeout-minutes: 15
     strategy:
       # A dead leg must NOT cancel its siblings. The surviving legs and their
@@ -2016,7 +2070,9 @@ jobs:
     # below is unaffected; it is not an expression.
     if: ${{ !cancelled() && inputs.mode == 'loss-delta' && needs['loss-delta-preflight'].result == 'success' }}
     needs: [loss-delta-preflight, loss-delta]
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-light
     timeout-minutes: 10
     # No `issues: write`: this mode is dispatch-only measurement and must never
     # file an outage row. Routing belongs to the scheduled oneshot probe.
