@@ -73,6 +73,10 @@ jobs:
       IMAGE: ghcr.io/blockcast/amt-verify:main
       SHAPE: ${{ inputs.shape || 'teardown-only' }}
       RELAY: ${{ inputs.relay || '69.25.95.96' }}
+      # The staging relay VIP is allocated from this LB pool. The tools ARC
+      # egress must be outside it so billing is attributed to an independent
+      # public vantage rather than to the relay's own on-prem network.
+      RELAY_PREFIX: 69.25.95.96/27
       SOURCE: ${{ inputs.source || '69.25.95.196' }}
       GROUP: ${{ inputs.group || '232.99.0.10' }}
       TIMEOUT: ${{ inputs.timeout || '30' }}
@@ -93,6 +97,7 @@ jobs:
           docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" | sed 's/^/client_commit=/'
       - name: v4 (billing GwIP = egress_ipv4)
         run: |
+          set -euo pipefail
           case "$SHAPE" in
             graceful) flag= ;;
             teardown-only) flag=--no-graceful-leave ;;
@@ -105,7 +110,25 @@ jobs:
           case "$CAPTURE_TAIL" in ''|*[!0-9]*) echo "::error::capture_tail must be an integer"; exit 2 ;; esac
           [ "$CAPTURE_TAIL" -le 1200 ] || { echo "::error::capture_tail > 1200 s exceeds the 25m job budget"; exit 2; }
           mkdir -p out
-          ip=$(curl -fsS -4 https://api.ipify.org || echo unavailable)
+          ip=$(curl -fsS -4 https://api.ipify.org)
+          python3 - "$ip" "$RELAY_PREFIX" <<'PY'
+          import ipaddress
+          import sys
+
+          public = ipaddress.ip_address(sys.argv[1])
+          relay_prefix = ipaddress.ip_network(sys.argv[2], strict=False)
+          rfc1918 = tuple(ipaddress.ip_network(cidr) for cidr in (
+              "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+          ))
+          if public.version != 4:
+              raise SystemExit(f"::error::egress_ipv4 is not IPv4: {public}")
+          if any(public in network for network in rfc1918):
+              raise SystemExit(f"::error::egress_ipv4 is RFC1918/private: {public}")
+          if public in relay_prefix:
+              raise SystemExit(
+                  f"::error::egress_ipv4 {public} is inside relay prefix {relay_prefix}"
+              )
+          PY
           {
             echo "shape=$SHAPE flag=${flag:-none}"
             echo "egress_ipv4=$ip"
@@ -116,8 +139,15 @@ jobs:
           # 1 discovery, 2 advertisement, 3 request, 4 query, 5 update,
           # 6 data, 7 TEARDOWN. A case-2 run with no outbound type 7 means the
           # client never sent Teardown, whatever the relay log says.
-          sudo tcpdump -i any -nn -U -w out/amt.pcap "udp port 2268 and host $RELAY" 2>/dev/null &
+          sudo tcpdump -i any -nn -U -w out/amt.pcap "udp port 2268 and host $RELAY" >out/tcpdump.log 2>&1 &
+          capture_pid=$!
           sleep 1
+          if ! sudo kill -0 "$capture_pid" 2>/dev/null; then
+            wait "$capture_pid" 2>/dev/null || true
+            echo "::error::tcpdump failed to start (pid=$capture_pid)"
+            cat out/tcpdump.log
+            exit 2
+          fi
           set +e
           docker run --rm --network host "$IMAGE" --relay "$RELAY" --source "$SOURCE" \
             --group "$GROUP" --timeout "$TIMEOUT" --json $flag \
@@ -125,8 +155,22 @@ jobs:
           rc=$?
           set -e
           { echo "ts_after=$(date -u +%FT%T.%NZ)"; echo "exit=$rc"; } | tee -a out/meta.txt
-          sleep "$CAPTURE_TAIL"; sudo pkill tcpdump; sleep 1
+          sleep "$CAPTURE_TAIL"
+          sudo kill "$capture_pid" 2>/dev/null || true
+          wait "$capture_pid" 2>/dev/null || true
+          if [ ! -s out/amt.pcap ]; then
+            echo "::error::tcpdump produced no pcap: capture failed or saw no packets"
+            cat out/tcpdump.log
+            exit 2
+          fi
+          capture_packets=$(sudo tcpdump -nn -r out/amt.pcap 2>/dev/null | wc -l)
+          if [ "$capture_packets" -le 0 ]; then
+            echo "::error::tcpdump pcap is empty: no packets captured"
+            cat out/tcpdump.log
+            exit 2
+          fi
           {
+            echo "capture_packets=$capture_packets"
             for t in 1 2 3 4 5 6 7; do
               o=$(sudo tcpdump -nn -r out/amt.pcap "udp[8]&0x0f==$t and dst host $RELAY" 2>/dev/null | wc -l)
               i=$(sudo tcpdump -nn -r out/amt.pcap "udp[8]&0x0f==$t and src host $RELAY" 2>/dev/null | wc -l)
@@ -153,6 +197,7 @@ jobs:
         continue-on-error: true
         run: |
           curl -fsS -6 -m 5 https://api6.ipify.org && { echo " native v6; WARP not needed"; exit 0; }
+          sudo apt-get update -y -q
           sudo apt-get install -y -q wireguard-tools >/dev/null
           curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.3.1/wgcf_2.3.1_linux_amd64
           echo "4fb7a136aa470ece11d17949c7db07b040ec9c604742dc8680bcf1889f85d0c8  wgcf" | sha256sum -c -

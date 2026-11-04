@@ -222,6 +222,11 @@ jobs:
       issues: write
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
+      # The production relay VIP is allocated from this LB pool. The tools
+      # ARC egress must be outside it: an address in the pool could make an
+      # in-cluster path look like the independent public vantage this probe
+      # exists to measure.
+      RELAY_PREFIX: 69.25.95.128/26
       SOURCE: ${{ inputs.source || '69.25.95.192' }}
       GROUP: ${{ inputs.group || '232.1.1.60' }}
       TIMEOUT: ${{ inputs.timeout || '30' }}
@@ -230,8 +235,28 @@ jobs:
     steps:
       - name: Vantage receipt
         run: |
+          set -euo pipefail
+          public_ip=$(curl -fsS -4 https://api.ipify.org)
+          python3 - "$public_ip" "${RELAY_PREFIX:-69.25.95.128/26}" <<'PY'
+          import ipaddress
+          import sys
+
+          public = ipaddress.ip_address(sys.argv[1])
+          relay_prefix = ipaddress.ip_network(sys.argv[2], strict=False)
+          rfc1918 = tuple(ipaddress.ip_network(cidr) for cidr in (
+              "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+          ))
+          if public.version != 4:
+              raise SystemExit(f"::error::public_ip is not IPv4: {public}")
+          if any(public in network for network in rfc1918):
+              raise SystemExit(f"::error::public_ip is RFC1918/private: {public}")
+          if public in relay_prefix:
+              raise SystemExit(
+                  f"::error::public_ip {public} is inside relay prefix {relay_prefix}"
+              )
+          PY
           echo "utc=$(date -u +%FT%TZ)"
-          echo "public_ip=$(curl -fsS https://api.ipify.org)"
+          echo "public_ip=$public_ip relay_prefix=$RELAY_PREFIX"
           echo "target=$RELAY:2268 sg=($SOURCE,$GROUP)"
           # BLO-33455. The fan-out ramp's stop rule is RECEIVER headroom: the
           # relay fans one stream into N unicast tunnels and this NIC absorbs
@@ -1089,6 +1114,7 @@ jobs:
       labels: arc-dind
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
+      RELAY_PREFIX: 69.25.95.128/26
       SOURCE: ${{ inputs.source || '69.25.95.192' }}
       GROUP: ${{ inputs.group || '232.1.1.60' }}
       # Must MATCH the declared input default. It read
@@ -1109,8 +1135,28 @@ jobs:
     steps:
       - name: Vantage receipt
         run: |
+          set -euo pipefail
+          public_ip=$(curl -fsS -4 https://api.ipify.org)
+          python3 - "$public_ip" "${RELAY_PREFIX:-69.25.95.128/26}" <<'PY'
+          import ipaddress
+          import sys
+
+          public = ipaddress.ip_address(sys.argv[1])
+          relay_prefix = ipaddress.ip_network(sys.argv[2], strict=False)
+          rfc1918 = tuple(ipaddress.ip_network(cidr) for cidr in (
+              "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+          ))
+          if public.version != 4:
+              raise SystemExit(f"::error::public_ip is not IPv4: {public}")
+          if any(public in network for network in rfc1918):
+              raise SystemExit(f"::error::public_ip is RFC1918/private: {public}")
+          if public in relay_prefix:
+              raise SystemExit(
+                  f"::error::public_ip {public} is inside relay prefix {relay_prefix}"
+              )
+          PY
           echo "utc=$(date -u +%FT%TZ)"
-          echo "public_ip=$(curl -fsS https://api.ipify.org)"
+          echo "public_ip=$public_ip relay_prefix=$RELAY_PREFIX"
           echo "target=$RELAY:2268 sg=($SOURCE,$GROUP) steps=$STEPS"
 
       # THE STEP LIST IS A CONTRACT AND IT WAS NEVER CHECKED.
