@@ -188,8 +188,10 @@ jobs:
   probe:
     if: ${{ (inputs.mode || 'oneshot') == 'oneshot' }}
     runs-on:
-      group: default-tools
-      labels: arc-dind
+      # The production arc-dind scale set is retired/scaled to zero. This
+      # dedicated AMT DinD scale set is the live on-prem replacement.
+      group: arc-linux-amt-dind
+      labels: arc-linux-amt-dind
     # An EXCEEDED job timeout CANCELS the job. MEASURED, not inferred -- the
     # docs do not state it, and it decides how `Route probe failure` must be
     # gated, so it was settled by experiment rather than by reading:
@@ -1110,8 +1112,8 @@ jobs:
   tunnels-ramp:
     if: ${{ inputs.mode == 'tunnels-ramp' }}
     runs-on:
-      group: default-tools
-      labels: arc-dind
+      group: arc-linux-amt-dind
+      labels: arc-linux-amt-dind
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
       RELAY_PREFIX: 69.25.95.128/26
@@ -1760,8 +1762,8 @@ jobs:
   loss-delta-preflight:
     if: ${{ inputs.mode == 'loss-delta' }}
     runs-on:
-      group: default-tools
-      labels: arc-dind
+      group: arc-linux-amt-dind
+      labels: arc-linux-amt-dind
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1832,8 +1834,8 @@ jobs:
     if: ${{ inputs.mode == 'loss-delta' }}
     needs: loss-delta-preflight
     runs-on:
-      group: default-tools
-      labels: arc-dind
+      group: arc-linux-amt-dind
+      labels: arc-linux-amt-dind
     timeout-minutes: 15
     strategy:
       # A dead leg must NOT cancel its siblings. The surviving legs and their
