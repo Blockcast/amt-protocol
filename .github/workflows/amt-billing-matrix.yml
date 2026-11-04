@@ -66,10 +66,8 @@ permissions:
 jobs:
   run:
     runs-on:
-      # The production arc-dind scale set is retired/scaled to zero. This
-      # dedicated AMT DinD scale set is the live on-prem replacement.
-      group: arc-linux-amt-dind
-      labels: arc-linux-amt-dind
+      group: default-tools
+      labels: arc-dind
     timeout-minutes: 25
     env:
       IMAGE: ghcr.io/blockcast/amt-verify:main
