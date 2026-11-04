@@ -95,6 +95,13 @@ jobs:
         run: |
           docker pull -q "$IMAGE" || docker build -q -t "$IMAGE" .
           docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" | sed 's/^/client_commit=/'
+      - name: install tcpdump for wire evidence
+        run: |
+          if ! command -v tcpdump >/dev/null 2>&1; then
+            sudo apt-get update -y -q
+            sudo apt-get install -y -q tcpdump
+          fi
+          tcpdump --version
       - name: v4 (billing GwIP = egress_ipv4)
         run: |
           set -euo pipefail
@@ -196,14 +203,23 @@ jobs:
         if: always() && env.RELAY6 != ''
         continue-on-error: true
         run: |
-          curl -fsS -6 -m 5 https://api6.ipify.org && { echo " native v6; WARP not needed"; exit 0; }
-          sudo apt-get update -y -q
-          sudo apt-get install -y -q wireguard-tools >/dev/null
-          curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.3.1/wgcf_2.3.1_linux_amd64
-          echo "4fb7a136aa470ece11d17949c7db07b040ec9c604742dc8680bcf1889f85d0c8  wgcf" | sha256sum -c -
+          set -euo pipefail
+          skip_v6() {
+            echo "::notice::IPv6 egress unavailable; skipping optional case 4 ($1)"
+            exit 0
+          }
+          if curl -fsS -6 -m 5 https://api6.ipify.org; then
+            echo " native v6; WARP not needed"
+            exit 0
+          fi
+          echo "native v6 unavailable; trying optional WARP tunnel"
+          sudo apt-get update -y -q || skip_v6 "apt update failed"
+          sudo apt-get install -y -q wireguard-tools >/dev/null || skip_v6 "wireguard-tools install failed"
+          timeout 30 curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.3.1/wgcf_2.3.1_linux_amd64 || skip_v6 "wgcf download failed"
+          echo "4fb7a136aa470ece11d17949c7db07b040ec9c604742dc8680bcf1889f85d0c8  wgcf" | sha256sum -c - || skip_v6 "wgcf checksum failed"
           chmod +x wgcf
-          ./wgcf register --accept-tos >/dev/null
-          ./wgcf generate >/dev/null
+          timeout 30 ./wgcf register --accept-tos >/dev/null || skip_v6 "wgcf registration failed"
+          timeout 30 ./wgcf generate >/dev/null || skip_v6 "wgcf profile generation failed"
           # Keep only the v6 half: drop v4 addresses/routes and DNS so v4 stays native.
           python3 - <<'PY'
           import re
@@ -219,9 +235,13 @@ jobs:
               out.append(l)
           open('wg6.conf','w').write(''.join(out))
           PY
-          sudo install -m 600 wg6.conf /etc/wireguard/wg6.conf
-          sudo wg-quick up wg6
-          curl -fsS -6 -m 10 https://api6.ipify.org; echo " <- WARP v6 egress"
+          sudo install -m 600 wg6.conf /etc/wireguard/wg6.conf || skip_v6 "wg6 profile install failed"
+          sudo wg-quick up wg6 || skip_v6 "WARP tunnel setup failed"
+          if ! curl -fsS -6 -m 10 https://api6.ipify.org; then
+            sudo wg-quick down wg6 >/dev/null 2>&1 || true
+            skip_v6 "WARP tunnel has no IPv6 egress"
+          fi
+          echo " <- WARP v6 egress"
       - name: v6 attempt (case 4, informational)
         if: always() && env.RELAY6 != ''
         continue-on-error: true
