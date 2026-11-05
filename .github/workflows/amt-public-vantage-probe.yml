@@ -1108,6 +1108,7 @@ jobs:
   # a keep-alive interval. Its positive control is in-tree
   # (each_deliberate_failure_mode_reduces_the_alive_count).
   tunnels-ramp:
+    timeout-minutes: 15
     if: ${{ inputs.mode == 'tunnels-ramp' }}
     runs-on:
       group: default-tools
