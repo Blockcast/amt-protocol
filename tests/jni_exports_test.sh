@@ -38,15 +38,22 @@ Driad_nativeBuildQuery
 IgmpSsm_nativeCreateJoinReport
 IgmpSsm_nativeCreateMultiJoinReport
 "
+# Added after the rename, so there is no legacy alias for these.
+primary_only="
+Driad_nativeBuildDnsQuery
+Driad_nativeParseDnsResponse
+"
 
 exports=$(nm -D --defined-only "$so" | awk '{print $NF}' | grep '^Java_' | sort)
 fail=0
 for prefix in Java_com_blockcast_amt_ Java_com_blockcast_sdk_amt_; do
-  want=$(for m in $methods; do echo "$prefix$m"; done | sort)
+  extra=""
+  [ "$prefix" = Java_com_blockcast_amt_ ] && extra=$primary_only
+  want=$(for m in $methods $extra; do echo "$prefix$m"; done | sort)
   got=$(grep "^${prefix}" <<<"$exports" || true)
   n=$(grep -c . <<<"$got" || true)
   if [ "$want" != "$got" ]; then
-    echo "::error::$prefix exports differ from the expected 17 (got $n):"
+    echo "::error::$prefix exports differ from the expected list (got $n):"
     diff <(echo "$want") <(echo "$got") || true
     fail=1
   else
