@@ -6,6 +6,7 @@ import android.net.Network
 import android.os.Build
 import android.os.CancellationSignal
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
@@ -100,7 +101,7 @@ object Driad {
         } catch (e: InterruptedException) {
             cancel.cancel()
             Thread.currentThread().interrupt()
-            throw java.io.InterruptedIOException("AMTRELAY lookup for $source interrupted")
+            throw InterruptedIOException("AMTRELAY lookup for $source interrupted")
         }
         if (!answered) {
             cancel.cancel()

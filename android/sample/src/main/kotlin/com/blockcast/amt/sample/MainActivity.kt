@@ -26,6 +26,9 @@ class MainActivity : Activity() {
     private val packets = AtomicLong()
     private val bytes = AtomicLong()
     private var session: AmtSession? = null
+
+    // Bumped by every start()/stop(); a join thread whose generation is stale closes its own session.
+    private var gen = 0
     private lateinit var status: TextView
     private lateinit var counter: TextView
 
@@ -64,9 +67,11 @@ class MainActivity : Activity() {
 
     private fun start(source: String, group: String, relayInput: String) {
         stop()
+        val mine = synchronized(this) { ++gen }
         packets.set(0)
         bytes.set(0)
         thread(name = "amt-join") {
+            var s: AmtSession? = null
             try {
                 val channel = SsmChannel(source, group)
                 val relay = relayInput.ifEmpty {
@@ -74,7 +79,7 @@ class MainActivity : Activity() {
                     Driad.resolveRelay(source)
                 }
                 show("relay $relay: discovery…")
-                val s = AmtSession(
+                s = AmtSession(
                     relay,
                     object : AmtSession.Listener {
                         override fun onPacket(ipPacket: ByteArray) {
@@ -88,19 +93,25 @@ class MainActivity : Activity() {
                     },
                     receiveBufferBytes = 4 shl 20,
                 )
-                synchronized(this) { session = s }
+                if (!synchronized(this) { (gen == mine).also { if (it) session = s } }) return@thread s.close()
                 s.open()
+                // stop() may have closed s before open() ran; open() would then have reopened it.
+                if (synchronized(this) { gen != mine }) return@thread s.close()
                 s.join(channel)
                 show("joined $channel via $relay")
             } catch (e: Exception) {
                 show("failed: $e")
-                stop()
+                synchronized(this) { if (session === s) session = null }
+                s?.close()
             }
         }
     }
 
     private fun stop() {
-        val s = synchronized(this) { session.also { session = null } } ?: return
+        val s = synchronized(this) {
+            gen++
+            session.also { session = null }
+        } ?: return
         thread(name = "amt-close") { s.close() }
     }
 
