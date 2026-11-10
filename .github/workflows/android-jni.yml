@@ -9,6 +9,16 @@ name: Android JNI
 
 on:
   pull_request:
+    # Skip the ~6.5 min NDK build for PRs that cannot change the libraries.
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'cbindgen.toml'
+      - 'Makefile'
+      - '.github/workflows/android-jni.yml'
   push:
     branches: [main]
     tags: ['v*']
