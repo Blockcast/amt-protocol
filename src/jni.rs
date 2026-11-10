@@ -607,7 +607,9 @@ pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeGetVersion<'local
 
 // pim's packages/blockcast-sdk-android still declares these natives in package
 // com.blockcast.sdk.amt and builds this crate from its submodule, so the old names
-// must keep resolving. Remove once pim's SDK depends on the com.blockcast.amt binding.
+// must keep resolving. Remove once pim's AmtGateway moves to com.blockcast.amt;
+// pim pins packages/amt-protocol at 61a16b3d. tests/jni_exports_test.sh asserts
+// both name sets, so drop the legacy half there in the same change.
 macro_rules! legacy_symbol {
     ($old:ident => $new:ident ($($arg:ident: $ty:ty),*) $(-> $ret:ty)?) => {
         #[no_mangle]

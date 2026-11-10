@@ -328,3 +328,9 @@ jobs:
       - name: cargo check (JNI selection)
         if: matrix.id == 'ffi'
         run: cargo check --no-default-features --features jni --locked
+
+      # Both JNI name sets (com.blockcast.amt + the legacy com.blockcast.sdk.amt
+      # aliases pim binds) must be exported by the built library.
+      - name: tests/jni_exports_test.sh
+        if: matrix.id == 'ffi'
+        run: bash tests/jni_exports_test.sh
