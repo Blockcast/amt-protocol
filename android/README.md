@@ -62,7 +62,7 @@ wrapper` generates one. A CI job for this module can run the same two commands.
 Relay from DRIAD (RFC 8777), through the system resolver (API 29+, blocks):
 
 ```kotlin
-val relay = Driad.resolveRelay("203.0.113.9")   // IP literal or host name
+val relay = Driad.resolveRelay("203.0.113.9")   // source must be an IP literal; returns an IP literal or host name
 ```
 
 Below API 29, send `Driad.dnsQuery(source, id)` with your own DNS client and pass the
