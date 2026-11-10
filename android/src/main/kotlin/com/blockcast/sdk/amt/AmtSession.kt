@@ -6,6 +6,7 @@ import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.SocketAddress
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
@@ -261,7 +262,7 @@ class AmtSession @JvmOverloads constructor(
                     continue
                 }
                 val datagram = packet.data.copyOf(packet.length)
-                val ipPacket = lock.withLock { dispatch(datagram) } ?: continue
+                val ipPacket = lock.withLock { dispatch(datagram, packet.socketAddress) } ?: continue
                 listener.onPacket(ipPacket)
             }
         } catch (e: Exception) {
@@ -276,11 +277,21 @@ class AmtSession @JvmOverloads constructor(
     /**
      * Route one datagram through the gateway. Caller holds [lock]. Returns the inner IP
      * packet for Multicast Data, null otherwise.
+     *
+     * Multicast Data carries no MAC and a Query's MAC only binds the nonce, so both are
+     * accepted only from the learned relay; anything else on the socket is spoofable
+     * injection. Advertisements stay unfiltered: an anycast discovery reply may come from
+     * the relay's unicast address, and [AmtGateway.handleAdvertisement] checks the nonce.
      */
-    private fun dispatch(datagram: ByteArray): ByteArray? {
+    private fun dispatch(datagram: ByteArray, from: SocketAddress): ByteArray? {
         val gw = gateway ?: return null
         try {
-            when (AmtWire.messageType(datagram)) {
+            val type = AmtWire.messageType(datagram)
+            if ((type == AmtWire.MULTICAST_DATA || type == AmtWire.MEMBERSHIP_QUERY) && from != relay) {
+                droppedDatagrams++
+                return null
+            }
+            when (type) {
                 AmtWire.MULTICAST_DATA -> return gw.handleData(datagram)
 
                 AmtWire.RELAY_ADVERTISEMENT -> {
