@@ -73,6 +73,9 @@ unzip -o "libamt_protocol-android-$TAG.zip" -d app/src/main/jniLibs/
 Record the tag and the `SHA256SUMS` line in the consuming project; do not
 pin to a `main` artifact, which is rebuilt on every push.
 
+The Kotlin library module in [`android/`](android/README.md) wraps the JNI surface;
+copy `dist/android/` into its `jniLibs` directory as described there.
+
 ## Usage with Go (CGO)
 
 After installing the library:
