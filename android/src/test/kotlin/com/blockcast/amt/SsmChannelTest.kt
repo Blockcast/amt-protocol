@@ -1,4 +1,4 @@
-package com.blockcast.sdk.amt
+package com.blockcast.amt
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull

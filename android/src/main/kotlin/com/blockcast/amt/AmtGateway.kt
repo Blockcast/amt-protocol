@@ -1,4 +1,4 @@
-package com.blockcast.sdk.amt
+package com.blockcast.amt
 
 /**
  * RFC 7450 AMT gateway state machine, backed by `libamt_protocol.so`.
@@ -80,7 +80,7 @@ class AmtGateway private constructor(private var handle: Long) : AutoCloseable {
         @JvmStatic
         fun nativeVersion(): String = nativeGetVersion() ?: "unknown"
 
-        // Bound to the symbols src/jni.rs exports as Java_com_blockcast_sdk_amt_AmtGateway_<name>.
+        // Bound to the symbols src/jni.rs exports as Java_com_blockcast_amt_AmtGateway_<name>.
         // Names and signatures must match that file exactly.
         @JvmStatic private external fun nativeCreate(relayAddress: String, relayPort: Int, enableDriad: Boolean): Long
         @JvmStatic private external fun nativeDestroy(handle: Long)

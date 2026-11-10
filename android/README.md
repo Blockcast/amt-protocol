@@ -2,9 +2,11 @@
 
 Kotlin library module over the crate's JNI surface (`src/jni.rs`, Cargo feature `jni`).
 
-- Package `com.blockcast.sdk.amt`: fixed by the exported symbols
-  `Java_com_blockcast_sdk_amt_<Class>_<method>`, so the class and native method names
+- Package `com.blockcast.amt`: fixed by the exported symbols
+  `Java_com_blockcast_amt_<Class>_<method>`, so the class and native method names
   in `AmtGateway.kt`, `Driad.kt` and `IgmpSsm.kt` must stay in step with `src/jni.rs`.
+  `src/jni.rs` also exports the old `Java_com_blockcast_sdk_amt_*` names for
+  pim-multicast-gateway's `com.blockcast.sdk.amt` SDK, which loads this same `.so`.
 - `minSdk 21`, Kotlin stdlib only, JUnit 4 for the unit tests.
 - The native library is not built here. Drop the per-ABI `libamt_protocol.so` files in
   and Gradle packages them into the AAR.
@@ -13,10 +15,10 @@ Kotlin library module over the crate's JNI surface (`src/jni.rs`, Cargo feature 
 
 ```
 android/
-  build.gradle.kts             com.android.library + kotlin.android, namespace com.blockcast.sdk.amt
+  build.gradle.kts             com.android.library + kotlin.android, namespace com.blockcast.amt
   settings.gradle.kts
   src/main/AndroidManifest.xml INTERNET permission (merged into the app)
-  src/main/kotlin/com/blockcast/sdk/amt/
+  src/main/kotlin/com/blockcast/amt/
     AmtGateway.kt              RFC 7450 state machine over the natives; no I/O
     Driad.kt                   DRIAD query name (RFC 8777)
     IgmpSsm.kt                 IGMPv3 SSM join reports

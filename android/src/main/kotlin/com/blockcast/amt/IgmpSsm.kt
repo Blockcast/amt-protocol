@@ -1,4 +1,4 @@
-package com.blockcast.sdk.amt
+package com.blockcast.amt
 
 /**
  * IGMPv3 source-specific join reports (RFC 3376), IP-encapsulated the way the relay
@@ -34,7 +34,7 @@ object IgmpSsm {
             ?: throw AmtException(AmtError.INVALID_ADDRESS, "not IPv4 literals: source=$source groups=$groups")
     }
 
-    // Java_com_blockcast_sdk_amt_IgmpSsm_<name> in src/jni.rs.
+    // Java_com_blockcast_amt_IgmpSsm_<name> in src/jni.rs.
     @JvmStatic private external fun nativeCreateJoinReport(sourceAddress: String, groupAddress: String): ByteArray?
     @JvmStatic private external fun nativeCreateMultiJoinReport(sourceAddress: String, groupAddresses: Array<String>): ByteArray?
 }

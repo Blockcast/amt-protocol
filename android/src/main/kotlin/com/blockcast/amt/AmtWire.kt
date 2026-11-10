@@ -1,6 +1,7 @@
-package com.blockcast.sdk.amt
+package com.blockcast.amt
 
 import java.net.InetAddress
+import java.net.SocketAddress
 
 /**
  * The few bytes of RFC 7450 and IPv4 framing the host side needs to route datagrams.
@@ -22,6 +23,15 @@ object AmtWire {
      */
     fun messageType(datagram: ByteArray): Int =
         if (datagram.isEmpty()) -1 else datagram[0].toInt() and 0xFF
+
+    /**
+     * Whether a datagram of [type] from [from] may reach the gateway when [relay] is the
+     * learned relay. Multicast Data carries no MAC and a Query's MAC only binds the nonce,
+     * so both must come from the relay. Everything else passes: an anycast discovery reply
+     * may come from the relay's unicast address, and the native side checks its nonce.
+     */
+    fun acceptedFrom(type: Int, from: SocketAddress, relay: SocketAddress?): Boolean =
+        (type != MULTICAST_DATA && type != MEMBERSHIP_QUERY) || from == relay
 
     /**
      * Relay unicast address carried in a Relay Advertisement (section 5.1.2), where the

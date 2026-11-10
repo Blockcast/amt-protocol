@@ -6,8 +6,8 @@ plugins {
 }
 
 android {
-    // Fixed by the symbols src/jni.rs exports (Java_com_blockcast_sdk_amt_<Class>_<method>).
-    namespace = "com.blockcast.sdk.amt"
+    // Fixed by the symbols src/jni.rs exports (Java_com_blockcast_amt_<Class>_<method>).
+    namespace = "com.blockcast.amt"
     compileSdk = 36
 
     defaultConfig {

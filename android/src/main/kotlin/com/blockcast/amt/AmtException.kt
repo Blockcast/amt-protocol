@@ -1,4 +1,4 @@
-package com.blockcast.sdk.amt
+package com.blockcast.amt
 
 /**
  * Why an AMT operation failed.

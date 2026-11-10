@@ -1,4 +1,4 @@
-package com.blockcast.sdk.amt
+package com.blockcast.amt
 
 /**
  * DRIAD (RFC 8777) helpers.
@@ -25,6 +25,6 @@ object Driad {
     fun queryName(source: String): String =
         nativeBuildQuery(source) ?: throw AmtException(AmtError.INVALID_ADDRESS, "not an IP literal: $source")
 
-    // Java_com_blockcast_sdk_amt_Driad_nativeBuildQuery in src/jni.rs.
+    // Java_com_blockcast_amt_Driad_nativeBuildQuery in src/jni.rs.
     @JvmStatic private external fun nativeBuildQuery(sourceAddress: String): String?
 }

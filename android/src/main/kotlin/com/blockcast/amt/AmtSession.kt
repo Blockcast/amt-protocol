@@ -1,4 +1,4 @@
-package com.blockcast.sdk.amt
+package com.blockcast.amt
 
 import java.io.IOException
 import java.net.DatagramPacket
@@ -277,17 +277,13 @@ class AmtSession @JvmOverloads constructor(
     /**
      * Route one datagram through the gateway. Caller holds [lock]. Returns the inner IP
      * packet for Multicast Data, null otherwise.
-     *
-     * Multicast Data carries no MAC and a Query's MAC only binds the nonce, so both are
-     * accepted only from the learned relay; anything else on the socket is spoofable
-     * injection. Advertisements stay unfiltered: an anycast discovery reply may come from
-     * the relay's unicast address, and [AmtGateway.handleAdvertisement] checks the nonce.
+     * Datagrams [AmtWire.acceptedFrom] refuses are spoofable injection and only counted.
      */
     private fun dispatch(datagram: ByteArray, from: SocketAddress): ByteArray? {
         val gw = gateway ?: return null
         try {
             val type = AmtWire.messageType(datagram)
-            if ((type == AmtWire.MULTICAST_DATA || type == AmtWire.MEMBERSHIP_QUERY) && from != relay) {
+            if (!AmtWire.acceptedFrom(type, from, relay)) {
                 droppedDatagrams++
                 return null
             }

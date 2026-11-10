@@ -1,9 +1,12 @@
-package com.blockcast.sdk.amt
+package com.blockcast.amt
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.net.InetSocketAddress
 
 class AmtWireTest {
     @Test
@@ -84,5 +87,23 @@ class AmtWireTest {
             (udpLength ushr 8).toByte(), udpLength.toByte(), 0, 0,
         )
         return header + udp + payload
+    }
+
+    @Test
+    fun dataAndQueryAreAcceptedOnlyFromTheLearnedRelay() {
+        val relay = InetSocketAddress("198.51.100.7", 2268)
+        val sameRelay = InetSocketAddress("198.51.100.7", 2268)
+        val otherPort = InetSocketAddress("198.51.100.7", 2269)
+        val stranger = InetSocketAddress("203.0.113.9", 2268)
+        for (type in listOf(AmtWire.MULTICAST_DATA, AmtWire.MEMBERSHIP_QUERY)) {
+            assertTrue(AmtWire.acceptedFrom(type, sameRelay, relay))
+            assertFalse(AmtWire.acceptedFrom(type, otherPort, relay))
+            assertFalse(AmtWire.acceptedFrom(type, stranger, relay))
+            // No relay learned yet: nothing may inject data or a query.
+            assertFalse(AmtWire.acceptedFrom(type, stranger, null))
+        }
+        // Advertisements may come from the relay's unicast address after anycast discovery.
+        assertTrue(AmtWire.acceptedFrom(AmtWire.RELAY_ADVERTISEMENT, stranger, relay))
+        assertTrue(AmtWire.acceptedFrom(AmtWire.RELAY_ADVERTISEMENT, stranger, null))
     }
 }
