@@ -38,7 +38,8 @@ make jni
 # Output: dist/android/<abi>/libamt_protocol.so  (arm64-v8a, armeabi-v7a, x86, x86_64)
 ```
 
-The library exports the JNI symbols for `com.blockcast.sdk.amt.AmtGateway`;
+The library exports the JNI symbols for `com.blockcast.amt.AmtGateway` (plus
+legacy `com.blockcast.sdk.amt` aliases for pim, see [`android/`](android/README.md));
 load it with `System.loadLibrary("amt_protocol")`. Minimum Android API level
 is 21 (cargo-ndk's default).
 
