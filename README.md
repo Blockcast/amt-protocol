@@ -38,7 +38,8 @@ make jni
 # Output: dist/android/<abi>/libamt_protocol.so  (arm64-v8a, armeabi-v7a, x86, x86_64)
 ```
 
-The library exports the JNI symbols for `com.blockcast.sdk.amt.AmtGateway`;
+The library exports the JNI symbols for `com.blockcast.amt.AmtGateway` (plus
+legacy `com.blockcast.sdk.amt` aliases for pim, see [`android/`](android/README.md));
 load it with `System.loadLibrary("amt_protocol")`. Minimum Android API level
 is 21 (cargo-ndk's default).
 
@@ -72,6 +73,9 @@ unzip -o "libamt_protocol-android-$TAG.zip" -d app/src/main/jniLibs/
 
 Record the tag and the `SHA256SUMS` line in the consuming project; do not
 pin to a `main` artifact, which is rebuilt on every push.
+
+The Kotlin library module in [`android/`](android/README.md) wraps the JNI surface;
+copy `dist/android/` into its `jniLibs` directory as described there.
 
 ## Usage with Go (CGO)
 

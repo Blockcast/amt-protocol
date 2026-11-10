@@ -47,7 +47,7 @@ unsafe fn from_handle<'a>(handle: jlong) -> &'a mut GatewayHandle {
 ///
 /// JNI signature: (Ljava/lang/String;IZ)J
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeCreate(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeCreate(
     mut env: JNIEnv,
     _class: JClass,
     relay_address: JString,
@@ -86,7 +86,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeCreate(
 ///
 /// JNI signature: (J)V
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeDestroy(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeDestroy(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -107,7 +107,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeDestroy(
 /// JNI signature: (J)I
 /// Returns: 0=Idle, 1=Discovering, 2=Requesting, 3=Querying, 4=Active, 5=Closed, -1=Error
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeGetState(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeGetState(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -131,7 +131,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeGetState(
 ///
 /// JNI signature: (J)I
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeGetRelayPort(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeGetRelayPort(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -153,7 +153,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeGetRelayPort(
 /// JNI signature: (J)[B
 /// Returns encoded RelayDiscovery message or null on error
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeStartDiscovery<'local>(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeStartDiscovery<'local>(
     env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
@@ -181,7 +181,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeStartDiscover
 /// JNI signature: (J[B)I
 /// Returns 0 on success, error code on failure
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleAdvertisement(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeHandleAdvertisement(
     env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -220,7 +220,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleAdverti
 /// JNI signature: (JZ)[B
 /// Returns encoded Request message or null on error
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeRequestMembership<'local>(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeRequestMembership<'local>(
     env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
@@ -249,7 +249,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeRequestMember
 /// JNI signature: (J[B)[B
 /// Returns IGMP/MLD query data or null on error
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleQuery<'local>(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeHandleQuery<'local>(
     env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
@@ -293,7 +293,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleQuery<'
 /// JNI signature: (J[B)[B
 /// Returns encoded MembershipUpdate message or null on error
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeSendUpdate<'local>(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeSendUpdate<'local>(
     env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
@@ -327,7 +327,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeSendUpdate<'l
 /// JNI signature: (J[B)[B
 /// Returns IP packet or null on error
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleData<'local>(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeHandleData<'local>(
     env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
@@ -367,7 +367,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleData<'l
 /// Returns encoded Teardown message or null on error, including when the
 /// relay never sent Gateway Address fields (no Teardown it could accept)
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeSendTeardown<'local>(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeSendTeardown<'local>(
     env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
@@ -399,7 +399,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeSendTeardown<
 /// nativeHandleQuery and before the nativeSendUpdate answering that Query,
 /// and send the Teardown to the relay first. The gateway state is unchanged.
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeRebindTeardown<'local>(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeRebindTeardown<'local>(
     env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
@@ -423,7 +423,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeRebindTeardow
 ///
 /// JNI signature: (J)V
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeReset(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeReset(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -442,7 +442,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeReset(
 ///
 /// JNI signature: (Ljava/lang/String;)Ljava/lang/String;
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_Driad_nativeBuildQuery<'local>(
+pub extern "system" fn Java_com_blockcast_amt_Driad_nativeBuildQuery<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass,
     source_address: JString,
@@ -474,7 +474,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_Driad_nativeBuildQuery<'local>
 /// JNI signature: (Ljava/lang/String;Ljava/lang/String;)[B
 /// Returns IP-encapsulated IGMPv3 membership report or null on error
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_IgmpSsm_nativeCreateJoinReport<'local>(
+pub extern "system" fn Java_com_blockcast_amt_IgmpSsm_nativeCreateJoinReport<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass,
     source_address: JString,
@@ -518,7 +518,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_IgmpSsm_nativeCreateJoinReport
 /// JNI signature: (Ljava/lang/String;[Ljava/lang/String;)[B
 /// Returns IP-encapsulated IGMPv3 membership report or null on error
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_IgmpSsm_nativeCreateMultiJoinReport<'local>(
+pub extern "system" fn Java_com_blockcast_amt_IgmpSsm_nativeCreateMultiJoinReport<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass,
     source_address: JString,
@@ -591,7 +591,7 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_IgmpSsm_nativeCreateMultiJoinR
 ///
 /// JNI signature: ()Ljava/lang/String;
 #[no_mangle]
-pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeGetVersion<'local>(
+pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeGetVersion<'local>(
     env: JNIEnv<'local>,
     _class: JClass,
 ) -> jni::sys::jstring {
@@ -600,3 +600,43 @@ pub extern "system" fn Java_com_blockcast_sdk_amt_AmtGateway_nativeGetVersion<'l
         Err(_) => std::ptr::null_mut(),
     }
 }
+
+// ============================================================================
+// Legacy symbols for pim-multicast-gateway
+// ============================================================================
+
+// pim's packages/blockcast-sdk-android still declares these natives in package
+// com.blockcast.sdk.amt and builds this crate from its submodule, so the old names
+// must keep resolving. Remove once pim's AmtGateway moves to com.blockcast.amt;
+// pim pins packages/amt-protocol at 61a16b3d. tests/jni_exports_test.sh asserts
+// both name sets, so drop the legacy half there in the same change.
+macro_rules! legacy_symbol {
+    ($old:ident => $new:ident ($($arg:ident: $ty:ty),*) $(-> $ret:ty)?) => {
+        #[no_mangle]
+        pub extern "system" fn $old<'local>(
+            env: JNIEnv<'local>,
+            class: JClass<'local>,
+            $($arg: $ty),*
+        ) $(-> $ret)? {
+            $new(env, class, $($arg),*)
+        }
+    };
+}
+
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeCreate => Java_com_blockcast_amt_AmtGateway_nativeCreate(relay_address: JString<'local>, relay_port: jint, enable_driad: jboolean) -> jlong);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeDestroy => Java_com_blockcast_amt_AmtGateway_nativeDestroy(handle: jlong));
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeGetState => Java_com_blockcast_amt_AmtGateway_nativeGetState(handle: jlong) -> jint);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeGetRelayPort => Java_com_blockcast_amt_AmtGateway_nativeGetRelayPort(handle: jlong) -> jint);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeStartDiscovery => Java_com_blockcast_amt_AmtGateway_nativeStartDiscovery(handle: jlong) -> jbyteArray);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleAdvertisement => Java_com_blockcast_amt_AmtGateway_nativeHandleAdvertisement(handle: jlong, data: JByteArray<'local>) -> jint);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeRequestMembership => Java_com_blockcast_amt_AmtGateway_nativeRequestMembership(handle: jlong, p_flag: jboolean) -> jbyteArray);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleQuery => Java_com_blockcast_amt_AmtGateway_nativeHandleQuery(handle: jlong, data: JByteArray<'local>) -> jbyteArray);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeSendUpdate => Java_com_blockcast_amt_AmtGateway_nativeSendUpdate(handle: jlong, report_data: JByteArray<'local>) -> jbyteArray);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeHandleData => Java_com_blockcast_amt_AmtGateway_nativeHandleData(handle: jlong, data: JByteArray<'local>) -> jbyteArray);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeSendTeardown => Java_com_blockcast_amt_AmtGateway_nativeSendTeardown(handle: jlong) -> jbyteArray);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeRebindTeardown => Java_com_blockcast_amt_AmtGateway_nativeRebindTeardown(handle: jlong) -> jbyteArray);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeReset => Java_com_blockcast_amt_AmtGateway_nativeReset(handle: jlong));
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeGetVersion => Java_com_blockcast_amt_AmtGateway_nativeGetVersion() -> jni::sys::jstring);
+legacy_symbol!(Java_com_blockcast_sdk_amt_Driad_nativeBuildQuery => Java_com_blockcast_amt_Driad_nativeBuildQuery(source_address: JString<'local>) -> jni::sys::jstring);
+legacy_symbol!(Java_com_blockcast_sdk_amt_IgmpSsm_nativeCreateJoinReport => Java_com_blockcast_amt_IgmpSsm_nativeCreateJoinReport(source_address: JString<'local>, group_address: JString<'local>) -> jbyteArray);
+legacy_symbol!(Java_com_blockcast_sdk_amt_IgmpSsm_nativeCreateMultiJoinReport => Java_com_blockcast_amt_IgmpSsm_nativeCreateMultiJoinReport(source_address: JString<'local>, group_addresses: JObjectArray<'local>) -> jbyteArray);
