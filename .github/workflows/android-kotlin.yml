@@ -41,11 +41,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # The action's default package list includes `tools`, which sdkmanager no
+      # longer serves, so the step fails unless `packages` is set. Platform 36
+      # is compileSdk in android/build.gradle.kts.
       - uses: android-actions/setup-android@v3
-
-      # compileSdk 36 in android/build.gradle.kts.
-      - name: Install Android platform 36
-        run: yes | sdkmanager "platforms;android-36" > /dev/null
+        with:
+          packages: 'platform-tools platforms;android-36'
 
       # No wrapper is committed (android/README.md); pin the Gradle the module
       # was verified with.
