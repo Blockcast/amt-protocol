@@ -105,7 +105,7 @@ jni-build:
 		-t x86 \
 		-t x86_64 \
 		-o $(ANDROID_JNI_DIR) \
-		-- build --release --features jni --no-default-features
+		-- build --release --locked --features jni --no-default-features
 	@echo "JNI output: $(ANDROID_JNI_DIR)"
 	@find $(ANDROID_JNI_DIR) -name "*.so" -exec ls -la {} \;
 
