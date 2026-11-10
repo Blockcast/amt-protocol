@@ -1,0 +1,160 @@
+name: Android JNI
+
+# Builds the four Android ABIs of libamt_protocol.so (the `jni` feature) the
+# way `make jni` does, so the JNI selection is compiled by a real NDK on every
+# PR rather than only `cargo check`ed (ci.yml keeps that check). The .so files
+# are uploaded as a workflow artifact on PRs and pushes to main, and attached
+# to the GitHub release on `v*` tags. README.md "Android JNI" documents how
+# consumers fetch and pin them.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-jni-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Android NDK. `NDK_VERSION` is the release name in the download URL and the
+  # directory inside the zip. Pinned to the current LTS; bump both lines
+  # together. The sha256 was computed from the official zip
+  # (https://dl.google.com/android/repository/android-ndk-r30-linux.zip,
+  # 738633529 bytes) after checking its SHA-1 5107f898313790e449e87eee2183d9a20602dee9
+  # against Google's NDK downloads page -- Google publishes SHA-1 only.
+  NDK_VERSION: r30
+  NDK_SHA256: 753611f410d002cfcd3f3dc2ef49aad532089d3180b436c060a90bf0fcb64df2
+  # cargo-ndk 3.5+ links with -Wl,-z,max-page-size=16384, which Android 15+
+  # 16 KiB-page devices require. Installed from crates.io with --locked.
+  CARGO_NDK_VERSION: 4.1.2
+
+jobs:
+  build:
+    name: android jni (4 ABIs)
+    # Fork PRs are intentionally skipped: this job executes PR-controlled code
+    # on the trusted in-cluster ARC pool.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on:
+      group: default-tools
+      labels: arc-light
+    # Cold run: ~740 MB NDK download + unzip, a cargo-ndk build, then four
+    # release (LTO) builds of the crate. Warm runs restore the NDK and the
+    # cargo-ndk binary from cache.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Version-pinned and kept equal to rust-toolchain.toml's `channel`;
+      # tests/toolchain_pin_test.sh fails on any other rev. The four Android
+      # std targets are installed with the pinned toolchain, not floated.
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      # Also caches ~/.cargo/bin (cache-bin defaults to true), so the cargo-ndk
+      # binary installed below comes back on the next run with this key.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-jni
+
+      # RUNNER_TEMP is not available to job-level `env:`, so the path is
+      # resolved here. The Makefile's jni-check-ndk and cargo-ndk both read
+      # ANDROID_NDK_HOME.
+      - name: Resolve ANDROID_NDK_HOME
+        run: echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Restore Android NDK ${{ env.NDK_VERSION }}
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_NDK_HOME }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux-${{ env.NDK_SHA256 }}
+
+      - name: Install Android NDK ${{ env.NDK_VERSION }} (sha256-verified)
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          zip="$RUNNER_TEMP/android-ndk-${NDK_VERSION}-linux.zip"
+          curl -fsSL --retry 3 -o "$zip" \
+            "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          echo "${NDK_SHA256}  ${zip}" | sha256sum -c -
+          # The zip's single top-level dir is android-ndk-$NDK_VERSION, i.e.
+          # $ANDROID_NDK_HOME.
+          unzip -q "$zip" -d "$RUNNER_TEMP"
+          rm -f "$zip"
+          test -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+
+      # Idempotent: an already-installed exact version is reported and skipped.
+      - name: Install cargo-ndk ${{ env.CARGO_NDK_VERSION }}
+        run: cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
+
+      # The Makefile target, so local and CI builds agree (`--locked` lives
+      # there). jni-check-ndk asserts cargo-ndk and ANDROID_NDK_HOME first.
+      - name: make jni
+        run: make jni
+
+      # Anti-vacuity: cargo-ndk writes nothing for a target it silently
+      # skipped, so assert all four .so files exist before uploading.
+      - name: dist/android artifact check
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            so="dist/android/$abi/libamt_protocol.so"
+            test -f "$so" || { echo "::error::$so missing -- the $abi build produced no library."; exit 1; }
+          done
+          ls -l dist/android/*/libamt_protocol.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-jni
+          path: dist/android/**
+          if-no-files-found: error
+
+  # Tag pushes only. Re-packages the artifact built above (same ref, same run)
+  # as one tarball per ABI plus a combined jniLibs-layout zip and SHA256SUMS,
+  # and attaches them to the GitHub release for the tag (created if absent).
+  release:
+    name: attach to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    runs-on:
+      group: default-tools
+      labels: arc-light
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-jni
+          path: dist/android
+
+      - name: Package per-ABI tarballs, combined zip, SHA256SUMS
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          mkdir -p release
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            test -f "dist/android/$abi/libamt_protocol.so"
+            tar -C dist/android -czf "release/libamt_protocol-android-${abi}-${tag}.tar.gz" "${abi}/libamt_protocol.so"
+          done
+          # python3 rather than `zip`, which the runner image is not known to carry.
+          python3 - "release/libamt_protocol-android-${tag}.zip" <<'PY'
+          import pathlib, sys, zipfile
+          root = pathlib.Path("dist/android")
+          with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+              for so in sorted(root.glob("*/libamt_protocol.so")):
+                  z.write(so, so.relative_to(root))
+          PY
+          (cd release && sha256sum -- *.tar.gz *.zip > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*

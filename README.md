@@ -35,8 +35,43 @@ make wasm
 make install-android-deps  # one-time
 export ANDROID_NDK_HOME=/path/to/ndk
 make jni
-# Output: dist/android/
+# Output: dist/android/<abi>/libamt_protocol.so  (arm64-v8a, armeabi-v7a, x86, x86_64)
 ```
+
+The library exports the JNI symbols for `com.blockcast.sdk.amt.AmtGateway`;
+load it with `System.loadLibrary("amt_protocol")`. Minimum Android API level
+is 21 (cargo-ndk's default).
+
+#### Prebuilt libraries
+
+[`.github/workflows/android-jni.yml`](.github/workflows/android-jni.yml) runs
+`make jni` on every pull request and push to `main`, and uploads
+`dist/android/` as the workflow artifact `android-jni` (jniLibs layout,
+`<abi>/libamt_protocol.so`; artifacts expire after the repository's retention
+period). On a `v*` tag it also attaches to the GitHub release:
+
+- `libamt_protocol-android-<abi>-<tag>.tar.gz`, one per ABI
+- `libamt_protocol-android-<tag>.zip`, all four ABIs in jniLibs layout
+- `SHA256SUMS`
+
+The toolchain is pinned in that workflow: the Rust version from
+`rust-toolchain.toml`, the Android NDK (an LTS release, downloaded from
+Google and sha256-verified) and the cargo-ndk version. cargo-ndk links with
+`-z max-page-size=16384`, so the libraries load on 16 KiB-page devices.
+
+To pin a consumer to a release, fetch by tag and verify before unpacking into
+the app's `jniLibs` directory:
+
+```bash
+TAG=v0.2.0  # any release tag cut after this workflow landed
+BASE=https://github.com/Blockcast/amt-protocol/releases/download/$TAG
+curl -fsSLO "$BASE/libamt_protocol-android-$TAG.zip" -O "$BASE/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
+unzip -o "libamt_protocol-android-$TAG.zip" -d app/src/main/jniLibs/
+```
+
+Record the tag and the `SHA256SUMS` line in the consuming project; do not
+pin to a `main` artifact, which is rebuilt on every push.
 
 ## Usage with Go (CGO)
 
