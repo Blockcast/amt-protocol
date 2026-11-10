@@ -165,6 +165,7 @@ jobs:
           PY
           (cd release && sha256sum -- *.tar.gz *.zip > SHA256SUMS && cat SHA256SUMS)
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release/*
+          fail_on_unmatched_files: true
