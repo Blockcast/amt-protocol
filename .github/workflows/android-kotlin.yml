@@ -64,7 +64,7 @@ jobs:
       # Kept equal to rust-toolchain.toml's `channel` (tests/toolchain_pin_test.sh).
       - uses: dtolnay/rust-toolchain@1.99.0
 
-      - name: host libamt_protocol.so for AmtSessionTest
+      - name: host libamt_protocol.so for AmtSessionTest and DriadTest
         run: cargo build --release --features jni --locked
 
       - name: gradle test
@@ -75,8 +75,10 @@ jobs:
         run: |
           set -euo pipefail
           ls android/build/test-results/testDebugUnitTest/TEST-*.xml
-          # AmtSessionTest skips itself without the host .so; here it must run.
-          grep -q 'tests="[1-9][0-9]*" skipped="0"' android/build/test-results/testDebugUnitTest/TEST-com.blockcast.amt.AmtSessionTest.xml
+          # These skip themselves without the host .so; here they must run.
+          for t in AmtSessionTest DriadTest; do
+            grep -q 'tests="[1-9][0-9]*" skipped="0"' android/build/test-results/testDebugUnitTest/TEST-com.blockcast.amt.$t.xml
+          done
           ! grep -l '<failure' android/build/test-results/testDebugUnitTest/TEST-*.xml
 
       - name: gradle assembleRelease

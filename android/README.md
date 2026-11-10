@@ -20,7 +20,7 @@ android/
   src/main/AndroidManifest.xml INTERNET permission (merged into the app)
   src/main/kotlin/com/blockcast/amt/
     AmtGateway.kt              RFC 7450 state machine over the natives; no I/O
-    Driad.kt                   DRIAD query name (RFC 8777)
+    Driad.kt                   DRIAD (RFC 8777): query name, AMTRELAY lookup via DnsResolver
     IgmpSsm.kt                 IGMPv3 SSM join reports
     AmtException.kt            AmtError + AmtException
     AmtWire.kt                 message type, advertised relay address, IPv4/UDP payload (pure Kotlin)
@@ -58,6 +58,15 @@ Needs JDK 17+, Gradle 8.13+ and an Android SDK with platform 36 (`ANDROID_HOME`,
 wrapper` generates one. A CI job for this module can run the same two commands.
 
 ## Use
+
+Relay from DRIAD (RFC 8777), through the system resolver (API 29+, blocks):
+
+```kotlin
+val relay = Driad.resolveRelay("203.0.113.9")   // IP literal or host name
+```
+
+Below API 29, send `Driad.dnsQuery(source, id)` with your own DNS client and pass the
+answer to `Driad.relayFromResponse(query, answer)`.
 
 High level, one relay and one or more IPv4 SSM channels:
 
@@ -101,9 +110,9 @@ natives there.
 - IPv6 / MLD joins: `IgmpSsm` is IPv4 only.
 - Leaving one group while keeping the tunnel: no IGMP leave-report builder, so
   `AmtSession.leave()` ends the tunnel.
-- DRIAD beyond the query name: the AMTRELAY RDATA decoder in `src/driad.rs` is not
-  exported. Resolve `Driad.queryName(source)` with `android.net.DnsResolver.rawQuery`
-  (API 29+), decode the record, then pass the relay address to `AmtSession`.
+- DRIAD failover: `Driad.relayFromResponse` returns one relay of the lowest precedence;
+  the full candidate list (`parse_dns_response_candidates` in `src/driad.rs`) and the
+  D-bit are not exported, so `AmtSession` always runs relay discovery first.
 - Failure detail: most natives return null on failure, so `AmtError` is classified from the
   gateway state (`INVALID_STATE` vs `REJECTED`); only `handleAdvertisement` reports a code.
 - The `enableDriad` flag of `AmtGateway.create` is stored in the native config and not acted on.

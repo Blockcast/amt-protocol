@@ -465,6 +465,65 @@ pub extern "system" fn Java_com_blockcast_amt_Driad_nativeBuildQuery<'local>(
     }
 }
 
+/// Build the DNS query for a source's AMTRELAY records (RFC 8777), with EDNS(0)
+///
+/// JNI signature: (Ljava/lang/String;I)[B
+/// Returns the query message, or null when the source is not an IP literal
+#[no_mangle]
+pub extern "system" fn Java_com_blockcast_amt_Driad_nativeBuildDnsQuery<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    source_address: JString,
+    transaction_id: jint,
+) -> jbyteArray {
+    let addr_str: String = match env.get_string(&source_address) {
+        Ok(s) => s.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let addr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let query = crate::driad::DriadResolver::build_dns_query_edns(addr, transaction_id as u16);
+
+    match env.byte_array_from_slice(&query) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Pick a relay from the DNS answer to a query built by nativeBuildDnsQuery
+///
+/// JNI signature: ([B[B)Ljava/lang/String;
+/// Returns the relay (IP literal or DNS name) of the lowest precedence, or null
+/// when the answer does not match the query or has no usable AMTRELAY record
+#[no_mangle]
+pub extern "system" fn Java_com_blockcast_amt_Driad_nativeParseDnsResponse<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass,
+    query: JByteArray<'local>,
+    response: JByteArray<'local>,
+) -> jni::sys::jstring {
+    let (Ok(query), Ok(response)) = (
+        env.convert_byte_array(&query),
+        env.convert_byte_array(&response),
+    ) else {
+        return std::ptr::null_mut();
+    };
+
+    let Some(relay) = crate::driad::DriadResolver::parse_dns_response_validated(&query, &response)
+    else {
+        return std::ptr::null_mut();
+    };
+
+    match env.new_string(relay.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // ============================================================================
 // IGMP SSM Support
 // ============================================================================
