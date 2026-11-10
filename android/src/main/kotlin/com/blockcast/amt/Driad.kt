@@ -6,6 +6,7 @@ import android.net.Network
 import android.os.Build
 import android.os.CancellationSignal
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
@@ -41,7 +42,8 @@ object Driad {
 
     /**
      * DNS query message for the AMTRELAY records of [source], with an EDNS(0) OPT record
-     * so a resolver can return every relay.
+     * so a resolver can return every relay. [transactionId] must be in 0..0xFFFF; higher
+     * bits are dropped.
      *
      * @throws AmtException [AmtError.INVALID_ADDRESS] when [source] is not an IP literal.
      */
@@ -76,6 +78,7 @@ object Driad {
         val query = dnsQuery(source, random.nextInt(0x10000))
         val done = CountDownLatch(1)
         var answer: ByteArray? = null
+        var answerRcode = 0
         var failure: Exception? = null
         val cancel = CancellationSignal()
         DnsResolver.getInstance().rawQuery(
@@ -83,6 +86,7 @@ object Driad {
             object : DnsResolver.Callback<ByteArray> {
                 override fun onAnswer(a: ByteArray, rcode: Int) {
                     answer = a
+                    answerRcode = rcode
                     done.countDown()
                 }
 
@@ -92,13 +96,20 @@ object Driad {
                 }
             },
         )
-        if (!done.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
+        val answered = try {
+            done.await(timeoutMillis, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            cancel.cancel()
+            Thread.currentThread().interrupt()
+            throw InterruptedIOException("AMTRELAY lookup for $source interrupted")
+        }
+        if (!answered) {
             cancel.cancel()
             throw IOException("AMTRELAY lookup for $source timed out")
         }
         failure?.let { throw IOException("AMTRELAY lookup for $source failed", it) }
         return relayFromResponse(query, checkNotNull(answer))
-            ?: throw IOException("no usable AMTRELAY record for $source (${queryName(source)})")
+            ?: throw IOException("no usable AMTRELAY record for $source (${queryName(source)}, rcode $answerRcode)")
     }
 
     private val random = SecureRandom()

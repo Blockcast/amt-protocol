@@ -62,7 +62,7 @@ wrapper` generates one. A CI job for this module can run the same two commands.
 Relay from DRIAD (RFC 8777), through the system resolver (API 29+, blocks):
 
 ```kotlin
-val relay = Driad.resolveRelay("203.0.113.9")   // IP literal or host name
+val relay = Driad.resolveRelay("203.0.113.9")   // source must be an IP literal; returns an IP literal or host name
 ```
 
 Below API 29, send `Driad.dnsQuery(source, id)` with your own DNS client and pass the
@@ -116,3 +116,20 @@ natives there.
 - Failure detail: most natives return null on failure, so `AmtError` is classified from the
   gateway state (`INVALID_STATE` vs `REJECTED`); only `handleAdvertisement` reports a code.
 - The `enableDriad` flag of `AmtGateway.create` is stored in the native config and not acted on.
+
+## Sample app
+
+`sample/` is a one-screen app (minSdk 29) that joins one (S,G) and counts datagrams. The
+relay comes from `Driad.resolveRelay` unless one is typed in. To put it on a phone, add the
+native libraries first, then install:
+
+```bash
+make jni && cp -r dist/android/. android/src/main/jniLibs/
+gradle -p android :sample:installDebug
+adb shell am start -n com.blockcast.amt.sample/.MainActivity \
+  --es source 203.0.113.9 --es group 232.1.1.1          # optional: --es relay <ip or name>
+```
+
+The screen shows the relay used, the join state, and the packet, byte and dropped-datagram
+counts. Without `jniLibs` the APK still builds, but it fails at the first native call with
+`UnsatisfiedLinkError`.
