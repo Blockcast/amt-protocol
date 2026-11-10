@@ -38,6 +38,9 @@ make jni
 # Output: dist/android/
 ```
 
+The Kotlin library module in [`android/`](android/README.md) wraps the JNI surface;
+copy `dist/android/` into its `jniLibs` directory as described there.
+
 ## Usage with Go (CGO)
 
 After installing the library:
