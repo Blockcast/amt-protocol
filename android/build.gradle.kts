@@ -33,3 +33,12 @@ kotlin {
 dependencies {
     testImplementation("junit:junit:4.13.2")
 }
+
+// AmtSessionTest needs the host libamt_protocol.so (`cargo build --release --features jni`)
+// and is skipped without it: pass its directory as -PamtNativeDir (CI does).
+tasks.withType<Test>().configureEach {
+    providers.gradleProperty("amtNativeDir").orNull?.let {
+        systemProperty("java.library.path", it)
+        systemProperty("amt.nativeDir", it)
+    }
+}

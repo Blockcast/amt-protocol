@@ -1,17 +1,24 @@
 name: Android Kotlin
 
 # Builds and unit-tests the Kotlin library module in android/ (README there):
-# `gradle -p android test` for the pure-Kotlin parts and `assembleRelease` for
-# the AAR. No .so is needed for either; android-jni.yml builds those.
+# `gradle -p android test` and `assembleRelease` for the AAR. The tests load a
+# host libamt_protocol.so (AmtSessionTest); the Android .so files come from
+# android-jni.yml.
 
 on:
   pull_request:
     paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'android/**'
       - '.github/workflows/android-kotlin.yml'
   push:
     branches: [main]
     paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'android/**'
       - '.github/workflows/android-kotlin.yml'
   workflow_dispatch:
@@ -54,14 +61,22 @@ jobs:
         with:
           gradle-version: '8.14.3'
 
+      # Kept equal to rust-toolchain.toml's `channel` (tests/toolchain_pin_test.sh).
+      - uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: host libamt_protocol.so for AmtSessionTest
+        run: cargo build --release --features jni --locked
+
       - name: gradle test
-        run: gradle -p android --no-daemon testDebugUnitTest
+        run: gradle -p android --no-daemon testDebugUnitTest -PamtNativeDir="$GITHUB_WORKSPACE/target/release"
 
       # Anti-vacuity: a test task that found no classes still passes.
       - name: unit test results present
         run: |
           set -euo pipefail
           ls android/build/test-results/testDebugUnitTest/TEST-*.xml
+          # AmtSessionTest skips itself without the host .so; here it must run.
+          grep -q 'tests="[1-9][0-9]*" skipped="0"' android/build/test-results/testDebugUnitTest/TEST-com.blockcast.amt.AmtSessionTest.xml
           ! grep -l '<failure' android/build/test-results/testDebugUnitTest/TEST-*.xml
 
       - name: gradle assembleRelease

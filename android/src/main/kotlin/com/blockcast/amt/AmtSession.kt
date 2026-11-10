@@ -195,6 +195,8 @@ class AmtSession @JvmOverloads constructor(
      * End the tunnel: send the Teardown (section 5.2.3.7) when the relay supports one,
      * then return the gateway to [AmtGateway.State.IDLE] with the relay still known, so
      * [join] can be called again. No-op when nothing is joined or the session is closed.
+     * Best effort: while a refresh is in flight the gateway is not ACTIVE, so no Teardown
+     * is sent and the relay forwards until its membership timer expires.
      *
      * @throws IOException on socket failure.
      */
@@ -235,7 +237,7 @@ class AmtSession @JvmOverloads constructor(
                 val gw = gateway ?: throw AmtException(AmtError.CLOSED, "session closed during $what")
                 sendToRelay(send(gw))
                 var left = TimeUnit.MILLISECONDS.toNanos(replyTimeoutMillis)
-                while (!done() && left > 0) left = changed.awaitNanos(left)
+                while (!done() && gateway != null && left > 0) left = changed.awaitNanos(left)
                 if (done()) return
             }
         }
@@ -255,14 +257,18 @@ class AmtSession @JvmOverloads constructor(
         try {
             while (true) {
                 packet.setData(buffer, 0, buffer.size)
-                try {
+                val received = try {
                     s.receive(packet)
+                    true
                 } catch (ignored: SocketTimeoutException) {
-                    lock.withLock { tick() }
-                    continue
+                    false
                 }
-                val datagram = packet.data.copyOf(packet.length)
-                val ipPacket = lock.withLock { dispatch(datagram, packet.socketAddress) } ?: continue
+                val ipPacket = lock.withLock {
+                    val inner = if (received) dispatch(packet.data.copyOf(packet.length), packet.socketAddress) else null
+                    // Every pass, not only on timeout: a flowing stream never lets receive() time out.
+                    tick()
+                    inner
+                } ?: continue
                 listener.onPacket(ipPacket)
             }
         } catch (e: Exception) {
@@ -344,7 +350,7 @@ class AmtSession @JvmOverloads constructor(
         get() = checkNotNull(hostAddress)
 
     private companion object {
-        /** Receive timeout, which doubles as the refresh check period. */
+        /** Receive timeout: the longest the refresh check waits when no datagram arrives. */
         const val TICK_MILLIS = 1_000
 
         /** Largest UDP datagram. */
