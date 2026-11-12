@@ -141,7 +141,6 @@ impl AmtBuffer {
 /// # Arguments
 /// - `relay_address`: Null-terminated C string with relay IP address
 /// - `relay_port`: Relay port (use 0 for default 2268)
-/// - `enable_driad`: Enable DRIAD discovery
 /// - `out_handle`: Pointer to receive gateway handle
 ///
 /// # Returns
@@ -154,7 +153,6 @@ impl AmtBuffer {
 pub unsafe extern "C" fn amt_gateway_new(
     relay_address: *const c_char,
     relay_port: u16,
-    enable_driad: bool,
     out_handle: *mut AmtGatewayHandle,
 ) -> AmtResult {
     if relay_address.is_null() || out_handle.is_null() {
@@ -179,11 +177,7 @@ pub unsafe extern "C" fn amt_gateway_new(
         Some(relay_port)
     };
 
-    let config = if enable_driad {
-        AmtConfig::with_driad(addr, port)
-    } else {
-        AmtConfig::new(addr, port)
-    };
+    let config = AmtConfig::new(addr, port);
 
     let platform = Arc::new(FfiPlatform::new());
     let gateway = Box::new(AmtGateway::new(config, platform));
@@ -957,7 +951,7 @@ mod tests {
         let relay = CString::new("192.0.2.1").unwrap();
         let mut handle: AmtGatewayHandle = ptr::null_mut();
         assert_eq!(
-            unsafe { amt_gateway_new(relay.as_ptr(), 0, false, &mut handle) },
+            unsafe { amt_gateway_new(relay.as_ptr(), 0, &mut handle) },
             AmtResult::Ok
         );
 

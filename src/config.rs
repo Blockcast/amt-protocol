@@ -10,18 +10,14 @@ use std::net::IpAddr;
 /// AMT Gateway Configuration
 #[derive(Debug, Clone)]
 pub struct AmtConfig {
-    /// AMT relay address
-    /// - Discovered via DRIAD (preferred)
-    /// - Or manually configured
+    /// AMT relay address. Always a real relay: discovery by source is done
+    /// before construction (`AsyncAmtGateway::builder_for_source`, or the
+    /// caller's own DRIAD lookup), never encoded here (AMT-02).
     pub relay_address: IpAddr,
 
     /// AMT relay port
     /// Default: 2268 (RFC 7450)
     pub relay_port: u16,
-
-    /// Enable DRIAD relay discovery
-    /// If true, will attempt DNS-based relay discovery before using relay_address
-    pub enable_driad: bool,
 
     /// Keep-alive interval in seconds
     /// Send periodic Membership Update to maintain tunnel state
@@ -47,31 +43,6 @@ impl AmtConfig {
         Self {
             relay_address,
             relay_port: relay_port.unwrap_or(DEFAULT_AMT_PORT),
-            enable_driad: false,
-            keepalive_interval_secs: Self::DEFAULT_KEEPALIVE_SECS,
-            force_teardown: false,
-        }
-    }
-
-    /// Create configuration with DRIAD discovery enabled
-    /// Falls back to provided relay if DRIAD fails
-    pub fn with_driad(fallback_relay: IpAddr, relay_port: Option<u16>) -> Self {
-        Self {
-            relay_address: fallback_relay,
-            relay_port: relay_port.unwrap_or(DEFAULT_AMT_PORT),
-            enable_driad: true,
-            keepalive_interval_secs: Self::DEFAULT_KEEPALIVE_SECS,
-            force_teardown: false,
-        }
-    }
-
-    /// Create configuration with DRIAD discovery only (no fallback)
-    /// Will fail if DRIAD lookup fails
-    pub fn driad_only() -> Self {
-        Self {
-            relay_address: "0.0.0.0".parse().unwrap(), // Placeholder
-            relay_port: DEFAULT_AMT_PORT,
-            enable_driad: true,
             keepalive_interval_secs: Self::DEFAULT_KEEPALIVE_SECS,
             force_teardown: false,
         }
@@ -84,13 +55,6 @@ impl AmtConfig {
     }
 }
 
-impl Default for AmtConfig {
-    /// Default: Enable DRIAD with no fallback
-    fn default() -> Self {
-        Self::driad_only()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,19 +63,7 @@ mod tests {
     fn test_manual_config() {
         let cfg = AmtConfig::new("192.0.2.1".parse().unwrap(), None);
         assert_eq!(cfg.relay_port, DEFAULT_AMT_PORT);
-        assert!(!cfg.enable_driad);
-    }
-
-    #[test]
-    fn test_driad_with_fallback() {
-        let cfg = AmtConfig::with_driad("192.0.2.1".parse().unwrap(), Some(3000));
+        let cfg = AmtConfig::new("192.0.2.1".parse().unwrap(), Some(3000));
         assert_eq!(cfg.relay_port, 3000);
-        assert!(cfg.enable_driad);
-    }
-
-    #[test]
-    fn test_driad_only() {
-        let cfg = AmtConfig::driad_only();
-        assert!(cfg.enable_driad);
     }
 }

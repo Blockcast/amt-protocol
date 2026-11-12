@@ -45,14 +45,13 @@ unsafe fn from_handle<'a>(handle: jlong) -> &'a mut GatewayHandle {
 
 /// Create a new AMT Gateway
 ///
-/// JNI signature: (Ljava/lang/String;IZ)J
+/// JNI signature: (Ljava/lang/String;I)J
 #[no_mangle]
 pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeCreate(
     mut env: JNIEnv,
     _class: JClass,
     relay_address: JString,
     relay_port: jint,
-    enable_driad: jboolean,
 ) -> jlong {
     let addr_str: String = match env.get_string(&relay_address) {
         Ok(s) => s.into(),
@@ -70,11 +69,7 @@ pub extern "system" fn Java_com_blockcast_amt_AmtGateway_nativeCreate(
         Some(relay_port as u16)
     };
 
-    let config = if enable_driad != 0 {
-        AmtConfig::with_driad(addr, port)
-    } else {
-        AmtConfig::new(addr, port)
-    };
+    let config = AmtConfig::new(addr, port);
 
     let platform = Arc::new(FfiPlatform::new());
     let gateway = AmtGateway::new(config, platform);
@@ -682,7 +677,7 @@ macro_rules! legacy_symbol {
     };
 }
 
-legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeCreate => Java_com_blockcast_amt_AmtGateway_nativeCreate(relay_address: JString<'local>, relay_port: jint, enable_driad: jboolean) -> jlong);
+legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeCreate => Java_com_blockcast_amt_AmtGateway_nativeCreate(relay_address: JString<'local>, relay_port: jint) -> jlong);
 legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeDestroy => Java_com_blockcast_amt_AmtGateway_nativeDestroy(handle: jlong));
 legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeGetState => Java_com_blockcast_amt_AmtGateway_nativeGetState(handle: jlong) -> jint);
 legacy_symbol!(Java_com_blockcast_sdk_amt_AmtGateway_nativeGetRelayPort => Java_com_blockcast_amt_AmtGateway_nativeGetRelayPort(handle: jlong) -> jint);

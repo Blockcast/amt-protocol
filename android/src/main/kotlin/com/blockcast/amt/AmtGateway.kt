@@ -59,17 +59,16 @@ class AmtGateway private constructor(private var handle: Long) : AutoCloseable {
          * Create a gateway for a relay.
          *
          * @param relayAddress IPv4 or IPv6 literal of the relay, or of an anycast relay
-         *   discovery address. Not a hostname: resolve it first.
+         *   discovery address. Not a hostname: resolve it first. To discover the relay for a
+         *   source, resolve it with [Driad] before calling this.
          * @param relayPort relay UDP port, 1..65535.
-         * @param enableDriad recorded in the gateway configuration; the native state machine
-         *   does not act on it. See [Driad] for what the JNI surface offers.
          * @throws AmtException [AmtError.INVALID_ADDRESS] when [relayAddress] does not parse.
          */
         @JvmStatic
         @JvmOverloads
-        fun create(relayAddress: String, relayPort: Int = DEFAULT_PORT, enableDriad: Boolean = false): AmtGateway {
+        fun create(relayAddress: String, relayPort: Int = DEFAULT_PORT): AmtGateway {
             require(relayPort in 1..65535) { "relayPort out of range: $relayPort" }
-            val handle = nativeCreate(relayAddress, relayPort, enableDriad)
+            val handle = nativeCreate(relayAddress, relayPort)
             if (handle == 0L) {
                 throw AmtException(AmtError.INVALID_ADDRESS, "relay address is not an IP literal: $relayAddress")
             }
@@ -82,7 +81,7 @@ class AmtGateway private constructor(private var handle: Long) : AutoCloseable {
 
         // Bound to the symbols src/jni.rs exports as Java_com_blockcast_amt_AmtGateway_<name>.
         // Names and signatures must match that file exactly.
-        @JvmStatic private external fun nativeCreate(relayAddress: String, relayPort: Int, enableDriad: Boolean): Long
+        @JvmStatic private external fun nativeCreate(relayAddress: String, relayPort: Int): Long
         @JvmStatic private external fun nativeDestroy(handle: Long)
         @JvmStatic private external fun nativeGetState(handle: Long): Int
         @JvmStatic private external fun nativeGetRelayPort(handle: Long): Int
