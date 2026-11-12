@@ -42,13 +42,14 @@ struct Args {
 
     /// OVERALL deadline for the one-shot data phase, in seconds — not a
     /// first-data timeout and not a per-packet idle timeout. The clock starts
-    /// at `subscribe()` and covers all `--packet-count` packets, so a run
-    /// cannot exceed it however the stream behaves.
+    /// at `subscribe()` and covers all `--packet-count` packets, so the data
+    /// phase cannot exceed it however the stream behaves.
     ///
     /// On expiry the run still emits its report with `outcome: "timeout"` and
-    /// the PARTIAL `packet_count` / `byte_count` observed so far; the exit code
-    /// is unchanged (1). That partial count is the datum a saturation probe
-    /// needs — see BLO-33456.
+    /// the PARTIAL `packet_count` / `byte_count` observed so far, then shuts
+    /// down as any other run does (leave and Teardown, unless a shutdown flag
+    /// says otherwise); the exit code is unchanged (1). That partial count is
+    /// the datum a saturation probe needs — see BLO-33456.
     #[arg(long, default_value = "30")]
     timeout: u64,
 
@@ -813,8 +814,13 @@ async fn run(args: Args) -> std::result::Result<(), ExitCategory> {
     }
 
     // Exit-code semantics unchanged: any early stop is still HandshakeFail
-    // (exit 1). The only change is that the report is on stdout first.
+    // (exit 1), once the report is on stdout and the gateway has shut down in
+    // its `shutdown_mode`. Dropped here, it sent no leave and no Teardown, and
+    // the relay kept forwarding until its stale timer ran out.
     if let Some(stop) = stopped {
+        if let Err(e) = finish_gateway(gw, args.group, args.source, shutdown_mode).await {
+            tracing::warn!(target: "amt", error=?e, "shutdown after an early stop failed");
+        }
         return Err(ExitCategory::HandshakeFail(
             stop.into_err(args.group, args.source),
         ));
@@ -915,12 +921,26 @@ async fn run_watch(
     let mut pkts: u64 = 0;
     let mut bytes: u64 = 0;
     let mut last_seen = Instant::now();
+    // One listener for the whole loop. A `ctrl_c()` built on each pass hears
+    // only the signals that arrive while that pass waits, so a SIGINT that came
+    // while a packet or the stats line was being handled was lost. The handler
+    // is installed when this future is first polled; `biased;` makes that the
+    // first thing the loop does, ahead of the first stats line.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            // `tick` is above `recv` so a busy stream cannot starve the stats line.
+            biased;
+            _ = &mut ctrl_c => {
                 eprintln!("amt-verify: SIGINT received, tearing down");
                 break;
+            }
+            _ = tick.tick() => {
+                let age = last_seen.elapsed().as_millis();
+                println!("pkts={} bytes={} last_seen={}ms_ago state={:?}",
+                    pkts, bytes, age, gw.state());
             }
             recv = data_rx.recv() => {
                 match recv {
@@ -940,11 +960,6 @@ async fn run_watch(
                         break;
                     }
                 }
-            }
-            _ = tick.tick() => {
-                let age = last_seen.elapsed().as_millis();
-                println!("pkts={} bytes={} last_seen={}ms_ago state={:?}",
-                    pkts, bytes, age, gw.state());
             }
         }
     }
