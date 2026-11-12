@@ -1,10 +1,10 @@
 name: AMT billing matrix case
 
 # BLO-46644. Drives one gateway-side shape of the AMT billing matrix
-# (multicast: docs/runbook/amt-billing-e2e-matrix.md) from the tools-cluster
-# ARC DinD pool, i.e. an off-cluster public-vantage runner. In-cluster
-# gateways cannot complete discovery against the staging relay (BLO-34638),
-# so this is the venue that makes cases 1-3 repeatable without a human host.
+# (multicast: docs/runbook/amt-billing-e2e-matrix.md) from a GitHub-hosted
+# runner, i.e. an off-cluster public-vantage runner. In-cluster gateways cannot
+# complete discovery against the staging relay (BLO-34638), so this is the
+# venue that makes cases 1-3 repeatable without a human host.
 #
 # This workflow is only the gateway half. The billing half is read back from
 # the relay WAL keyed on `egress_ipv4` below, and the shutdown timestamp
@@ -65,15 +65,13 @@ permissions:
 
 jobs:
   run:
-    runs-on:
-      group: default-tools
-      labels: arc-dind
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
       IMAGE: ghcr.io/blockcast/amt-verify:main
       SHAPE: ${{ inputs.shape || 'teardown-only' }}
       RELAY: ${{ inputs.relay || '69.25.95.96' }}
-      # The staging relay VIP is allocated from this LB pool. The tools ARC
+      # The staging relay VIP is allocated from this LB pool. The hosted
       # egress must be outside it so billing is attributed to an independent
       # public vantage rather than to the relay's own on-prem network.
       RELAY_PREFIX: 69.25.95.96/27
@@ -196,7 +194,7 @@ jobs:
           echo "### case shape \`$SHAPE\` — exit $rc, GwIP \`$ip\`" >> "$GITHUB_STEP_SUMMARY"
           exit $rc
       - name: v6 egress via Cloudflare WARP (case 4; ARC runners may lack native v6)
-        # BLO-47085: the ARC DinD runner has no guaranteed native IPv6 egress,
+        # BLO-47085: GitHub-hosted runners have no guaranteed native IPv6 egress,
         # so the v6 step uses a v6-only WireGuard tunnel to WARP. This gives
         # the off-cluster runner a public v6 address without touching v4, which
         # the v4 step's GwIP and GitHub's own control connection ride on.

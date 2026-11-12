@@ -49,11 +49,10 @@ jobs:
   build:
     name: android jni (4 ABIs)
     # Fork PRs are intentionally skipped: this job executes PR-controlled code
-    # on the trusted in-cluster ARC pool.
+    # Fork PRs remain intentionally skipped; preserve the existing trust
+    # boundary while this public lane uses hosted hardware.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    runs-on: ubuntu-latest
     # Cold run: ~740 MB NDK download + unzip, a cargo-ndk build, then four
     # release (LTO) builds of the crate. Warm runs restore the NDK and the
     # cargo-ndk binary from cache.
@@ -136,9 +135,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@v4

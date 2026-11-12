@@ -27,12 +27,10 @@ jobs:
   tests:
     timeout-minutes: 40
     name: golden corpus + mutation harness
-    # Fork PRs are intentionally skipped: this job executes PR-controlled code
-    # on the trusted in-cluster ARC pool.
+    # Keep the existing fork behavior; this lane now runs on GitHub-hosted
+    # hardware and no longer depends on the public-repo ARC transition.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # Kept equal to rust-toolchain.toml's `channel`, which would silently
@@ -62,14 +60,11 @@ jobs:
         run: cargo test --test driad_candidates --no-default-features --locked
 
   wasm-shape:
-    timeout-minutes: 30  # BLO-44648: bound self-hosted ARC job
+    timeout-minutes: 30  # BLO-44648: keep the job bounded
     name: wasm-bindgen JS shape
-    # Fork PRs are intentionally skipped: this job executes PR-controlled code
-    # on the trusted in-cluster ARC pool.
+    # Keep the existing fork behavior while using a hosted runner.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # Kept equal to rust-toolchain.toml's `channel` (BLO-41503).
@@ -97,14 +92,11 @@ jobs:
           grep -q 'test result: ok. 2 passed' shape.log
 
   fuzz:
-    timeout-minutes: 45  # BLO-44648: bound self-hosted ARC job
+    timeout-minutes: 45  # BLO-44648: keep the job bounded
     name: libFuzzer (bounded)
-    # Fork PRs are intentionally skipped: this job executes PR-controlled code
-    # on the trusted in-cluster ARC pool.
+    # Keep the existing fork behavior while using a hosted runner.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    runs-on: ubuntu-latest
     # `cargo fuzz` needs nightly, and `dtolnay/rust-toolchain@nightly` below only
     # gets it there via `rustup default nightly`. rust-toolchain.toml (BLO-41503)
     # outranks `rustup default`, so without this every cargo call in this job
@@ -132,10 +124,7 @@ jobs:
 
       # Bounded so this is a regression gate, not an open-ended fuzzing session:
       # each target runs the checked-in seed corpus plus a fixed time budget.
-      # A crash writes to fuzz/artifacts/ and fails the job. ARC's runner pods
-      # cannot grant LeakSanitizer the ptrace permission it needs at shutdown;
-      # without this flag an otherwise successful bounded run ends red with
-      # "LeakSanitizer has encountered a fatal error" after the corpus pass.
+      # A crash writes to fuzz/artifacts/ and fails the job.
       - name: fuzz parse_dns_response
         run: cargo fuzz run driad_parse_response -- -max_total_time=120 -max_len=4096 -detect_leaks=0
       - name: fuzz parse_amtrelay_rdata
