@@ -58,6 +58,16 @@ on:
         default: "2602:f74d:1:5::196"
       group_v6:
         default: "ff3e::232:99:10"
+      runner:
+        # BLO-47085. The ARC pods have no IPv6 egress and WARP's WireGuard
+        # handshake does not complete from them either (run 43131737387), so
+        # case 4 can only run on a GitHub-hosted runner, where WARP worked on
+        # 2026-10-20 (run 39352388997). This repo is public, so hosted standard
+        # runners cost nothing; #196's spend rationale does not apply here.
+        description: arc (default) or hosted (needed for case 4 / IPv6)
+        type: choice
+        options: [arc, hosted]
+        default: arc
 
 permissions:
   contents: read
@@ -65,9 +75,7 @@ permissions:
 
 jobs:
   run:
-    runs-on:
-      group: default-tools
-      labels: arc-dind
+    runs-on: ${{ inputs.runner == 'hosted' && 'ubuntu-latest' || fromJSON('{"group":"default-tools","labels":"arc-dind"}') }}
     timeout-minutes: 25
     env:
       IMAGE: ghcr.io/blockcast/amt-verify:main
