@@ -109,9 +109,10 @@ esac
 # The N tunnels run CONCURRENTLY, so a read-modify-write counter file races and
 # two stubs hand back the same packet_count -- which silently turns the
 # "a later tunnel got nothing" case green, i.e. hides the very regression this
-# file exists to catch. mkdir is atomic; claim a slot with it.
+# file exists to catch. Bash noclobber claims with O_EXCL; Ubuntu 26's uutils
+# mkdir can report success for concurrent EEXIST (uutils/coreutils#16344).
 n=0
-while ! mkdir "$STUB_DIR/.claim.$((n+1))" 2>/dev/null; do n=$((n+1)); done
+while ! (set -C; : >"$STUB_DIR/.claim.$((n+1))") 2>/dev/null; do n=$((n+1)); done
 n=$((n+1))
 pc=$(echo "$PC_LIST"   | cut -d, -f"$n")
 ec=$(echo "$EXIT_LIST" | cut -d, -f"$n")
@@ -218,7 +219,7 @@ chmod +x "$WORK/bin/curl"
 # receipt-level case would go red for a reason that has nothing to do with the
 # receipts. TIME_LIST supplies the six stamps (start1,end1,...,end3) instead.
 #
-# mkdir is the same atomic claim the docker stub uses: it succeeds on a leg's
+# The same noclobber claim as the docker stub succeeds on a leg's
 # FIRST call (the start stamp) and fails on its second (the end stamp), so the
 # stub needs no counter file it could race on. Falls through to the real date
 # for every other caller and for an unset TIME_LIST.
@@ -226,7 +227,7 @@ cat >"$WORK/bin/date" <<'EOF'
 #!/usr/bin/env bash
 if [ -n "${TIME_LIST:-}" ] && [ "${1:-}" = "-u" ] && [ "${2:-}" = "+%s" ]; then
   f=$((2 * ${LEG:-1} - 1))
-  mkdir "$STUB_DIR/.date.${LEG:-1}" 2>/dev/null || f=$((f + 1))
+  (set -C; : >"$STUB_DIR/.date.${LEG:-1}") 2>/dev/null || f=$((f + 1))
   echo "$TIME_LIST" | cut -d, -f"$f"
   exit 0
 fi

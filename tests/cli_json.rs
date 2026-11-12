@@ -227,6 +227,49 @@ async fn timeout_is_an_overall_deadline_not_per_packet() {
     );
 }
 
+// A run that ends on its deadline still leaves. Before, `run` returned the
+// deadline error ahead of `finish_gateway`, so the gateway was dropped with no
+// leave and no Teardown, and a relay kept forwarding (and attributing the
+// bytes to the gateway's account) until its own stale timer ran out: 260 s on
+// the Linux relay.
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_sends_leave_then_teardown() {
+    let relay = FakeRelay::bind("v4").await;
+    let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
+    relay.spawn(inner);
+
+    let (stdout, status) = run_json(&relay, "232.0.0.1", &["--packet-count", "2"]).await;
+
+    assert_eq!(status.code(), Some(1), "exit semantics must be unchanged");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+    assert_eq!(v["outcome"], "timeout");
+    let types = captured_types(&relay).await;
+    assert_eq!(count(&types, MessageType::MembershipUpdate), 2, "{types:?}");
+    assert_eq!(count(&types, MessageType::Teardown), 1, "{types:?}");
+    assert_eq!(authenticated_teardowns(&relay).await, 1, "{types:?}");
+}
+
+// The deadline path honours the shutdown mode like every other exit: the hard
+// client loss that `--drop-without-teardown` simulates stays silent.
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_with_drop_without_teardown_sends_no_leave_or_teardown() {
+    let relay = FakeRelay::bind("v4").await;
+    let inner = synth_v4_udp([10, 0, 0, 1], [232, 0, 0, 1], 5004, 5005, b"x");
+    relay.spawn(inner);
+
+    let (_stdout, status) = run_json(
+        &relay,
+        "232.0.0.1",
+        &["--packet-count", "2", "--drop-without-teardown"],
+    )
+    .await;
+
+    assert_eq!(status.code(), Some(1));
+    let types = captured_types(&relay).await;
+    assert_eq!(count(&types, MessageType::MembershipUpdate), 1, "{types:?}");
+    assert_eq!(count(&types, MessageType::Teardown), 0, "{types:?}");
+}
+
 // BLO-46422 (W9 S3a). --forward hands payloads to a decoder on THIS host and
 // must never become a sender onto the network. clap refuses each of these with
 // exit 2 before a socket is bound or a channel joined; the channel's own group
@@ -350,6 +393,138 @@ async fn forward_continues_under_watch() {
         assert_eq!(&buf[..n], b"txfeed", "datagram {i}");
     }
     child.kill().await.expect("stop amt-verify");
+}
+
+// One SIGINT ends a --watch run, with its leave and Teardown, whatever the
+// loop is doing when the signal arrives. `run_watch` built a new `ctrl_c()`
+// listener on every pass of its loop, and a listener hears only the signals
+// that arrive while it exists. A SIGINT that came while the loop was handling
+// a packet or printing its stats line was lost for good, and the run carried
+// on until another one happened to land while the loop was idle.
+//
+// The test holds the loop outside its `select!`: the child's stdout is a FIFO
+// filled to the brim, so the 5 s stats `println!` blocks, and the SIGINT
+// arrives then.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn watch_stops_on_a_sigint_that_arrives_while_the_loop_is_busy() {
+    use tokio::net::unix::pipe;
+
+    struct Unlink(std::path::PathBuf);
+    impl Drop for Unlink {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    let relay = FakeRelay::bind("v4").await;
+    relay.spawn(synth_v4_udp(
+        [10, 0, 0, 1],
+        [232, 0, 0, 1],
+        5004,
+        5005,
+        b"x",
+    ));
+
+    // A FIFO and not `Stdio::piped()`: the test needs a write end of its own
+    // that it can fill without blocking, and O_NONBLOCK on a shared write end
+    // would make the child's `println!` fail instead of block.
+    let fifo =
+        Unlink(std::env::temp_dir().join(format!("amt-verify-stdout-{}", std::process::id())));
+    let made = Command::new("mkfifo")
+        .arg(&fifo.0)
+        .status()
+        .await
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo: {made}");
+    let mut stdout = pipe::OpenOptions::new()
+        .open_receiver(&fifo.0)
+        .expect("open the read end");
+    let filler = pipe::OpenOptions::new()
+        .open_sender(&fifo.0)
+        .expect("open the test's write end");
+    let child_stdout = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo.0)
+        .expect("open the child's write end");
+    drop(fifo);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amt-verify"))
+        .args([
+            "--relay",
+            &relay.addr.ip().to_string(),
+            "--port",
+            &relay.addr.port().to_string(),
+            "--group",
+            "232.0.0.1",
+            "--source",
+            "10.0.0.1",
+            "--watch",
+        ])
+        .stdout(child_stdout)
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn amt-verify");
+
+    // The first stats line is printed on entry to the watch loop.
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&seen).contains("pkts=") {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(10), stdout.read(&mut buf))
+            .await
+            .expect("amt-verify never reached its watch loop")
+            .expect("read the child's stdout");
+        seen.extend_from_slice(&buf[..n]);
+    }
+
+    // Fill the FIFO. It is empty here and holds a whole number of pages, so
+    // 1024-byte writes stop only when not one more byte fits.
+    let mut filled = 0;
+    loop {
+        match filler.try_write(&[b'.'; 1024]) {
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("fill the fifo: {e}"),
+        }
+    }
+
+    // The next stats line is due 5 s after the first; by now it is blocked.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    let pid = child.id().expect("amt-verify is still running");
+    let sent = Command::new("sh")
+        .args(["-c", &format!("kill -INT {pid}")])
+        .status()
+        .await
+        .expect("run kill");
+    assert!(sent.success(), "kill -INT: {sent}");
+    // Time for the child's signal driver to hand the SIGINT to its listeners.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Still running: the SIGINT found the loop held in its `println!`. A loop
+    // that was idle, or a FIFO with room left for the stats line, would have
+    // let the child tear down and exit by now.
+    assert!(
+        child.try_wait().expect("poll amt-verify").is_none(),
+        "amt-verify was not held in its stats println when the SIGINT arrived"
+    );
+
+    // Let the stats line through; the loop carries on from there.
+    let mut drained = 0;
+    while drained < filled {
+        drained += tokio::time::timeout(std::time::Duration::from_secs(10), stdout.read(&mut buf))
+            .await
+            .expect("drain the fifo")
+            .expect("read the child's stdout");
+    }
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+        .await
+        .expect("one SIGINT must end a --watch run")
+        .expect("wait for amt-verify");
+    assert!(status.success(), "exit code: {status}");
+    let types = captured_types(&relay).await;
+    assert_eq!(count(&types, MessageType::MembershipUpdate), 2, "{types:?}");
+    assert_eq!(authenticated_teardowns(&relay).await, 1, "{types:?}");
 }
 
 /// A relay that loses the gateway's first Request still delivers within one

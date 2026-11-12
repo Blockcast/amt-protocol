@@ -1,9 +1,9 @@
 name: AMT public-vantage probe
 
-# BLO-21823. Runs the real amt-verify from the tools-cluster ARC DinD pool
-# (public egress, arbitrary outbound UDP). The tools worker NAT gives the job a
-# routable public source, so this remains an off-cluster vantage rather than an
-# RFC1918 in-cluster probe.
+# BLO-21823. Runs the real amt-verify from a GitHub-hosted runner (public
+# egress, arbitrary outbound UDP). The hosted runner gives the job a routable
+# public source, so this remains an off-cluster vantage rather than an RFC1918
+# in-cluster probe.
 
 on:
   workflow_dispatch:
@@ -159,6 +159,14 @@ permissions:
   contents: read
   packages: read
 
+# BLO-47085: the 15-minute cron must keep at most one scheduled run pending.
+# A newer tick replaces an older *pending* one, and an in-progress run is never
+# cancelled. A stale probe measures "now" anyway, so replacing a pending tick
+# is safe. Dispatches get a per-run group so they are never displaced.
+concurrency:
+  group: ${{ github.event_name == 'schedule' && 'amt-public-vantage-probe-schedule' || format('amt-public-vantage-probe-{0}', github.run_id) }}
+  cancel-in-progress: false
+
 # THE IMAGE IS PINNED TO THE CHECKOUT, and that is the whole point.
 #
 # This was `:main` in all eight places. `:main` is whatever was last pushed to
@@ -187,9 +195,7 @@ env:
 jobs:
   probe:
     if: ${{ (inputs.mode || 'oneshot') == 'oneshot' }}
-    runs-on:
-      group: default-tools
-      labels: arc-dind
+    runs-on: ubuntu-latest
     # An EXCEEDED job timeout CANCELS the job. MEASURED, not inferred -- the
     # docs do not state it, and it decides how `Route probe failure` must be
     # gated, so it was settled by experiment rather than by reading:
@@ -222,10 +228,9 @@ jobs:
       issues: write
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
-      # The production relay VIP is allocated from this LB pool. The tools
-      # ARC egress must be outside it: an address in the pool could make an
-      # in-cluster path look like the independent public vantage this probe
-      # exists to measure.
+      # The production relay VIP is allocated from this LB pool. Hosted egress
+      # must be outside it: an address in the pool could make an in-cluster path
+      # look like the independent public vantage this probe exists to measure.
       RELAY_PREFIX: 69.25.95.128/26
       SOURCE: ${{ inputs.source || '69.25.95.192' }}
       GROUP: ${{ inputs.group || '232.1.1.60' }}
@@ -365,7 +370,7 @@ jobs:
           # attribution is by COVARIATION across lossy/clean, not by a threshold.
           #
           # Caveat, and it is real: this counter is netns-WIDE, not per-socket.
-          # On an otherwise-idle ARC runner ours is the only meaningful UDP
+          # On an otherwise-idle hosted runner ours is the only meaningful UDP
           # traffic, but a non-zero delta is evidence about the netns, so do not
           # read a small one as proof it was us.
           #
@@ -1034,7 +1039,7 @@ jobs:
       # `job.status != 'success' && env.ZERO_DATA != '1'` is true for any
       # non-verdict bad end, and those are third-party-network steps: ipify in
       # the vantage receipt, actions/checkout, the ghcr login, upload-artifact.
-      # The cron fires 96x/day on ARC runners, so a blip inside the first
+      # The cron fires 96x/day on hosted runners, so a blip inside the first
       # few days is close to certain. Once one files `[amt-probe][infra] ...`, the exact
       # title dedup above routes every LATER detector death to `gh issue
       # comment` on that stale row -- so a persistent death (ghcr token expiry,
@@ -1110,9 +1115,7 @@ jobs:
   tunnels-ramp:
     timeout-minutes: 15
     if: ${{ inputs.mode == 'tunnels-ramp' }}
-    runs-on:
-      group: default-tools
-      labels: arc-dind
+    runs-on: ubuntu-latest
     env:
       RELAY: ${{ inputs.relay || '69.25.95.128' }}
       RELAY_PREFIX: 69.25.95.128/26
@@ -1760,9 +1763,7 @@ jobs:
   # them distinguishable.
   loss-delta-preflight:
     if: ${{ inputs.mode == 'loss-delta' }}
-    runs-on:
-      group: default-tools
-      labels: arc-dind
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1832,9 +1833,7 @@ jobs:
   loss-delta:
     if: ${{ inputs.mode == 'loss-delta' }}
     needs: loss-delta-preflight
-    runs-on:
-      group: default-tools
-      labels: arc-dind
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       # A dead leg must NOT cancel its siblings. The surviving legs and their
@@ -2071,9 +2070,7 @@ jobs:
     # below is unaffected; it is not an expression.
     if: ${{ !cancelled() && inputs.mode == 'loss-delta' && needs['loss-delta-preflight'].result == 'success' }}
     needs: [loss-delta-preflight, loss-delta]
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     # No `issues: write`: this mode is dispatch-only measurement and must never
     # file an outage row. Routing belongs to the scheduled oneshot probe.
