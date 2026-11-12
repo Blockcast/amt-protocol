@@ -37,10 +37,10 @@ on:
       group:
         description: Multicast group
         # 232.1.1.62 (the runbook's group) was dark on 2026-10-15 while
-        # 232.99.0.10 from the same source carried ~4 Mbps. amt-verify only
-        # sends leave/Teardown on the data path: on a --timeout with no data
-        # it exits before shutdown, so a dark group silently turns every
-        # shape into case 3. Check `packet_count > 0` before reading a WAL row.
+        # 232.99.0.10 from the same source carried ~4 Mbps. On a dark group
+        # the run ends on its --timeout deadline and still shuts down in the
+        # chosen shape, but the relay has forwarded nothing to bill. Check
+        # `packet_count > 0` before reading a WAL row.
         default: "232.99.0.10"
       timeout:
         description: amt-verify --timeout (seconds)
