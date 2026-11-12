@@ -34,11 +34,10 @@ jobs:
   gradle:
     name: android kotlin (gradle test + aar)
     # Fork PRs skipped for the same reason as android-jni.yml: PR-controlled
-    # code on the trusted in-cluster ARC pool.
+    # Fork PRs remain intentionally skipped; preserve the existing trust
+    # boundary while this public lane uses hosted hardware.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
