@@ -115,7 +115,6 @@ natives there.
   D-bit are not exported, so `AmtSession` always runs relay discovery first.
 - Failure detail: most natives return null on failure, so `AmtError` is classified from the
   gateway state (`INVALID_STATE` vs `REJECTED`); only `handleAdvertisement` reports a code.
-- The `enableDriad` flag of `AmtGateway.create` is stored in the native config and not acted on.
 
 ## Sample app
 

@@ -50,24 +50,18 @@ impl JsAmtGateway {
     ///
     /// @param relay_address - IP address as string (e.g., "192.0.2.1" or "2001:db8::1")
     /// @param relay_port - Optional port number (default: 2268)
-    /// @param enable_driad - Enable DRIAD discovery
     /// @param keepalive_interval_secs - Keep-alive interval in seconds (default: 60, 0 to disable)
     #[wasm_bindgen(constructor)]
     pub fn new(
         relay_address: &str,
         relay_port: Option<u16>,
-        enable_driad: bool,
         keepalive_interval_secs: Option<u32>,
     ) -> Result<JsAmtGateway, JsValue> {
         let addr: IpAddr = relay_address
             .parse()
             .map_err(|e| JsValue::from_str(&format!("Invalid IP address: {}", e)))?;
 
-        let mut config = if enable_driad {
-            AmtConfig::with_driad(addr, relay_port)
-        } else {
-            AmtConfig::new(addr, relay_port)
-        };
+        let mut config = AmtConfig::new(addr, relay_port);
 
         if let Some(interval) = keepalive_interval_secs {
             config = config.with_keepalive(interval);

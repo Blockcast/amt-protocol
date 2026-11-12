@@ -92,14 +92,12 @@ typedef struct {
  *
  * @param relay_address Null-terminated C string with relay IP address
  * @param relay_port Relay port (use 0 for default 2268)
- * @param enable_driad Enable DRIAD discovery
  * @param out_handle Pointer to receive gateway handle
  * @return AMT_RESULT_OK on success
  */
 amt_result_t amt_gateway_new(
     const char* relay_address,
     uint16_t relay_port,
-    bool enable_driad,
     amt_gateway_handle_t* out_handle
 );
 

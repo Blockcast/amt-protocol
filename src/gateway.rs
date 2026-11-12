@@ -1010,7 +1010,10 @@ mod tests {
         let gw = AmtGateway::new(test_config(), test_platform());
         let cfg = gw.config();
         assert_eq!(cfg.relay_port, 2268);
-        assert!(!cfg.enable_driad);
+        assert_eq!(
+            cfg.relay_address,
+            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     #[test]
