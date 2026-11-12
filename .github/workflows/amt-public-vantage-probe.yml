@@ -159,6 +159,16 @@ permissions:
   contents: read
   packages: read
 
+# BLO-47085: the 15-minute cron outpaces the shared default-tools arc-dind pool
+# (cap 4), so with no concurrency group scheduled runs piled up 60 deep (~15h)
+# and starved every other arc-dind job queued behind them. A group keeps at most
+# one scheduled run pending: a newer tick replaces an older *pending* one, and an
+# in-progress run is never cancelled. A stale probe measures "now" anyway, so
+# nothing is lost. Dispatches get a per-run group so they are never displaced.
+concurrency:
+  group: ${{ github.event_name == 'schedule' && 'amt-public-vantage-probe-schedule' || format('amt-public-vantage-probe-{0}', github.run_id) }}
+  cancel-in-progress: false
+
 # THE IMAGE IS PINNED TO THE CHECKOUT, and that is the whole point.
 #
 # This was `:main` in all eight places. `:main` is whatever was last pushed to
